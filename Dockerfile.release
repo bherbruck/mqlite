@@ -1,0 +1,15 @@
+# Minimal release image using pre-built binaries
+# Used by CI - no Rust compilation, no QEMU emulation
+
+# Grab CA certs from Alpine
+FROM alpine:latest AS certs
+RUN apk add --no-cache ca-certificates
+
+FROM scratch
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+ARG TARGETARCH
+COPY mqlite-${TARGETARCH} /mqlite
+
+EXPOSE 1883 9001
+ENTRYPOINT ["/mqlite"]

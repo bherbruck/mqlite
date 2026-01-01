@@ -24,9 +24,14 @@ use mio::{Events, Interest, Poll, Token};
 use crate::client::{Client, ClientState, PendingPublish};
 use crate::client_handle::ClientWriteHandle;
 use crate::error::{ProtocolError, Result};
-use crate::packet::{Connack, ConnackCode, Packet, Publish, QoS, Suback};
+use crate::packet::{
+    encode_variable_byte_integer, update_message_expiry, Connack, ConnackCode, ConnackProperties,
+    Packet, Publish, QoS, Suback, Unsuback,
+};
 use crate::publish_encoder::PublishEncoder;
-use crate::shared::{ClientLocation, Session, SharedStateHandle};
+use crate::shared::{
+    ClientLocation, RetainedMessage, Session, SharedStateHandle, StoredSubscription,
+};
 use crate::subscription::{topic_matches_filter, Subscriber};
 
 /// Messages sent to workers via channels (control plane only).
@@ -35,10 +40,7 @@ use crate::subscription::{topic_matches_filter, Subscriber};
 #[allow(dead_code)] // Shutdown variant reserved for graceful shutdown
 pub enum WorkerMsg {
     /// New connection from main thread.
-    NewClient {
-        socket: TcpStream,
-        addr: SocketAddr,
-    },
+    NewClient { socket: TcpStream, addr: SocketAddr },
     /// Disconnect a client (for client takeover).
     Disconnect { token: Token },
     /// Shutdown signal.
@@ -47,6 +49,15 @@ pub enum WorkerMsg {
 
 /// Starting token for client connections within this worker.
 const CLIENT_START: usize = 1;
+
+/// A will message scheduled for delayed publication.
+#[derive(Debug)]
+struct DelayedWill {
+    /// When to publish the will message.
+    publish_at: Instant,
+    /// The will message to publish.
+    publish: Publish,
+}
 
 /// Maximum number of cached routes per worker.
 const ROUTE_CACHE_LIMIT: usize = 10_000;
@@ -114,6 +125,9 @@ pub struct Worker {
 
     /// Cache statistics for adaptive caching.
     cache_stats: CacheStats,
+
+    /// Wills scheduled for delayed publication (MQTT v5 Will Delay Interval).
+    delayed_wills: Vec<DelayedWill>,
 }
 
 impl Worker {
@@ -144,9 +158,10 @@ impl Worker {
             cache_stats: CacheStats {
                 hits: 0,
                 misses: 0,
-                enabled: true,  // Start with cache enabled
+                enabled: true, // Start with cache enabled
                 lookups_since_eval: 0,
             },
+            delayed_wills: Vec::new(),
         })
     }
 
@@ -162,9 +177,14 @@ impl Worker {
     pub fn run_once(&mut self) -> Result<()> {
         let mut events = Events::with_capacity(1024);
 
-        // Poll with a short timeout to check channel
-        self.poll
-            .poll(&mut events, Some(Duration::from_millis(10)))?;
+        // Determine poll timeout: use shorter of default and delayed will timeout
+        let default_timeout = Duration::from_millis(10);
+        let timeout = match self.next_delayed_will_timeout() {
+            Some(will_timeout) => std::cmp::min(default_timeout, will_timeout),
+            None => default_timeout,
+        };
+
+        self.poll.poll(&mut events, Some(timeout))?;
 
         // Process mio events
         for event in events.iter() {
@@ -193,9 +213,7 @@ impl Worker {
                             if let Some(ref client_id) = client.client_id {
                                 let mut sessions = self.shared.sessions.write();
                                 // Create session if it doesn't exist - handles race conditions
-                                let session = sessions
-                                    .entry(client_id.clone())
-                                    .or_default();
+                                let session = sessions.entry(client_id.clone()).or_default();
                                 for (pid, pending) in &client.pending_qos1 {
                                     session.pending_qos1.push((*pid, pending.publish.clone()));
                                 }
@@ -220,6 +238,9 @@ impl Worker {
 
         // Clean up disconnected clients
         self.cleanup_clients();
+
+        // Publish any delayed will messages that are ready
+        self.publish_delayed_wills();
 
         // Check keep-alive timeouts
         let now = Instant::now();
@@ -274,10 +295,7 @@ impl Worker {
                 self.cache_stats.lookups_since_eval = 0;
                 self.cache_stats.hits = 0;
                 self.cache_stats.misses = 0;
-                log::debug!(
-                    "Worker {}: Re-enabling route cache for evaluation",
-                    self.id
-                );
+                log::debug!("Worker {}: Re-enabling route cache for evaluation", self.id);
             } else {
                 // Cache disabled - go direct to trie, then dedup
                 self.subscriber_buf.clear();
@@ -297,7 +315,8 @@ impl Worker {
                 // Cache hit - already deduplicated
                 self.cache_stats.hits += 1;
                 self.subscriber_buf.clear();
-                self.subscriber_buf.extend(cached.subscribers.iter().cloned());
+                self.subscriber_buf
+                    .extend(cached.subscribers.iter().cloned());
                 return;
             }
         }
@@ -351,7 +370,8 @@ impl Worker {
         }
 
         // Move back to subscriber_buf
-        self.subscriber_buf.extend(self.dedup_buf.drain().map(|(_, sub)| sub));
+        self.subscriber_buf
+            .extend(self.dedup_buf.drain().map(|(_, sub)| sub));
     }
 
     /// Evaluate cache effectiveness and disable if hit rate is too low.
@@ -489,7 +509,10 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&token) {
                     if let Err(e) = client.queue_packet(&Packet::Pubrel { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!("Backpressure: dropping PUBREL to slow client (token={:?})", token);
+                            log::warn!(
+                                "Backpressure: dropping PUBREL to slow client (token={:?})",
+                                token
+                            );
                         }
                     }
                 }
@@ -499,7 +522,10 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&token) {
                     if let Err(e) = client.queue_packet(&Packet::Pubcomp { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!("Backpressure: dropping PUBCOMP to slow client (token={:?})", token);
+                            log::warn!(
+                                "Backpressure: dropping PUBCOMP to slow client (token={:?})",
+                                token
+                            );
                         }
                     }
                 }
@@ -532,10 +558,17 @@ impl Worker {
                 }
             }
 
-            Packet::Disconnect => {
+            Packet::Disconnect { reason_code } => {
                 if let Some(client) = self.clients.get_mut(&token) {
-                    client.graceful_disconnect = true;
-                    client.will = None;
+                    // MQTT v5 reason code 0x04 = Disconnect with Will Message
+                    if reason_code == 0x04 {
+                        // Keep will and mark as non-graceful so will gets published
+                        client.graceful_disconnect = false;
+                    } else {
+                        // Normal disconnect - clear will and mark as graceful
+                        client.graceful_disconnect = true;
+                        client.will = None;
+                    }
                     client.state = ClientState::Disconnecting;
                 }
             }
@@ -546,17 +579,27 @@ impl Worker {
         Ok(())
     }
 
-    fn handle_connect(
-        &mut self,
-        token: Token,
-        connect: crate::packet::Connect,
-    ) -> Result<()> {
+    fn handle_connect(&mut self, token: Token, connect: crate::packet::Connect) -> Result<()> {
+        let is_v5 = connect.protocol_version == 5;
+
         // MQTT-3.1.3-7: Zero-length ClientId requires CleanSession=1
         if connect.client_id.is_empty() && !connect.clean_session {
             let client = self.clients.get_mut(&token).unwrap();
-            let connack = Connack {
-                session_present: false,
-                code: ConnackCode::IdentifierRejected,
+            client.protocol_version = connect.protocol_version;
+            let connack = if is_v5 {
+                Connack {
+                    session_present: false,
+                    code: ConnackCode::IdentifierRejected,
+                    reason_code: Some(0x85), // Client Identifier not valid
+                    properties: Some(ConnackProperties::default()),
+                }
+            } else {
+                Connack {
+                    session_present: false,
+                    code: ConnackCode::IdentifierRejected,
+                    reason_code: None,
+                    properties: None,
+                }
             };
             // CONNACK rejection: will disconnect anyway
             let _ = client.queue_packet(&Packet::Connack(connack));
@@ -601,14 +644,14 @@ impl Worker {
                         // Create session if needed and set takeover_complete = false so we know to wait
                         if !connect.clean_session {
                             let mut sessions = self.shared.sessions.write();
-                            let session = sessions
-                                .entry(connect.client_id.clone())
-                                .or_default();
+                            let session = sessions.entry(connect.client_id.clone()).or_default();
                             session.takeover_complete = false;
                         }
                         // Send disconnect message - the other worker will set takeover_complete = true
-                        let _ = self.worker_senders[location.worker_id]
-                            .send(WorkerMsg::Disconnect { token: location.token });
+                        let _ =
+                            self.worker_senders[location.worker_id].send(WorkerMsg::Disconnect {
+                                token: location.token,
+                            });
                     }
                 }
             }
@@ -664,7 +707,7 @@ impl Worker {
                     .collect();
 
                 // Clone subscriptions before releasing lock
-                let subs_to_restore: Vec<(String, QoS)> = session.subscriptions.clone();
+                let subs_to_restore: Vec<StoredSubscription> = session.subscriptions.clone();
 
                 // Collect pending messages, preserving original packet IDs [MQTT-4.5.0-1]
                 for (pid, mut publish) in session.pending_qos1.drain(..) {
@@ -694,16 +737,19 @@ impl Worker {
                         subs.remove_client(self.id, *old_token);
                     }
 
-                    // Restore subscriptions with new handle
+                    // Restore subscriptions with new handle, preserving options and subscription_id
                     if let Some(handle) = self.token_to_handle.get(&token).cloned() {
                         let client_id: Arc<str> = Arc::from(connect.client_id.as_str());
-                        for (filter, qos) in &subs_to_restore {
+                        for stored_sub in &subs_to_restore {
                             subs.subscribe(
-                                filter,
+                                &stored_sub.topic_filter,
                                 Subscriber {
                                     handle: handle.clone(),
-                                    qos: *qos,
+                                    qos: stored_sub.options.qos,
                                     client_id: client_id.clone(),
+                                    options: stored_sub.options,
+                                    subscription_id: stored_sub.subscription_id,
+                                    share_group: None,
                                 },
                             );
                         }
@@ -732,6 +778,8 @@ impl Worker {
         client.keep_alive = connect.keep_alive;
         client.clean_session = connect.clean_session;
         client.will = connect.will.clone();
+        client.protocol_version = connect.protocol_version;
+        client.handle.set_protocol_version(connect.protocol_version);
         client.state = ClientState::Connected;
 
         if !connect.clean_session && !connect.client_id.is_empty() {
@@ -739,9 +787,58 @@ impl Worker {
                 .insert(token, connect.client_id.clone());
         }
 
-        let connack = Connack {
-            session_present,
-            code: ConnackCode::Accepted,
+        // Build CONNACK based on protocol version
+        // For v5, handle assigned client ID before building CONNACK
+        let assigned_client_id = if is_v5 && connect.client_id.is_empty() {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let assigned_id = format!("mqlite-{:016x}-{}", nanos, token.0);
+            // Update client's ID
+            client.client_id = Some(assigned_id.clone());
+            // Register in client registry
+            self.shared.client_registry.write().insert(
+                assigned_id.clone(),
+                ClientLocation {
+                    worker_id: self.id,
+                    token,
+                },
+            );
+            Some(assigned_id)
+        } else {
+            None
+        };
+
+        let connack = if is_v5 {
+            // Build v5 CONNACK with properties
+            let mut props = ConnackProperties::default();
+
+            if let Some(id) = assigned_client_id {
+                props.assigned_client_identifier = Some(id);
+            }
+
+            // Set server capabilities
+            props.retain_available = Some(true);
+            props.wildcard_subscription_available = Some(true);
+            props.subscription_identifiers_available = Some(true);
+            props.shared_subscription_available = Some(true);
+            props.maximum_qos = Some(2);
+
+            Connack {
+                session_present,
+                code: ConnackCode::Accepted,
+                reason_code: Some(0x00), // Success
+                properties: Some(props),
+            }
+        } else {
+            Connack {
+                session_present,
+                code: ConnackCode::Accepted,
+                reason_code: None,
+                properties: None,
+            }
         };
         // CONNACK: critical for connection, but client just connected so buffer should be empty
         let _ = client.queue_packet(&Packet::Connack(connack));
@@ -776,7 +873,8 @@ impl Worker {
         subscribe: crate::packet::Subscribe,
     ) -> Result<()> {
         let mut return_codes = Vec::with_capacity(subscribe.topics.len());
-        let mut retained_to_send: Vec<(Publish, QoS)> = Vec::new();
+        // (retained_msg, stored_at, sub_qos, retain_as_published, subscription_id)
+        let mut retained_to_send: Vec<(Publish, Instant, QoS, bool, Option<u32>)> = Vec::new();
 
         let (client_id, clean_session) = {
             let client = self.clients.get(&token);
@@ -793,33 +891,80 @@ impl Worker {
             .map(|s| Arc::from(s.as_str()))
             .unwrap_or_else(|| Arc::from(""));
 
-        for (topic_filter, qos) in &subscribe.topics {
+        for (topic_filter, options) in &subscribe.topics {
+            // Parse shared subscription if applicable
+            let (actual_filter, share_group) =
+                if topic_filter.starts_with("$share/") && topic_filter.len() > 7 {
+                    let rest = &topic_filter[7..];
+                    if let Some(slash_pos) = rest.find('/') {
+                        let group = &rest[..slash_pos];
+                        let filter = &rest[slash_pos + 1..];
+                        (filter.to_string(), Some(Arc::from(group)))
+                    } else {
+                        (topic_filter.clone(), None)
+                    }
+                } else {
+                    (topic_filter.clone(), None)
+                };
+
             if let Some(ref h) = handle {
                 self.shared.subscriptions.write().subscribe(
                     topic_filter,
                     Subscriber {
                         handle: h.clone(),
-                        qos: *qos,
+                        qos: options.qos,
                         client_id: client_id_arc.clone(),
+                        options: *options,
+                        subscription_id: subscribe.subscription_id,
+                        share_group: share_group.clone(),
                     },
                 );
             }
-            return_codes.push(*qos as u8);
+            return_codes.push(options.qos as u8);
 
             if !clean_session {
                 if let Some(ref cid) = client_id {
                     let mut sessions = self.shared.sessions.write();
                     if let Some(session) = sessions.get_mut(cid) {
-                        session.subscriptions.retain(|(f, _)| f != topic_filter);
-                        session.subscriptions.push((topic_filter.clone(), *qos));
+                        // Check if subscription already exists for RetainHandling
+                        let subscription_exists = session
+                            .subscriptions
+                            .iter()
+                            .any(|s| s.topic_filter == *topic_filter);
+                        session
+                            .subscriptions
+                            .retain(|s| s.topic_filter != *topic_filter);
+                        session.subscriptions.push(StoredSubscription {
+                            topic_filter: topic_filter.clone(),
+                            options: *options,
+                            subscription_id: subscribe.subscription_id,
+                        });
+
+                        // RetainHandling: 0=always send, 1=only if new, 2=never send
+                        if options.retain_handling == 2
+                            || (options.retain_handling == 1 && subscription_exists)
+                        {
+                            continue; // Skip retained message delivery
+                        }
                     }
                 }
             }
 
+            // RetainHandling check for clean session clients
+            if options.retain_handling == 2 {
+                continue; // Never send retained messages
+            }
+
             let retained = self.shared.retained_messages.read();
             for (topic, retained_msg) in retained.iter() {
-                if topic_matches_filter(topic, topic_filter) {
-                    retained_to_send.push((retained_msg.clone(), *qos));
+                if topic_matches_filter(topic, &actual_filter) {
+                    retained_to_send.push((
+                        retained_msg.publish.clone(),
+                        retained_msg.stored_at,
+                        options.qos,
+                        options.retain_as_published,
+                        subscribe.subscription_id,
+                    ));
                 }
             }
         }
@@ -828,6 +973,7 @@ impl Worker {
             let suback = Suback {
                 packet_id: subscribe.packet_id,
                 return_codes,
+                is_v5: client.protocol_version == 5,
             };
             // SUBACK: required response, drop if slow
             let _ = client.queue_packet(&Packet::Suback(suback));
@@ -835,7 +981,23 @@ impl Worker {
 
         // Send retained messages for matching topics
         if let Some(client) = self.clients.get_mut(&token) {
-            for (retained, sub_qos) in retained_to_send {
+            let is_v5 = client.protocol_version == 5;
+            for (retained, stored_at, sub_qos, _retain_as_published, subscription_id) in
+                retained_to_send
+            {
+                // MQTT-3.3.2.3.3-2: Calculate elapsed time and update Message Expiry Interval
+                let elapsed_secs = stored_at.elapsed().as_secs() as u32;
+
+                // For v5 messages, check and update expiry
+                let base_properties = if is_v5 {
+                    match update_message_expiry(retained.properties.as_ref(), elapsed_secs) {
+                        None => continue, // Message has expired, skip it
+                        Some(props) => props,
+                    }
+                } else {
+                    retained.properties.clone()
+                };
+
                 let effective_qos = std::cmp::min(retained.qos as u8, sub_qos as u8);
                 let out_qos = QoS::try_from(effective_qos)?;
 
@@ -844,13 +1006,41 @@ impl Worker {
                 } else {
                     None
                 };
+                // MQTT-3.3.1-8: When sending a PUBLISH to a Client as a result of a new
+                // subscription being made, the Server MUST set RETAIN to 1.
+                // This applies to both v3.1.1 and v5 - RetainAsPublished only affects
+                // normal publish forwarding, not retained message delivery to new subscribers.
+                let out_retain = true;
+
+                // MQTT-3.8.2.1.2: Add subscription identifier to properties if present
+                // For v5 clients, we must always include properties (even if empty)
+                let properties = if is_v5 {
+                    if let Some(sub_id) = subscription_id {
+                        // Build properties with subscription identifier prepended
+                        let mut props = Vec::new();
+                        props.push(0x0B); // Property ID for Subscription Identifier
+                        encode_variable_byte_integer(sub_id, &mut props);
+                        if let Some(ref existing) = base_properties {
+                            props.extend_from_slice(existing);
+                        }
+                        Some(Bytes::from(props))
+                    } else {
+                        // No subscription ID, but still v5 - include base properties or empty
+                        Some(base_properties.unwrap_or_else(Bytes::new))
+                    }
+                } else {
+                    // v3.1.1 - no properties
+                    None
+                };
+
                 let out_publish = Publish {
                     dup: false,
                     qos: out_qos,
-                    retain: true,
+                    retain: out_retain,
                     topic: retained.topic.clone(),
                     packet_id,
                     payload: retained.payload.clone(),
+                    properties,
                 };
                 // Retained messages: drop if slow
                 let _ = client.queue_packet(&Packet::Publish(out_publish));
@@ -883,7 +1073,9 @@ impl Worker {
                 if let Some(ref cid) = client_id {
                     let mut sessions = self.shared.sessions.write();
                     if let Some(session) = sessions.get_mut(cid) {
-                        session.subscriptions.retain(|(f, _)| f != topic_filter);
+                        session
+                            .subscriptions
+                            .retain(|s| s.topic_filter != *topic_filter);
                     }
                 }
             }
@@ -891,9 +1083,20 @@ impl Worker {
 
         if let Some(client) = self.clients.get_mut(&token) {
             // UNSUBACK: required response, drop if slow
-            let _ = client.queue_packet(&Packet::Unsuback {
+            // For v5, include reason codes (0x00 = Success, 0x11 = No subscription existed)
+            // Note: We always return Success as the broker removes the subscription if it exists
+            let is_v5 = client.protocol_version == 5;
+            let reason_codes = if is_v5 {
+                // Return success (0x00) for each topic
+                vec![0x00; unsub.topics.len()]
+            } else {
+                Vec::new()
+            };
+            let _ = client.queue_packet(&Packet::Unsuback(Unsuback {
                 packet_id: unsub.packet_id,
-            });
+                reason_codes,
+                is_v5,
+            }));
         }
 
         Ok(())
@@ -915,7 +1118,10 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&from_token) {
                     if let Err(e) = client.queue_packet(&Packet::Puback { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!("Backpressure: dropping PUBACK to slow publisher (token={:?})", from_token);
+                            log::warn!(
+                                "Backpressure: dropping PUBACK to slow publisher (token={:?})",
+                                from_token
+                            );
                         }
                     }
                 }
@@ -926,7 +1132,10 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&from_token) {
                     if let Err(e) = client.queue_packet(&Packet::Pubrec { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!("Backpressure: dropping PUBREC to slow publisher (token={:?})", from_token);
+                            log::warn!(
+                                "Backpressure: dropping PUBREC to slow publisher (token={:?})",
+                                from_token
+                            );
                         }
                     }
                 }
@@ -940,13 +1149,18 @@ impl Worker {
             if publish.payload.is_empty() {
                 retained_msgs.remove(&topic_str);
             } else {
-                let retained = Publish {
+                let retained_publish = Publish {
                     dup: false,
                     qos: publish.qos,
                     retain: true,
                     topic: publish.topic.clone(),
                     packet_id: None,
                     payload: publish.payload.clone(),
+                    properties: publish.properties.clone(),
+                };
+                let retained = RetainedMessage {
+                    publish: retained_publish,
+                    stored_at: Instant::now(),
                 };
                 retained_msgs.insert(topic_str, retained);
             }
@@ -956,14 +1170,27 @@ impl Worker {
         // Returns pre-deduplicated subscribers, ready for direct iteration
         self.get_subscribers_cached(&publish.topic);
 
+        // Add shared subscription subscribers (requires write lock, not cached)
+        {
+            let topic_str = std::str::from_utf8(&publish.topic).unwrap_or("");
+            let mut subscriptions = self.shared.subscriptions.write();
+            subscriptions.match_shared_subscribers(topic_str, &mut self.subscriber_buf);
+        }
+
         let mut factory = PublishEncoder::new(
             publish.topic.clone(),
             publish.payload.clone(),
+            publish.properties.clone(),
         );
 
         // Forward to subscribers using direct writes via handles
         // subscriber_buf is already deduplicated by get_subscribers_cached
         for sub in &self.subscriber_buf {
+            // MQTT-3.8.3.1-2: NoLocal - don't deliver to publishing client
+            if sub.options.no_local && sub.token() == from_token && sub.worker_id() == self.id {
+                continue;
+            }
+
             let worker_id = sub.worker_id();
             let sub_token = sub.token();
             let effective_qos = std::cmp::min(publish.qos as u8, sub.qos as u8);
@@ -993,6 +1220,7 @@ impl Worker {
                                     topic: publish.topic.clone(),
                                     packet_id: Some(pkt_id),
                                     payload: publish.payload.clone(),
+                                    properties: publish.properties.clone(),
                                 };
                                 match out_qos {
                                     QoS::AtLeastOnce => {
@@ -1019,6 +1247,7 @@ impl Worker {
                             topic: publish.topic.clone(),
                             packet_id: Some(pid),
                             payload: publish.payload.clone(),
+                            properties: publish.properties.clone(),
                         };
                         let pending = PendingPublish {
                             publish: pending_publish,
@@ -1049,6 +1278,7 @@ impl Worker {
                                 topic: publish.topic.clone(),
                                 packet_id: Some(pid),
                                 payload: publish.payload.clone(),
+                                properties: publish.properties.clone(),
                             };
                             match out_qos {
                                 QoS::AtLeastOnce => {
@@ -1070,7 +1300,21 @@ impl Worker {
             // Backpressure policy: if WouldBlock, the client is slow.
             // QoS 0: drop (at-most-once, loss is acceptable)
             // QoS 1/2: message is saved in session for retry on reconnect
-            if let Err(e) = sub.handle.queue_publish(&mut factory, out_qos, packet_id, false) {
+            //
+            // MQTT-3.8.3-4: If Retain As Published is 1, preserve the RETAIN flag
+            let out_retain = if sub.options.retain_as_published {
+                publish.retain
+            } else {
+                false
+            };
+            // MQTT-3.8.2.1.2: Include subscription identifier if subscriber has one
+            if let Err(e) = sub.handle.queue_publish_with_sub_id(
+                &mut factory,
+                out_qos,
+                packet_id,
+                out_retain,
+                sub.subscription_id,
+            ) {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
                     log::warn!(
                         "Backpressure: dropping publish to slow subscriber (worker={}, token={:?}, qos={:?})",
@@ -1094,6 +1338,7 @@ impl Worker {
             .collect();
 
         let mut will_messages: Vec<Publish> = Vec::new();
+        let mut delayed_wills: Vec<DelayedWill> = Vec::new();
 
         for token in disconnected {
             if let Some(mut client) = self.clients.remove(&token) {
@@ -1104,7 +1349,10 @@ impl Worker {
                 self.token_to_client_id.remove(&token);
 
                 if client.clean_session {
-                    self.shared.subscriptions.write().remove_client(self.id, token);
+                    self.shared
+                        .subscriptions
+                        .write()
+                        .remove_client(self.id, token);
                 }
 
                 if let Some(ref client_id) = client.client_id {
@@ -1130,9 +1378,7 @@ impl Worker {
                         let mut sessions = self.shared.sessions.write();
                         // Create session if it doesn't exist - handles race where cleanup
                         // runs before new client's CONNECT handler creates the session
-                        let session = sessions
-                            .entry(client_id.clone())
-                            .or_default();
+                        let session = sessions.entry(client_id.clone()).or_default();
                         // Only set last_connection if we're still the owner
                         // (otherwise the new client has already taken over)
                         if is_current_owner {
@@ -1161,8 +1407,28 @@ impl Worker {
                             topic: Bytes::from(will.topic),
                             packet_id: None,
                             payload: Bytes::from(will.message),
+                            properties: None, // TODO: convert WillProperties to raw bytes
                         };
-                        will_messages.push(publish);
+
+                        // Check for MQTT v5 Will Delay Interval
+                        let delay_secs = will
+                            .properties
+                            .as_ref()
+                            .and_then(|p| p.will_delay_interval)
+                            .unwrap_or(0);
+
+                        if delay_secs > 0 {
+                            // Schedule for delayed publication
+                            let publish_at =
+                                Instant::now() + Duration::from_secs(delay_secs as u64);
+                            delayed_wills.push(DelayedWill {
+                                publish_at,
+                                publish,
+                            });
+                        } else {
+                            // Immediate publication
+                            will_messages.push(publish);
+                        }
                     }
                 }
             }
@@ -1176,7 +1442,13 @@ impl Worker {
                 if will_publish.payload.is_empty() {
                     retained.remove(&topic_str);
                 } else {
-                    retained.insert(topic_str, will_publish.clone());
+                    retained.insert(
+                        topic_str,
+                        RetainedMessage {
+                            publish: will_publish.clone(),
+                            stored_at: Instant::now(),
+                        },
+                    );
                 }
             }
 
@@ -1186,6 +1458,7 @@ impl Worker {
             let mut factory = PublishEncoder::new(
                 will_publish.topic.clone(),
                 will_publish.payload.clone(),
+                will_publish.properties.clone(),
             );
 
             // subscriber_buf is already deduplicated by get_subscribers_cached
@@ -1215,6 +1488,7 @@ impl Worker {
                                 topic: will_publish.topic.clone(),
                                 packet_id: Some(pid),
                                 payload: will_publish.payload.clone(),
+                                properties: will_publish.properties.clone(),
                             };
                             let pending = PendingPublish {
                                 publish: pending_publish,
@@ -1244,6 +1518,7 @@ impl Worker {
                                     topic: will_publish.topic.clone(),
                                     packet_id: Some(pid),
                                     payload: will_publish.payload.clone(),
+                                    properties: will_publish.properties.clone(),
                                 };
                                 match out_qos {
                                     QoS::AtLeastOnce => {
@@ -1261,7 +1536,10 @@ impl Worker {
 
                 // Direct write via handle (works for both local and cross-thread)
                 // Backpressure: drop on slow client (will messages are best-effort)
-                if let Err(e) = sub.handle.queue_publish(&mut factory, out_qos, packet_id, false) {
+                if let Err(e) = sub
+                    .handle
+                    .queue_publish(&mut factory, out_qos, packet_id, false)
+                {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         log::warn!(
                             "Backpressure: dropping will message to slow subscriber (worker={}, token={:?})",
@@ -1271,6 +1549,129 @@ impl Worker {
                     }
                 }
             }
+        }
+
+        // Store delayed wills for later publication
+        self.delayed_wills.extend(delayed_wills);
+    }
+
+    /// Publish any delayed will messages that are ready.
+    fn publish_delayed_wills(&mut self) {
+        let now = Instant::now();
+
+        // Partition into ready and not-ready wills
+        let mut ready_wills = Vec::new();
+        self.delayed_wills.retain(|dw| {
+            if dw.publish_at <= now {
+                ready_wills.push(dw.publish.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        // Publish ready wills
+        for will_publish in ready_wills {
+            if will_publish.retain {
+                let topic_str = String::from_utf8_lossy(&will_publish.topic).into_owned();
+                let mut retained = self.shared.retained_messages.write();
+                if will_publish.payload.is_empty() {
+                    retained.remove(&topic_str);
+                } else {
+                    retained.insert(
+                        topic_str,
+                        RetainedMessage {
+                            publish: will_publish.clone(),
+                            stored_at: Instant::now(),
+                        },
+                    );
+                }
+            }
+
+            // Use cached route lookup
+            self.get_subscribers_cached(&will_publish.topic);
+
+            let mut factory = PublishEncoder::new(
+                will_publish.topic.clone(),
+                will_publish.payload.clone(),
+                will_publish.properties.clone(),
+            );
+
+            for sub in &self.subscriber_buf {
+                let worker_id = sub.worker_id();
+                let sub_token = sub.token();
+                let effective_qos = std::cmp::min(will_publish.qos as u8, sub.qos as u8);
+                let out_qos = match QoS::try_from(effective_qos) {
+                    Ok(q) => q,
+                    Err(_) => continue,
+                };
+
+                let packet_id = if out_qos != QoS::AtMostOnce {
+                    Some(sub.handle.allocate_packet_id())
+                } else {
+                    None
+                };
+
+                // Track pending for local clients
+                if worker_id == self.id {
+                    if let Some(pid) = packet_id {
+                        if let Some(client) = self.clients.get_mut(&sub_token) {
+                            let pending_publish = Publish {
+                                dup: false,
+                                qos: out_qos,
+                                retain: false,
+                                topic: will_publish.topic.clone(),
+                                packet_id: Some(pid),
+                                payload: will_publish.payload.clone(),
+                                properties: will_publish.properties.clone(),
+                            };
+                            let pending = PendingPublish {
+                                publish: pending_publish,
+                                sent_at: now,
+                            };
+                            match out_qos {
+                                QoS::AtLeastOnce => {
+                                    client.pending_qos1.insert(pid, pending);
+                                }
+                                QoS::ExactlyOnce => {
+                                    client.pending_qos2.insert(pid, pending);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                // Direct write via handle
+                if let Err(e) = sub
+                    .handle
+                    .queue_publish(&mut factory, out_qos, packet_id, false)
+                {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        log::warn!(
+                            "Backpressure: dropping delayed will to slow subscriber (worker={}, token={:?})",
+                            sub.handle.worker_id(),
+                            sub.handle.token()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get the time until the next delayed will should be published.
+    fn next_delayed_will_timeout(&self) -> Option<Duration> {
+        if self.delayed_wills.is_empty() {
+            return None;
+        }
+
+        let now = Instant::now();
+        let next_publish = self.delayed_wills.iter().map(|dw| dw.publish_at).min()?;
+
+        if next_publish <= now {
+            Some(Duration::ZERO)
+        } else {
+            Some(next_publish - now)
         }
     }
 }

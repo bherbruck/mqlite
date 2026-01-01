@@ -7,7 +7,7 @@ use std::sync::Arc;
 use mio::Token;
 
 use crate::client_handle::ClientWriteHandle;
-use crate::packet::QoS;
+use crate::packet::{QoS, SubscriptionOptions};
 
 /// Subscriber info stored in the trie.
 ///
@@ -23,6 +23,13 @@ pub struct Subscriber {
     /// Client ID for session lookup (needed for cross-worker QoS tracking).
     /// Arc<str> for zero-copy cloning in route cache.
     pub client_id: Arc<str>,
+    /// MQTT v5 subscription options.
+    pub options: SubscriptionOptions,
+    /// MQTT v5 subscription identifier (if specified in SUBSCRIBE).
+    pub subscription_id: Option<u32>,
+    /// Share group name (for shared subscriptions, None for regular).
+    #[allow(dead_code)]
+    pub share_group: Option<Arc<str>>,
 }
 
 impl Subscriber {
@@ -169,9 +176,57 @@ impl TrieNode {
     }
 }
 
+/// Shared subscription group with round-robin counter.
+struct SharedGroup {
+    subscribers: Vec<Subscriber>,
+    next_index: usize,
+}
+
+impl SharedGroup {
+    fn new() -> Self {
+        Self {
+            subscribers: Vec::new(),
+            next_index: 0,
+        }
+    }
+
+    fn add(&mut self, subscriber: Subscriber) {
+        // Remove existing subscription from same client
+        let wid = subscriber.worker_id();
+        let tok = subscriber.token();
+        self.subscribers
+            .retain(|s| !(s.worker_id() == wid && s.token() == tok));
+        self.subscribers.push(subscriber);
+    }
+
+    fn remove(&mut self, worker_id: usize, token: Token) {
+        self.subscribers
+            .retain(|s| !(s.worker_id() == worker_id && s.token() == token));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.subscribers.is_empty()
+    }
+
+    /// Get next subscriber (round-robin). Returns None if empty.
+    fn next(&mut self) -> Option<&Subscriber> {
+        if self.subscribers.is_empty() {
+            return None;
+        }
+        let idx = self.next_index % self.subscribers.len();
+        self.next_index = self.next_index.wrapping_add(1);
+        Some(&self.subscribers[idx])
+    }
+}
+
+/// Shared subscription store: group_name -> filter -> SharedGroup
+type SharedSubscriptions = HashMap<String, HashMap<String, SharedGroup>>;
+
 /// Subscription store using a trie for efficient topic matching.
 pub struct SubscriptionStore {
     root: TrieNode,
+    /// Shared subscriptions: $share/{group}/{filter}
+    shared: SharedSubscriptions,
     /// Generation counter for cache invalidation.
     /// Incremented on any subscription change.
     generation: AtomicU64,
@@ -181,6 +236,7 @@ impl SubscriptionStore {
     pub fn new() -> Self {
         Self {
             root: TrieNode::new(),
+            shared: HashMap::new(),
             generation: AtomicU64::new(0),
         }
     }
@@ -198,23 +254,88 @@ impl SubscriptionStore {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Parse shared subscription topic: $share/{group}/{filter}
+    /// Returns (group_name, actual_filter) if shared, None otherwise.
+    fn parse_shared(topic_filter: &str) -> Option<(&str, &str)> {
+        if !topic_filter.starts_with("$share/") {
+            return None;
+        }
+        let rest = &topic_filter[7..]; // Skip "$share/"
+        let slash_pos = rest.find('/')?;
+        if slash_pos == 0 || slash_pos == rest.len() - 1 {
+            return None; // Empty group name or empty filter
+        }
+        let group = &rest[..slash_pos];
+        let filter = &rest[slash_pos + 1..];
+        Some((group, filter))
+    }
+
     /// Subscribe to a topic filter.
     pub fn subscribe(&mut self, topic_filter: &str, subscriber: Subscriber) {
-        let levels: Vec<&str> = topic_filter.split('/').collect();
-        self.root.insert(&levels, subscriber);
+        if let Some((group, filter)) = Self::parse_shared(topic_filter) {
+            // Shared subscription
+            let group_map = self.shared.entry(group.to_string()).or_default();
+            let shared_group = group_map
+                .entry(filter.to_string())
+                .or_insert_with(SharedGroup::new);
+            shared_group.add(subscriber);
+        } else {
+            // Normal subscription
+            let levels: Vec<&str> = topic_filter.split('/').collect();
+            self.root.insert(&levels, subscriber);
+        }
         self.invalidate_caches();
     }
 
     /// Unsubscribe from a topic filter.
     pub fn unsubscribe(&mut self, topic_filter: &str, worker_id: usize, token: Token) {
-        let levels: Vec<&str> = topic_filter.split('/').collect();
-        self.root.remove(&levels, worker_id, token);
+        if let Some((group, filter)) = Self::parse_shared(topic_filter) {
+            // Shared subscription
+            if let Some(group_map) = self.shared.get_mut(group) {
+                if let Some(shared_group) = group_map.get_mut(filter) {
+                    shared_group.remove(worker_id, token);
+                    if shared_group.is_empty() {
+                        group_map.remove(filter);
+                    }
+                }
+                if group_map.is_empty() {
+                    self.shared.remove(group);
+                }
+            }
+        } else {
+            // Normal subscription
+            let levels: Vec<&str> = topic_filter.split('/').collect();
+            self.root.remove(&levels, worker_id, token);
+        }
         self.invalidate_caches();
     }
 
     /// Remove all subscriptions for a client.
     pub fn remove_client(&mut self, worker_id: usize, token: Token) {
+        // Remove from normal subscriptions
         self.root.remove_client(worker_id, token);
+
+        // Remove from shared subscriptions
+        let mut empty_groups = Vec::new();
+        for (group_name, group_map) in self.shared.iter_mut() {
+            let mut empty_filters = Vec::new();
+            for (filter, shared_group) in group_map.iter_mut() {
+                shared_group.remove(worker_id, token);
+                if shared_group.is_empty() {
+                    empty_filters.push(filter.clone());
+                }
+            }
+            for filter in empty_filters {
+                group_map.remove(&filter);
+            }
+            if group_map.is_empty() {
+                empty_groups.push(group_name.clone());
+            }
+        }
+        for group in empty_groups {
+            self.shared.remove(&group);
+        }
+
         self.invalidate_caches();
     }
 
@@ -235,10 +356,25 @@ impl SubscriptionStore {
     }
 
     /// Find all subscribers matching a topic (Bytes variant), reusing a buffer.
+    /// Also handles shared subscriptions with round-robin selection.
     #[inline]
     pub fn match_topic_bytes_into(&self, topic: &[u8], out: &mut Vec<Subscriber>) {
         let topic_str = std::str::from_utf8(topic).unwrap_or("");
         self.match_topic_into(topic_str, out);
+    }
+
+    /// Find shared subscription subscribers for a topic (mutable for round-robin).
+    /// Returns one subscriber per matching share group.
+    pub fn match_shared_subscribers(&mut self, topic: &str, out: &mut Vec<Subscriber>) {
+        for (_group_name, group_map) in self.shared.iter_mut() {
+            for (filter, shared_group) in group_map.iter_mut() {
+                if topic_matches_filter(topic, filter) {
+                    if let Some(sub) = shared_group.next() {
+                        out.push(sub.clone());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -302,6 +438,14 @@ mod tests {
             handle,
             qos,
             client_id: Arc::from(""),
+            options: SubscriptionOptions {
+                qos,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+            },
+            subscription_id: None,
+            share_group: None,
         }
     }
 

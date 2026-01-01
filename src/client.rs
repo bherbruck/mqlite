@@ -51,6 +51,9 @@ pub struct Client {
     /// Whether the client sent a DISCONNECT packet (graceful disconnect).
     pub graceful_disconnect: bool,
 
+    /// MQTT protocol version (3=3.1, 4=3.1.1, 5=5.0).
+    pub protocol_version: u8,
+
     /// Next packet ID for outgoing QoS 1/2 messages (1-65535, 0 is invalid).
     pub next_packet_id: u16,
 
@@ -76,7 +79,9 @@ impl Client {
     /// Create a new client with a shared write handle.
     pub fn new(token: Token, socket: TcpStream, worker_id: usize, epoll_fd: i32) -> Self {
         let socket_fd = socket.as_raw_fd();
-        let handle = Arc::new(ClientWriteHandle::new(worker_id, epoll_fd, socket_fd, token));
+        let handle = Arc::new(ClientWriteHandle::new(
+            worker_id, epoll_fd, socket_fd, token,
+        ));
 
         Self {
             token,
@@ -87,6 +92,7 @@ impl Client {
             clean_session: true,
             will: None,
             graceful_disconnect: false,
+            protocol_version: 4, // Default to 3.1.1, updated on CONNECT
             next_packet_id: 1,
             last_packet_time: Instant::now(),
             pending_qos1: AHashMap::new(),
@@ -109,9 +115,14 @@ impl Client {
 
             match self.socket.read(&mut self.read_buf[self.read_pos..]) {
                 Ok(0) => {
-                    // Connection closed
-                    self.state = ClientState::Disconnecting;
-                    return Ok(false);
+                    // Connection closed - if there's data to process (e.g., DISCONNECT packet),
+                    // return true so packets get processed. Otherwise mark as disconnecting.
+                    if self.read_pos > 0 {
+                        return Ok(true);
+                    } else {
+                        self.state = ClientState::Disconnecting;
+                        return Ok(false);
+                    }
                 }
                 Ok(n) => {
                     self.read_pos += n;
@@ -131,7 +142,7 @@ impl Client {
         }
 
         let data = &self.read_buf[..self.read_pos];
-        match packet::decode_packet(data)? {
+        match packet::decode_packet(data, self.protocol_version)? {
             Some((packet, consumed)) => {
                 // Remove consumed bytes from buffer
                 self.read_buf.copy_within(consumed..self.read_pos, 0);
@@ -166,7 +177,8 @@ impl Client {
         packet_id: Option<u16>,
         retain: bool,
     ) -> std::io::Result<()> {
-        self.handle.queue_publish(factory, effective_qos, packet_id, retain)
+        self.handle
+            .queue_publish(factory, effective_qos, packet_id, retain)
     }
 
     /// Write queued data to socket.
@@ -194,5 +206,4 @@ impl Client {
     pub fn has_pending_writes(&self) -> bool {
         self.handle.has_pending_writes()
     }
-
 }

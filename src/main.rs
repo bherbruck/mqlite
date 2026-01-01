@@ -1,6 +1,5 @@
 //! mqlite - A high-performance MQTT broker.
 
-mod write_buffer;
 mod client;
 mod client_handle;
 mod error;
@@ -10,6 +9,7 @@ mod server;
 mod shared;
 mod subscription;
 mod worker;
+mod write_buffer;
 
 use std::net::SocketAddr;
 
@@ -89,10 +89,7 @@ fn main() {
 
     let config = parse_args();
 
-    info!(
-        "Starting mqlite with {} worker threads",
-        config.num_threads
-    );
+    info!("Starting mqlite with {} worker threads", config.num_threads);
 
     let mut server = match Server::with_workers(config.bind_addr, config.num_threads) {
         Ok(s) => s,

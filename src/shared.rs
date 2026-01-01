@@ -8,19 +8,36 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 
 use mio::Token;
 
-use crate::packet::{Publish, QoS};
+use crate::packet::{Publish, SubscriptionOptions};
 use crate::subscription::SubscriptionStore;
+
+/// A retained message with timestamp for expiry countdown.
+#[derive(Debug, Clone)]
+pub struct RetainedMessage {
+    pub publish: Publish,
+    /// When the message was stored (for Message Expiry Interval countdown).
+    pub stored_at: Instant,
+}
+
+/// Stored subscription info for session persistence.
+#[derive(Debug, Clone)]
+pub struct StoredSubscription {
+    pub topic_filter: String,
+    pub options: SubscriptionOptions,
+    pub subscription_id: Option<u32>,
+}
 
 /// Stored session state for CleanSession=0 clients.
 #[derive(Debug, Default, Clone)]
 pub struct Session {
-    /// Subscribed topic filters with QoS.
-    pub subscriptions: Vec<(String, QoS)>,
+    /// Subscribed topic filters with options and subscription IDs.
+    pub subscriptions: Vec<StoredSubscription>,
     /// Pending QoS 1 messages not yet acknowledged (packet_id, Publish).
     pub pending_qos1: Vec<(u16, Publish)>,
     /// Pending QoS 2 messages not yet completed (packet_id, Publish).
@@ -48,8 +65,8 @@ pub struct SharedState {
     pub subscriptions: RwLock<SubscriptionStore>,
     /// Persistent sessions for CleanSession=0 clients.
     pub sessions: RwLock<HashMap<String, Session>>,
-    /// Retained messages stored by topic.
-    pub retained_messages: RwLock<HashMap<String, Publish>>,
+    /// Retained messages stored by topic (with timestamp for expiry countdown).
+    pub retained_messages: RwLock<HashMap<String, RetainedMessage>>,
     /// Maps ClientId → ClientLocation for cross-thread routing and duplicate detection.
     pub client_registry: RwLock<HashMap<String, ClientLocation>>,
 }

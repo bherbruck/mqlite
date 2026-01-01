@@ -347,10 +347,7 @@ mod tests {
         // Next write should return WouldBlock (soft limit)
         let result = buf.write_bytes(&chunk);
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
 
         // After consuming, we can write again
         buf.consume(256 * 1024);

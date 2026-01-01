@@ -7,14 +7,14 @@
 
 use std::cell::RefCell;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 
 use mio::Token;
 use parking_lot::Mutex;
 
-use crate::write_buffer::WriteBuffer;
 use crate::packet::{self, Packet, QoS};
 use crate::publish_encoder::PublishEncoder;
+use crate::write_buffer::WriteBuffer;
 
 // Thread-local buffer for packet encoding (avoids allocation per packet).
 thread_local! {
@@ -32,6 +32,8 @@ pub struct ClientWriteHandle {
     ready_for_writing: AtomicBool,
     /// Atomic packet ID counter for cross-thread QoS allocation.
     next_packet_id: AtomicU16,
+    /// MQTT protocol version (4=3.1.1, 5=5.0). Set after CONNECT.
+    protocol_version: AtomicU8,
     /// The epoll fd (owned by the worker's Poll).
     epoll_fd: RawFd,
     /// The client's socket fd.
@@ -49,11 +51,31 @@ impl ClientWriteHandle {
             write_buf: Mutex::new(WriteBuffer::new()),
             ready_for_writing: AtomicBool::new(false),
             next_packet_id: AtomicU16::new(1),
+            protocol_version: AtomicU8::new(4), // Default to 3.1.1
             epoll_fd,
             socket_fd,
             token,
             worker_id,
         }
+    }
+
+    /// Set the protocol version (called after CONNECT is processed).
+    #[inline]
+    pub fn set_protocol_version(&self, version: u8) {
+        self.protocol_version.store(version, Ordering::Relaxed);
+    }
+
+    /// Get the protocol version.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn protocol_version(&self) -> u8 {
+        self.protocol_version.load(Ordering::Relaxed)
+    }
+
+    /// Check if this client uses MQTT v5.
+    #[inline]
+    pub fn is_v5(&self) -> bool {
+        self.protocol_version.load(Ordering::Relaxed) == 5
     }
 
     /// Allocate the next packet ID atomically. Can be called from any thread.
@@ -102,8 +124,30 @@ impl ClientWriteHandle {
         packet_id: Option<u16>,
         retain: bool,
     ) -> std::io::Result<()> {
+        self.queue_publish_with_sub_id(factory, effective_qos, packet_id, retain, None)
+    }
+
+    /// Queue a publish packet with optional subscription identifier.
+    /// Used for MQTT v5 when forwarding to subscribers with subscription_id.
+    #[inline]
+    pub fn queue_publish_with_sub_id(
+        &self,
+        factory: &mut PublishEncoder,
+        effective_qos: QoS,
+        packet_id: Option<u16>,
+        retain: bool,
+        subscription_id: Option<u32>,
+    ) -> std::io::Result<()> {
+        let is_v5 = self.is_v5();
         let mut buf = self.write_buf.lock();
-        factory.write_to(&mut *buf, effective_qos, packet_id, retain)?;
+        factory.write_to_with_sub_id(
+            &mut *buf,
+            effective_qos,
+            packet_id,
+            retain,
+            is_v5,
+            subscription_id,
+        )?;
         drop(buf);
         self.set_ready_for_writing(true);
         Ok(())
@@ -130,7 +174,7 @@ impl ClientWriteHandle {
                 Ok(n) => {
                     buf.consume(n);
                     buf.maybe_shrink(); // Reclaim memory from recovered slow clients
-                    // Continue loop to write more if buffer not empty
+                                        // Continue loop to write more if buffer not empty
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     return Ok(false);

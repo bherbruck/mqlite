@@ -104,8 +104,8 @@ impl Server {
                 let handle = thread::Builder::new()
                     .name(format!("worker-{}", id))
                     .spawn(move || {
-                        let mut worker = Worker::new(id, shared, rx, senders)
-                            .expect("Failed to create worker");
+                        let mut worker =
+                            Worker::new(id, shared, rx, senders).expect("Failed to create worker");
                         if let Err(e) = worker.run() {
                             error!("Worker {} error: {}", id, e);
                         }
@@ -140,12 +140,13 @@ impl Server {
                     let worker_id = self.next_worker;
                     self.next_worker = (self.next_worker + 1) % self.num_workers;
 
-                    debug!("Accepted connection from {}, assigning to worker {}", addr, worker_id);
+                    debug!(
+                        "Accepted connection from {}, assigning to worker {}",
+                        addr, worker_id
+                    );
 
-                    let _ = self.worker_senders[worker_id].send(WorkerMsg::NewClient {
-                        socket,
-                        addr,
-                    });
+                    let _ =
+                        self.worker_senders[worker_id].send(WorkerMsg::NewClient { socket, addr });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;

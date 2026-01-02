@@ -3,7 +3,7 @@
 use std::io::{self, Read};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
 use mio::net::TcpStream;
@@ -14,6 +14,7 @@ use crate::error::Result;
 use crate::packet;
 use crate::packet::{Packet, Publish, QoS, Will};
 use crate::publish_encoder::PublishEncoder;
+use crate::util::{QuotaTracker, RateLimitedCounter};
 
 /// Pending outgoing QoS 1/2 message awaiting acknowledgment.
 #[derive(Debug, Clone)]
@@ -66,6 +67,15 @@ pub struct Client {
     /// Pending outgoing QoS 2 messages awaiting PUBREC.
     pub pending_qos2: AHashMap<u16, PendingPublish>,
 
+    // MQTT 5 Flow Control
+    /// Client's maximum packet size (from CONNECT properties, 0 = unlimited).
+    pub client_max_packet_size: u32,
+    /// Outgoing quota tracker for QoS 1/2 flow control.
+    pub quota: QuotaTracker,
+
+    /// Rate-limited backpressure logging.
+    pub backpressure_log: RateLimitedCounter,
+
     /// Read buffer for incoming data.
     read_buf: Vec<u8>,
     read_pos: usize,
@@ -97,9 +107,28 @@ impl Client {
             last_packet_time: Instant::now(),
             pending_qos1: AHashMap::new(),
             pending_qos2: AHashMap::new(),
+            client_max_packet_size: 0,  // 0 = unlimited
+            quota: QuotaTracker::new(65535),  // Default per MQTT 5 spec
+            backpressure_log: RateLimitedCounter::new(Duration::from_secs(10)),
             read_buf: vec![0u8; INITIAL_BUFFER_SIZE],
             read_pos: 0,
             handle,
+        }
+    }
+
+    /// Record a backpressure drop and log if interval has passed.
+    /// Returns true if a log was emitted (for callers that want to add context).
+    pub fn record_backpressure_drop(&mut self, context: &str) -> bool {
+        if let Some(count) = self.backpressure_log.increment() {
+            log::warn!(
+                "Backpressure: dropped {} messages to slow client (token={:?}, {})",
+                count,
+                self.token,
+                context
+            );
+            true
+        } else {
+            false
         }
     }
 
@@ -136,13 +165,14 @@ impl Client {
     }
 
     /// Try to decode the next packet from the read buffer.
-    pub fn decode_packet(&mut self) -> Result<Option<Packet>> {
+    /// max_packet_size: Maximum allowed packet size (0 = no limit).
+    pub fn decode_packet(&mut self, max_packet_size: u32) -> Result<Option<Packet>> {
         if self.read_pos == 0 {
             return Ok(None);
         }
 
         let data = &self.read_buf[..self.read_pos];
-        match packet::decode_packet(data, self.protocol_version)? {
+        match packet::decode_packet(data, self.protocol_version, max_packet_size)? {
             Some((packet, consumed)) => {
                 // Remove consumed bytes from buffer
                 self.read_buf.copy_within(consumed..self.read_pos, 0);
@@ -158,6 +188,30 @@ impl Client {
         let id = self.next_packet_id;
         self.next_packet_id = if id == 65535 { 1 } else { id + 1 };
         id
+    }
+
+    /// Set MQTT 5 flow control values from CONNECT properties.
+    pub fn set_flow_control(&mut self, receive_max: u16, max_packet_size: u32) {
+        self.quota.set_max(receive_max);
+        self.client_max_packet_size = max_packet_size;
+    }
+
+    /// Check if we can send a QoS 1/2 message (quota available).
+    #[inline]
+    pub fn has_quota(&self) -> bool {
+        self.quota.has_quota()
+    }
+
+    /// Consume one quota slot when sending QoS 1/2. Returns false if no quota.
+    #[inline]
+    pub fn consume_quota(&mut self) -> bool {
+        self.quota.consume()
+    }
+
+    /// Restore one quota slot when receiving ACK (PUBACK/PUBCOMP).
+    #[inline]
+    pub fn restore_quota(&mut self) {
+        self.quota.restore()
     }
 
     /// Queue a packet for sending.

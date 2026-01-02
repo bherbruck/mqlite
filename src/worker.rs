@@ -23,16 +23,18 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::client::{Client, ClientState, PendingPublish};
 use crate::client_handle::ClientWriteHandle;
+use crate::config::Config;
 use crate::error::{ProtocolError, Result};
 use crate::packet::{
-    encode_variable_byte_integer, update_message_expiry, Connack, ConnackCode, ConnackProperties,
-    Packet, Publish, QoS, Suback, Unsuback,
+    encode_variable_byte_integer, update_message_expiry, validate_topic, Connack, ConnackCode,
+    ConnackProperties, Packet, Publish, QoS, Suback, Unsuback,
 };
 use crate::publish_encoder::PublishEncoder;
 use crate::shared::{
     ClientLocation, RetainedMessage, Session, SharedStateHandle, StoredSubscription,
 };
 use crate::subscription::{topic_matches_filter, Subscriber};
+use crate::util::RateLimitedCounter;
 
 /// Messages sent to workers via channels (control plane only).
 /// Publish delivery uses direct writes, not channels.
@@ -88,6 +90,8 @@ struct CacheStats {
     enabled: bool,
     /// Lookups since last evaluation.
     lookups_since_eval: u64,
+    /// How many times cache has been disabled (for rate-limited logging).
+    disabled_count: u64,
 }
 
 /// Worker thread that handles a subset of client connections.
@@ -128,6 +132,12 @@ pub struct Worker {
 
     /// Wills scheduled for delayed publication (MQTT v5 Will Delay Interval).
     delayed_wills: Vec<DelayedWill>,
+
+    /// Rate-limited subscriber backpressure logging (for cross-thread drops).
+    subscriber_backpressure_log: RateLimitedCounter,
+
+    /// Broker configuration.
+    config: Arc<Config>,
 }
 
 impl Worker {
@@ -137,6 +147,7 @@ impl Worker {
         shared: SharedStateHandle,
         rx: Receiver<WorkerMsg>,
         worker_senders: Vec<Sender<WorkerMsg>>,
+        config: Arc<Config>,
     ) -> Result<Self> {
         let poll = Poll::new()?;
         let epoll_fd = poll.as_raw_fd();
@@ -160,8 +171,11 @@ impl Worker {
                 misses: 0,
                 enabled: true, // Start with cache enabled
                 lookups_since_eval: 0,
+                disabled_count: 0,
             },
             delayed_wills: Vec::new(),
+            subscriber_backpressure_log: RateLimitedCounter::new(Duration::from_secs(10)),
+            config,
         })
     }
 
@@ -384,16 +398,21 @@ impl Worker {
         let hit_rate = self.cache_stats.hits as f64 / total as f64;
 
         if hit_rate < CACHE_MIN_HIT_RATE {
-            log::info!(
-                "Worker {}: Route cache disabled (hit rate {:.1}% < {:.1}% threshold, {} hits / {} total)",
-                self.id,
-                hit_rate * 100.0,
-                CACHE_MIN_HIT_RATE * 100.0,
-                self.cache_stats.hits,
-                total
-            );
+            self.cache_stats.disabled_count += 1;
+            // Only log first disable and every 100th after that
+            if self.cache_stats.disabled_count == 1 || self.cache_stats.disabled_count % 100 == 0 {
+                log::info!(
+                    "Worker {}: Route cache disabled (hit rate {:.1}% < {:.1}% threshold, {} hits / {} total, disabled {} times)",
+                    self.id,
+                    hit_rate * 100.0,
+                    CACHE_MIN_HIT_RATE * 100.0,
+                    self.cache_stats.hits,
+                    total,
+                    self.cache_stats.disabled_count
+                );
+            }
             self.cache_stats.enabled = false;
-            self.route_cache.clear(); // Free memory
+            // Keep cache entries for when re-enabled (avoids warmup penalty)
         } else {
             log::debug!(
                 "Worker {}: Route cache healthy (hit rate {:.1}%, {} hits / {} total)",
@@ -435,7 +454,7 @@ impl Worker {
                     return Ok(());
                 }
 
-                match client.decode_packet() {
+                match client.decode_packet(self.config.max_packet_size) {
                     Ok(Some(packet)) => {
                         client.last_packet_time = Instant::now();
                         packet
@@ -502,6 +521,8 @@ impl Worker {
             Packet::Puback { packet_id } => {
                 if let Some(client) = self.clients.get_mut(&token) {
                     client.pending_qos1.remove(&packet_id);
+                    // MQTT 5: Restore outgoing quota when ACK received
+                    client.restore_quota();
                 }
             }
 
@@ -509,10 +530,7 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&token) {
                     if let Err(e) = client.queue_packet(&Packet::Pubrel { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!(
-                                "Backpressure: dropping PUBREL to slow client (token={:?})",
-                                token
-                            );
+                            client.record_backpressure_drop("PUBREL");
                         }
                     }
                 }
@@ -522,10 +540,7 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&token) {
                     if let Err(e) = client.queue_packet(&Packet::Pubcomp { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!(
-                                "Backpressure: dropping PUBCOMP to slow client (token={:?})",
-                                token
-                            );
+                            client.record_backpressure_drop("PUBCOMP");
                         }
                     }
                 }
@@ -534,6 +549,8 @@ impl Worker {
             Packet::Pubcomp { packet_id } => {
                 if let Some(client) = self.clients.get_mut(&token) {
                     client.pending_qos2.remove(&packet_id);
+                    // MQTT 5: Restore outgoing quota when QoS 2 flow completes
+                    client.restore_quota();
                 }
             }
 
@@ -782,6 +799,15 @@ impl Worker {
         client.handle.set_protocol_version(connect.protocol_version);
         client.state = ClientState::Connected;
 
+        // MQTT 5: Extract client's flow control values
+        if is_v5 {
+            if let Some(ref props) = connect.properties {
+                let client_recv_max = props.receive_maximum.unwrap_or(65535);
+                let client_max_pkt = props.maximum_packet_size.unwrap_or(0);
+                client.set_flow_control(client_recv_max, client_max_pkt);
+            }
+        }
+
         if !connect.clean_session && !connect.client_id.is_empty() {
             self.token_to_client_id
                 .insert(token, connect.client_id.clone());
@@ -825,6 +851,13 @@ impl Worker {
             props.subscription_identifiers_available = Some(true);
             props.shared_subscription_available = Some(true);
             props.maximum_qos = Some(2);
+
+            // Advertise server limits (MQTT 5 flow control)
+            props.receive_maximum = Some(self.config.receive_maximum);
+            if self.config.max_packet_size > 0 {
+                props.maximum_packet_size = Some(self.config.max_packet_size);
+            }
+            props.topic_alias_maximum = Some(self.config.topic_alias_maximum);
 
             Connack {
                 session_present,
@@ -906,6 +939,23 @@ impl Worker {
                 } else {
                     (topic_filter.clone(), None)
                 };
+
+            // Validate topic filter length and depth
+            if validate_topic(
+                actual_filter.as_bytes(),
+                self.config.max_topic_length,
+                self.config.max_topic_levels,
+            )
+            .is_err()
+            {
+                // Topic too long or too deep - return error code for this subscription
+                // MQTT 5: 0x97 = Quota exceeded (closest match)
+                // MQTT 3.1.1: 0x80 = Failure
+                let client = self.clients.get(&token);
+                let is_v5 = client.map(|c| c.protocol_version == 5).unwrap_or(false);
+                return_codes.push(if is_v5 { 0x97 } else { 0x80 });
+                continue;
+            }
 
             if let Some(ref h) = handle {
                 self.shared.subscriptions.write().subscribe(
@@ -1112,16 +1162,26 @@ impl Worker {
             return Ok(());
         }
 
+        // Validate topic length and depth
+        if let Err(_e) = validate_topic(
+            &publish.topic,
+            self.config.max_topic_length,
+            self.config.max_topic_levels,
+        ) {
+            // Topic too long or too deep - disconnect client
+            if let Some(client) = self.clients.get_mut(&from_token) {
+                client.state = ClientState::Disconnecting;
+            }
+            return Ok(());
+        }
+
         // Send PUBACK/PUBREC to publisher
         if publish.qos == QoS::AtLeastOnce {
             if let Some(packet_id) = publish.packet_id {
                 if let Some(client) = self.clients.get_mut(&from_token) {
                     if let Err(e) = client.queue_packet(&Packet::Puback { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!(
-                                "Backpressure: dropping PUBACK to slow publisher (token={:?})",
-                                from_token
-                            );
+                            client.record_backpressure_drop("PUBACK");
                         }
                     }
                 }
@@ -1132,10 +1192,7 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&from_token) {
                     if let Err(e) = client.queue_packet(&Packet::Pubrec { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!(
-                                "Backpressure: dropping PUBREC to slow publisher (token={:?})",
-                                from_token
-                            );
+                            client.record_backpressure_drop("PUBREC");
                         }
                     }
                 }
@@ -1185,6 +1242,8 @@ impl Worker {
 
         // Forward to subscribers using direct writes via handles
         // subscriber_buf is already deduplicated by get_subscribers_cached
+        let mut backpressure_count: u32 = 0;
+        let mut last_backpressure_sub: Option<(usize, Token)> = None;
         for sub in &self.subscriber_buf {
             // MQTT-3.8.3.1-2: NoLocal - don't deliver to publishing client
             if sub.options.no_local && sub.token() == from_token && sub.worker_id() == self.id {
@@ -1235,6 +1294,18 @@ impl Worker {
                         }
                     }
                     continue;
+                }
+
+                // MQTT 5 flow control: check quota before sending QoS 1/2
+                if out_qos != QoS::AtMostOnce {
+                    if let Some(client) = self.clients.get_mut(&sub_token) {
+                        if !client.consume_quota() {
+                            // No quota available - skip this message (flow control)
+                            backpressure_count += 1;
+                            last_backpressure_sub = Some((worker_id, sub_token));
+                            continue;
+                        }
+                    }
                 }
 
                 // Track pending for local clients
@@ -1316,11 +1387,22 @@ impl Worker {
                 sub.subscription_id,
             ) {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
+                    // Track for rate-limited logging (can't call method due to borrow)
+                    backpressure_count += 1;
+                    last_backpressure_sub = Some((sub.handle.worker_id(), sub.handle.token()));
+                }
+            }
+        }
+
+        // Log accumulated backpressure drops (rate limited to every 10s per worker)
+        if backpressure_count > 0 {
+            if let Some(count) = self.subscriber_backpressure_log.increment_by(backpressure_count as u64) {
+                if let Some((worker_id, token)) = last_backpressure_sub {
                     log::warn!(
-                        "Backpressure: dropping publish to slow subscriber (worker={}, token={:?}, qos={:?})",
-                        sub.handle.worker_id(),
-                        sub.handle.token(),
-                        out_qos
+                        "Backpressure: dropped {} messages to slow subscribers (last: worker={}, token={:?})",
+                        count,
+                        worker_id,
+                        token
                     );
                 }
             }
@@ -1462,6 +1544,8 @@ impl Worker {
             );
 
             // subscriber_buf is already deduplicated by get_subscribers_cached
+            let mut will_backpressure_count: u32 = 0;
+            let mut last_will_backpressure_sub: Option<(usize, Token)> = None;
             for sub in &self.subscriber_buf {
                 let worker_id = sub.worker_id();
                 let sub_token = sub.token();
@@ -1541,10 +1625,21 @@ impl Worker {
                     .queue_publish(&mut factory, out_qos, packet_id, false)
                 {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
+                        will_backpressure_count += 1;
+                        last_will_backpressure_sub = Some((sub.handle.worker_id(), sub.handle.token()));
+                    }
+                }
+            }
+
+            // Log accumulated will backpressure drops (rate limited to every 10s per worker)
+            if will_backpressure_count > 0 {
+                if let Some(count) = self.subscriber_backpressure_log.increment_by(will_backpressure_count as u64) {
+                    if let Some((worker_id, token)) = last_will_backpressure_sub {
                         log::warn!(
-                            "Backpressure: dropping will message to slow subscriber (worker={}, token={:?})",
-                            sub.handle.worker_id(),
-                            sub.handle.token()
+                            "Backpressure: dropped {} will messages to slow subscribers (last: worker={}, token={:?})",
+                            count,
+                            worker_id,
+                            token
                         );
                     }
                 }
@@ -1597,6 +1692,8 @@ impl Worker {
                 will_publish.properties.clone(),
             );
 
+            let mut delayed_backpressure_count: u32 = 0;
+            let mut last_delayed_backpressure_sub: Option<(usize, Token)> = None;
             for sub in &self.subscriber_buf {
                 let worker_id = sub.worker_id();
                 let sub_token = sub.token();
@@ -1648,10 +1745,21 @@ impl Worker {
                     .queue_publish(&mut factory, out_qos, packet_id, false)
                 {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
+                        delayed_backpressure_count += 1;
+                        last_delayed_backpressure_sub = Some((sub.handle.worker_id(), sub.handle.token()));
+                    }
+                }
+            }
+
+            // Log accumulated delayed will backpressure drops (rate limited to every 10s per worker)
+            if delayed_backpressure_count > 0 {
+                if let Some(count) = self.subscriber_backpressure_log.increment_by(delayed_backpressure_count as u64) {
+                    if let Some((worker_id, token)) = last_delayed_backpressure_sub {
                         log::warn!(
-                            "Backpressure: dropping delayed will to slow subscriber (worker={}, token={:?})",
-                            sub.handle.worker_id(),
-                            sub.handle.token()
+                            "Backpressure: dropped {} delayed will messages to slow subscribers (last: worker={}, token={:?})",
+                            count,
+                            worker_id,
+                            token
                         );
                     }
                 }

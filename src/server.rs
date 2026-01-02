@@ -14,6 +14,7 @@ use log::{debug, error, info};
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 
+use crate::config::Config;
 use crate::error::Result;
 use crate::shared::SharedState;
 use crate::worker::{Worker, WorkerMsg};
@@ -34,17 +35,13 @@ pub struct Server {
     next_worker: usize,
     /// Number of workers.
     num_workers: usize,
+    /// Broker configuration.
+    config: Arc<Config>,
 }
 
 impl Server {
-    /// Create a new server bound to the given address.
-    #[allow(dead_code)]
-    pub fn new(addr: SocketAddr) -> Result<Self> {
-        Self::with_workers(addr, 1)
-    }
-
-    /// Create a new server with the specified number of workers.
-    pub fn with_workers(addr: SocketAddr, num_workers: usize) -> Result<Self> {
+    /// Create a new server with the specified number of workers and config.
+    pub fn new(addr: SocketAddr, num_workers: usize, config: Arc<Config>) -> Result<Self> {
         let poll = Poll::new()?;
         let mut listener = TcpListener::bind(addr)?;
 
@@ -59,6 +56,7 @@ impl Server {
             worker_senders: Vec::new(),
             next_worker: 0,
             num_workers,
+            config,
         })
     }
 
@@ -77,7 +75,13 @@ impl Server {
         if self.num_workers == 1 {
             // Single worker: run in main thread (best latency)
             let rx = receivers.remove(0);
-            let mut worker = Worker::new(0, shared, rx, self.worker_senders.clone())?;
+            let mut worker = Worker::new(
+                0,
+                shared,
+                rx,
+                self.worker_senders.clone(),
+                Arc::clone(&self.config),
+            )?;
 
             let mut events = Events::with_capacity(1024);
 
@@ -100,12 +104,13 @@ impl Server {
             for (id, rx) in receivers.into_iter().enumerate() {
                 let shared = Arc::clone(&shared);
                 let senders = self.worker_senders.clone();
+                let config = Arc::clone(&self.config);
 
                 let handle = thread::Builder::new()
                     .name(format!("worker-{}", id))
                     .spawn(move || {
-                        let mut worker =
-                            Worker::new(id, shared, rx, senders).expect("Failed to create worker");
+                        let mut worker = Worker::new(id, shared, rx, senders, config)
+                            .expect("Failed to create worker");
                         if let Err(e) = worker.run() {
                             error!("Worker {} error: {}", id, e);
                         }

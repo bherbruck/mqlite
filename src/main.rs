@@ -2,27 +2,31 @@
 
 mod client;
 mod client_handle;
+mod config;
 mod error;
 mod packet;
 mod publish_encoder;
 mod server;
 mod shared;
 mod subscription;
+mod util;
 mod worker;
 mod write_buffer;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use log::{error, info};
 
+use crate::config::Config;
 use crate::server::Server;
 
-struct Config {
+struct Args {
     bind_addr: SocketAddr,
     num_threads: usize,
 }
 
-fn parse_args() -> Config {
+fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
     let mut bind_addr = "0.0.0.0:1883".to_string();
     let mut num_threads = num_cpus::get();
@@ -78,7 +82,7 @@ fn parse_args() -> Config {
         std::process::exit(1);
     });
 
-    Config {
+    Args {
         bind_addr,
         num_threads,
     }
@@ -87,11 +91,23 @@ fn parse_args() -> Config {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let config = parse_args();
+    let args = parse_args();
+    let config = Arc::new(Config::default());
 
-    info!("Starting mqlite with {} worker threads", config.num_threads);
+    // Validate config
+    if let Err(e) = config.validate() {
+        error!("Invalid configuration: {}", e);
+        std::process::exit(1);
+    }
 
-    let mut server = match Server::with_workers(config.bind_addr, config.num_threads) {
+    info!(
+        "Starting mqlite with {} worker threads (max_packet_size={}KB, max_inflight={})",
+        args.num_threads,
+        config.max_packet_size / 1024,
+        config.max_inflight
+    );
+
+    let mut server = match Server::new(args.bind_addr, args.num_threads, config) {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to start server: {}", e);

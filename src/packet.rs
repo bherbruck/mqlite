@@ -575,7 +575,12 @@ pub fn encode_remaining_length(mut len: usize, buf: &mut [u8]) -> usize {
 /// Returns Ok(Some((packet, bytes_consumed))) if successful,
 /// Ok(None) if more data is needed, or Err on protocol errors.
 /// protocol_version: 0 = unknown (for CONNECT), 3 = MQTT 3.1, 4 = MQTT 3.1.1, 5 = MQTT 5.0
-pub fn decode_packet(buf: &[u8], protocol_version: u8) -> Result<Option<(Packet, usize)>> {
+/// max_packet_size: Maximum allowed packet size (0 = no limit).
+pub fn decode_packet(
+    buf: &[u8],
+    protocol_version: u8,
+    max_packet_size: u32,
+) -> Result<Option<(Packet, usize)>> {
     if buf.is_empty() {
         return Ok(None);
     }
@@ -591,6 +596,15 @@ pub fn decode_packet(buf: &[u8], protocol_version: u8) -> Result<Option<(Packet,
 
     let header_len = 1 + len_bytes;
     let total_len = header_len + remaining_len;
+
+    // Check packet size limit
+    if max_packet_size > 0 && total_len > max_packet_size as usize {
+        return Err(ProtocolError::PacketTooLarge {
+            size: total_len,
+            max: max_packet_size as usize,
+        }
+        .into());
+    }
 
     if buf.len() < total_len {
         return Ok(None);
@@ -1352,4 +1366,40 @@ fn encode_unsuback(unsuback: &Unsuback, buf: &mut Vec<u8>) {
 fn encode_pingresp(buf: &mut Vec<u8>) {
     buf.push((PacketType::Pingresp as u8) << 4);
     buf.push(0); // Remaining length
+}
+
+// === Topic Validation ===
+
+/// Validate a topic name or filter against length and depth limits.
+/// Returns Ok(()) if valid, or an appropriate ProtocolError.
+/// Zero-allocation on success, early-exits on depth violation.
+#[inline]
+pub fn validate_topic(topic: &[u8], max_length: usize, max_levels: usize) -> Result<()> {
+    // Check length (0 = no limit)
+    if max_length > 0 && topic.len() > max_length {
+        return Err(ProtocolError::TopicTooLong {
+            len: topic.len(),
+            max: max_length,
+        }
+        .into());
+    }
+
+    // Check levels with early exit (0 = no limit)
+    if max_levels > 0 {
+        let mut levels = 1usize;
+        for &b in topic {
+            if b == b'/' {
+                levels += 1;
+                if levels > max_levels {
+                    return Err(ProtocolError::TopicTooDeep {
+                        levels,
+                        max: max_levels,
+                    }
+                    .into());
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

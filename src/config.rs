@@ -1,4 +1,29 @@
 //! Broker configuration and limits.
+//!
+//! Supports configuration from:
+//! - TOML file (default: `mqlite.toml`)
+//! - Environment variables with `MQLITE__` prefix (double underscore for nesting)
+//! - In-file variable substitution: `${VAR}` or `${VAR:-default}`
+//!
+//! Environment variable examples:
+//! - `MQLITE__SERVER__BIND=0.0.0.0:1884`
+//! - `MQLITE__LIMITS__MAX_PACKET_SIZE=2097152`
+//! - `MQLITE__MQTT__MAX_QOS=1`
+//!
+//! In-file substitution examples:
+//! ```toml
+//! [server]
+//! bind = "${MQTT_HOST:-0.0.0.0}:${MQTT_PORT:-1883}"
+//! ```
+
+use std::net::SocketAddr;
+use std::path::Path;
+
+use config::{Environment, File, FileFormat};
+use regex::Regex;
+use serde::Deserialize;
+
+// === Default Constants ===
 
 /// Default maximum packet size (1MB).
 pub const DEFAULT_MAX_PACKET_SIZE: u32 = 1024 * 1024;
@@ -24,45 +49,171 @@ pub const DEFAULT_MAX_INFLIGHT: u16 = 32;
 /// Default maximum connections.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100_000;
 
-/// Broker configuration.
-#[derive(Debug, Clone)]
+/// Default keep alive in seconds.
+pub const DEFAULT_KEEP_ALIVE: u16 = 60;
+
+/// Default maximum keep alive in seconds.
+pub const DEFAULT_MAX_KEEP_ALIVE: u16 = 65535;
+
+// === Environment Variable Substitution ===
+
+/// Substitute environment variables in a string.
+/// Supports `${VAR}` and `${VAR:-default}` syntax.
+fn substitute_env_vars(content: &str) -> String {
+    let re = Regex::new(r"\$\{([^}:]+)(?::-([^}]*))?\}").unwrap();
+    re.replace_all(content, |caps: &regex::Captures| {
+        let var_name = &caps[1];
+        let default = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        std::env::var(var_name).unwrap_or_else(|_| default.to_string())
+    })
+    .to_string()
+}
+
+// === Configuration Structures ===
+
+/// Root configuration structure.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
-    // === Protocol Limits ===
+    /// Logging configuration.
+    pub log: LogConfig,
+    /// Server configuration.
+    pub server: ServerConfig,
+    /// Limits configuration.
+    pub limits: LimitsConfig,
+    /// Session configuration.
+    pub session: SessionConfig,
+    /// MQTT feature configuration.
+    pub mqtt: MqttConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            log: LogConfig::default(),
+            server: ServerConfig::default(),
+            limits: LimitsConfig::default(),
+            session: SessionConfig::default(),
+            mqtt: MqttConfig::default(),
+        }
+    }
+}
+
+/// Logging configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LogConfig {
+    /// Log level: error, warn, info, debug, trace.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+        }
+    }
+}
+
+/// Server configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    /// TCP bind address.
+    #[serde(default = "default_bind")]
+    pub bind: SocketAddr,
+    /// Number of worker threads (0 = auto based on CPU count).
+    #[serde(default)]
+    pub workers: usize,
+}
+
+fn default_bind() -> SocketAddr {
+    "0.0.0.0:1883".parse().unwrap()
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_bind(),
+            workers: 0,
+        }
+    }
+}
+
+/// Limits configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
     /// Maximum MQTT packet size in bytes.
     /// Packets exceeding this are rejected. Advertised in CONNACK for MQTT 5.
+    #[serde(default = "default_max_packet_size")]
     pub max_packet_size: u32,
 
     /// Maximum topic name length in bytes.
+    #[serde(default = "default_max_topic_length")]
     pub max_topic_length: usize,
 
     /// Maximum topic levels (segments separated by '/').
     /// Prevents subscription trie explosion from deeply nested wildcards.
+    #[serde(default = "default_max_topic_levels")]
     pub max_topic_levels: usize,
 
-    // === Flow Control (MQTT 5) ===
     /// Receive Maximum: max unacked QoS 1/2 messages we accept from a client.
     /// Advertised in CONNACK. Client exceeding this gets disconnected.
+    #[serde(default = "default_receive_maximum")]
     pub receive_maximum: u16,
 
     /// Topic Alias Maximum: max topic aliases we support per client.
     /// Advertised in CONNACK. 0 = topic aliases disabled.
+    #[serde(default = "default_topic_alias_maximum")]
     pub topic_alias_maximum: u16,
 
-    // === Backpressure ===
     /// Per-client write buffer soft limit in bytes.
     /// When exceeded, QoS 0 messages are dropped (backpressure).
+    #[serde(default = "default_client_write_buffer_size")]
     pub client_write_buffer_size: usize,
 
     /// Maximum inflight QoS 1/2 messages per client (broker -> client).
     /// Respects client's Receive Maximum if lower.
+    #[serde(default = "default_max_inflight")]
     pub max_inflight: u16,
 
-    // === Connection Limits ===
     /// Maximum concurrent connections.
+    #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 }
 
-impl Default for Config {
+fn default_max_packet_size() -> u32 {
+    DEFAULT_MAX_PACKET_SIZE
+}
+fn default_max_topic_length() -> usize {
+    DEFAULT_MAX_TOPIC_LENGTH
+}
+fn default_max_topic_levels() -> usize {
+    DEFAULT_MAX_TOPIC_LEVELS
+}
+fn default_receive_maximum() -> u16 {
+    DEFAULT_RECEIVE_MAXIMUM
+}
+fn default_topic_alias_maximum() -> u16 {
+    DEFAULT_TOPIC_ALIAS_MAXIMUM
+}
+fn default_client_write_buffer_size() -> usize {
+    DEFAULT_CLIENT_WRITE_BUFFER_SIZE
+}
+fn default_max_inflight() -> u16 {
+    DEFAULT_MAX_INFLIGHT
+}
+fn default_max_connections() -> usize {
+    DEFAULT_MAX_CONNECTIONS
+}
+
+impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
@@ -77,39 +228,229 @@ impl Default for Config {
     }
 }
 
+/// Session configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Default keep alive in seconds (used when client sends 0).
+    #[serde(default = "default_keep_alive")]
+    pub default_keep_alive: u16,
+
+    /// Maximum keep alive in seconds (client value capped to this).
+    #[serde(default = "default_max_keep_alive")]
+    pub max_keep_alive: u16,
+
+    /// Maximum topic aliases per client (MQTT v5).
+    #[serde(default = "default_topic_alias_maximum")]
+    pub max_topic_aliases: u16,
+}
+
+fn default_keep_alive() -> u16 {
+    DEFAULT_KEEP_ALIVE
+}
+fn default_max_keep_alive() -> u16 {
+    DEFAULT_MAX_KEEP_ALIVE
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            default_keep_alive: DEFAULT_KEEP_ALIVE,
+            max_keep_alive: DEFAULT_MAX_KEEP_ALIVE,
+            max_topic_aliases: DEFAULT_TOPIC_ALIAS_MAXIMUM,
+        }
+    }
+}
+
+/// MQTT feature configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MqttConfig {
+    /// Maximum QoS level (0, 1, or 2).
+    #[serde(default = "default_max_qos")]
+    pub max_qos: u8,
+
+    /// Whether retained messages are available.
+    #[serde(default = "default_true")]
+    pub retain_available: bool,
+
+    /// Whether wildcard subscriptions are available.
+    #[serde(default = "default_true")]
+    pub wildcard_subscriptions: bool,
+
+    /// Whether subscription identifiers are available (MQTT v5).
+    #[serde(default = "default_true")]
+    pub subscription_identifiers: bool,
+
+    /// Whether shared subscriptions are available.
+    #[serde(default = "default_true")]
+    pub shared_subscriptions: bool,
+}
+
+fn default_max_qos() -> u8 {
+    2
+}
+fn default_true() -> bool {
+    true
+}
+
+impl Default for MqttConfig {
+    fn default() -> Self {
+        Self {
+            max_qos: 2,
+            retain_available: true,
+            wildcard_subscriptions: true,
+            subscription_identifiers: true,
+            shared_subscriptions: true,
+        }
+    }
+}
+
+// === Configuration Error ===
+
+/// Configuration error.
+#[derive(Debug)]
+pub enum ConfigError {
+    /// IO error reading config file.
+    Io(std::io::Error),
+    /// Config parsing/loading error.
+    Config(config::ConfigError),
+    /// Invalid configuration value.
+    Validation(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Io(e) => write!(f, "IO error: {}", e),
+            ConfigError::Config(e) => write!(f, "Config error: {}", e),
+            ConfigError::Validation(msg) => write!(f, "Validation error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl From<std::io::Error> for ConfigError {
+    fn from(e: std::io::Error) -> Self {
+        ConfigError::Io(e)
+    }
+}
+
+impl From<config::ConfigError> for ConfigError {
+    fn from(e: config::ConfigError) -> Self {
+        ConfigError::Config(e)
+    }
+}
+
+// === Configuration Implementation ===
+
 impl Config {
-    /// Create a new config with default values.
-    pub fn new() -> Self {
-        Self::default()
+    /// Load configuration from a TOML file with environment variable overrides.
+    ///
+    /// Supports two forms of environment variable usage:
+    /// 1. In-file substitution: `${VAR}` or `${VAR:-default}` syntax in the TOML file
+    /// 2. Override via env vars: `MQLITE__` prefix with double underscores for nesting:
+    ///    - `MQLITE__SERVER__BIND=0.0.0.0:1884`
+    ///    - `MQLITE__LIMITS__MAX_PACKET_SIZE=2097152`
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
+        let mut builder = config::Config::builder()
+            // Start with defaults
+            .set_default("log.level", "info")?
+            .set_default("server.bind", "0.0.0.0:1883")?
+            .set_default("server.workers", 0)?
+            .set_default("limits.max_packet_size", DEFAULT_MAX_PACKET_SIZE as i64)?
+            .set_default("limits.max_topic_length", DEFAULT_MAX_TOPIC_LENGTH as i64)?
+            .set_default("limits.max_topic_levels", DEFAULT_MAX_TOPIC_LEVELS as i64)?
+            .set_default("limits.receive_maximum", DEFAULT_RECEIVE_MAXIMUM as i64)?
+            .set_default("limits.topic_alias_maximum", DEFAULT_TOPIC_ALIAS_MAXIMUM as i64)?
+            .set_default("limits.client_write_buffer_size", DEFAULT_CLIENT_WRITE_BUFFER_SIZE as i64)?
+            .set_default("limits.max_inflight", DEFAULT_MAX_INFLIGHT as i64)?
+            .set_default("limits.max_connections", DEFAULT_MAX_CONNECTIONS as i64)?
+            .set_default("session.default_keep_alive", DEFAULT_KEEP_ALIVE as i64)?
+            .set_default("session.max_keep_alive", DEFAULT_MAX_KEEP_ALIVE as i64)?
+            .set_default("session.max_topic_aliases", DEFAULT_TOPIC_ALIAS_MAXIMUM as i64)?
+            .set_default("mqtt.max_qos", 2)?
+            .set_default("mqtt.retain_available", true)?
+            .set_default("mqtt.wildcard_subscriptions", true)?
+            .set_default("mqtt.subscription_identifiers", true)?
+            .set_default("mqtt.shared_subscriptions", true)?;
+
+        // Load from file with env var substitution
+        let path = path.as_ref();
+        if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    let substituted = substitute_env_vars(&content);
+                    builder = builder.add_source(File::from_str(&substituted, FileFormat::Toml));
+                }
+                Err(e) => return Err(ConfigError::Io(e)),
+            }
+        }
+
+        // Override with environment variables (MQLITE__SERVER__BIND, etc.)
+        let cfg = builder
+            .add_source(
+                Environment::with_prefix("MQLITE")
+                    .separator("__")
+                    .try_parsing(true),
+            )
+            .build()?;
+
+        let config: Config = cfg.try_deserialize()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Load configuration from environment variables only (no file).
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::load(Path::new(""))
+    }
+
+    /// Parse configuration from a TOML string (for testing).
+    pub fn parse(content: &str) -> Result<Self, ConfigError> {
+        let substituted = substitute_env_vars(content);
+        let config: Config = toml::from_str(&substituted).map_err(|e| {
+            ConfigError::Validation(format!("TOML parse error: {}", e))
+        })?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
         // MQTT protocol maximum is 268,435,455 bytes
-        if self.max_packet_size > 268_435_455 {
-            return Err(ConfigError::InvalidValue(
+        if self.limits.max_packet_size > 268_435_455 {
+            return Err(ConfigError::Validation(
                 "max_packet_size cannot exceed MQTT protocol maximum (268,435,455)".into(),
             ));
         }
 
         // Receive Maximum of 0 is a protocol error
-        if self.receive_maximum == 0 {
-            return Err(ConfigError::InvalidValue(
+        if self.limits.receive_maximum == 0 {
+            return Err(ConfigError::Validation(
                 "receive_maximum must be at least 1".into(),
             ));
         }
 
         // Max topic length cannot exceed protocol limit
-        if self.max_topic_length > 65535 {
-            return Err(ConfigError::InvalidValue(
+        if self.limits.max_topic_length > 65535 {
+            return Err(ConfigError::Validation(
                 "max_topic_length cannot exceed 65535".into(),
             ));
         }
 
         // Sanity check on max inflight
-        if self.max_inflight == 0 {
-            return Err(ConfigError::InvalidValue(
+        if self.limits.max_inflight == 0 {
+            return Err(ConfigError::Validation(
                 "max_inflight must be at least 1".into(),
+            ));
+        }
+
+        // Validate max_qos
+        if self.mqtt.max_qos > 2 {
+            return Err(ConfigError::Validation(
+                "max_qos must be 0, 1, or 2".into(),
             ));
         }
 
@@ -117,22 +458,7 @@ impl Config {
     }
 }
 
-/// Configuration error.
-#[derive(Debug, Clone)]
-pub enum ConfigError {
-    /// Invalid configuration value.
-    InvalidValue(String),
-}
-
-impl std::fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConfigError::InvalidValue(msg) => write!(f, "invalid config: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
+// === Tests ===
 
 #[cfg(test)]
 mod tests {
@@ -147,14 +473,90 @@ mod tests {
     #[test]
     fn test_invalid_receive_maximum() {
         let mut config = Config::default();
-        config.receive_maximum = 0;
+        config.limits.receive_maximum = 0;
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_invalid_max_packet_size() {
         let mut config = Config::default();
-        config.max_packet_size = 300_000_000; // Exceeds MQTT max
+        config.limits.max_packet_size = 300_000_000; // Exceeds MQTT max
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_invalid_max_qos() {
+        let mut config = Config::default();
+        config.mqtt.max_qos = 3;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_parse_toml() {
+        let toml = r#"
+[log]
+level = "debug"
+
+[server]
+bind = "127.0.0.1:1884"
+workers = 4
+
+[limits]
+max_packet_size = 2097152
+max_topic_levels = 64
+
+[session]
+default_keep_alive = 120
+max_keep_alive = 300
+
+[mqtt]
+max_qos = 1
+retain_available = false
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.log.level, "debug");
+        assert_eq!(config.server.bind.port(), 1884);
+        assert_eq!(config.server.workers, 4);
+        assert_eq!(config.limits.max_packet_size, 2097152);
+        assert_eq!(config.limits.max_topic_levels, 64);
+        assert_eq!(config.session.default_keep_alive, 120);
+        assert_eq!(config.session.max_keep_alive, 300);
+        assert_eq!(config.mqtt.max_qos, 1);
+        assert!(!config.mqtt.retain_available);
+    }
+
+    #[test]
+    fn test_parse_partial_toml() {
+        // Only override some values, rest should use defaults
+        let toml = r#"
+[limits]
+max_packet_size = 512000
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.limits.max_packet_size, 512000);
+        assert_eq!(config.limits.max_topic_levels, DEFAULT_MAX_TOPIC_LEVELS);
+        assert_eq!(config.server.bind, default_bind());
+        assert_eq!(config.mqtt.max_qos, 2);
+    }
+
+    #[test]
+    fn test_env_var_substitution() {
+        std::env::set_var("TEST_PORT", "1885");
+        let content = r#"
+[server]
+bind = "0.0.0.0:${TEST_PORT}"
+"#;
+        let substituted = substitute_env_vars(content);
+        assert!(substituted.contains("0.0.0.0:1885"));
+        std::env::remove_var("TEST_PORT");
+    }
+
+    #[test]
+    fn test_env_var_substitution_with_default() {
+        // Ensure var is not set
+        std::env::remove_var("NONEXISTENT_VAR");
+        let content = r#"bind = "${NONEXISTENT_VAR:-0.0.0.0:1883}""#;
+        let substituted = substitute_env_vars(content);
+        assert!(substituted.contains("0.0.0.0:1883"));
     }
 }

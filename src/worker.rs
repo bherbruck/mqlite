@@ -454,7 +454,7 @@ impl Worker {
                     return Ok(());
                 }
 
-                match client.decode_packet(self.config.max_packet_size) {
+                match client.decode_packet(self.config.limits.max_packet_size) {
                     Ok(Some(packet)) => {
                         client.last_packet_time = Instant::now();
                         packet
@@ -853,11 +853,11 @@ impl Worker {
             props.maximum_qos = Some(2);
 
             // Advertise server limits (MQTT 5 flow control)
-            props.receive_maximum = Some(self.config.receive_maximum);
-            if self.config.max_packet_size > 0 {
-                props.maximum_packet_size = Some(self.config.max_packet_size);
+            props.receive_maximum = Some(self.config.limits.receive_maximum);
+            if self.config.limits.max_packet_size > 0 {
+                props.maximum_packet_size = Some(self.config.limits.max_packet_size);
             }
-            props.topic_alias_maximum = Some(self.config.topic_alias_maximum);
+            props.topic_alias_maximum = Some(self.config.limits.topic_alias_maximum);
 
             Connack {
                 session_present,
@@ -943,8 +943,8 @@ impl Worker {
             // Validate topic filter length and depth
             if validate_topic(
                 actual_filter.as_bytes(),
-                self.config.max_topic_length,
-                self.config.max_topic_levels,
+                self.config.limits.max_topic_length,
+                self.config.limits.max_topic_levels,
             )
             .is_err()
             {
@@ -1165,8 +1165,8 @@ impl Worker {
         // Validate topic length and depth
         if let Err(_e) = validate_topic(
             &publish.topic,
-            self.config.max_topic_length,
-            self.config.max_topic_levels,
+            self.config.limits.max_topic_length,
+            self.config.limits.max_topic_levels,
         ) {
             // Topic too long or too deep - disconnect client
             if let Some(client) = self.clients.get_mut(&from_token) {

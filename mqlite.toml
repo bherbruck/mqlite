@@ -1,0 +1,121 @@
+# mqlite Configuration Example
+# Copy this file to mqlite.toml and customize as needed
+#
+# Environment Variables:
+#
+# 1. In-file substitution using ${VAR} or ${VAR:-default} syntax:
+#    bind = "${MQTT_HOST:-0.0.0.0}:${MQTT_PORT:-1883}"
+#    password = "${ADMIN_PASSWORD}"
+#
+# 2. Override any field with MQLITE__ prefixed env vars (double underscore):
+#    MQLITE__SERVER__BIND=0.0.0.0:1884
+#    MQLITE__LIMITS__MAX_CONNECTIONS=50000
+#    MQLITE__MQTT__MAX_QOS=1
+#    MQLITE__LOG__LEVEL=debug
+
+[log]
+# Log level: error, warn, info, debug, trace
+level = "info"
+
+[server]
+# TCP bind address for MQTT connections
+bind = "0.0.0.0:1883"
+# Number of worker threads (0 = auto, uses CPU count)
+workers = 0
+
+[limits]
+# Note: Set any limit to 0 for unbounded (where applicable)
+
+# Maximum number of concurrent connections (default: 100000)
+max_connections = 100000
+
+# Maximum MQTT packet size in bytes (default: 1048576 = 1MB)
+# Packets exceeding this are rejected. Advertised in CONNACK for MQTT 5.
+max_packet_size = 1048576
+
+# Maximum topic name length in bytes (default: 4096)
+max_topic_length = 4096
+
+# Maximum topic levels (depth) allowed (default: 32)
+# Topic levels are separated by '/'. For example, "a/b/c" has 3 levels.
+# Prevents subscription trie explosion from deeply nested wildcards.
+max_topic_levels = 32
+
+# Receive Maximum: max unacked QoS 1/2 messages we accept from a client (default: 65535)
+# Advertised in CONNACK. Client exceeding this gets disconnected.
+receive_maximum = 65535
+
+# Topic Alias Maximum: max topic aliases per client (default: 0 = disabled)
+# Advertised in CONNACK for MQTT 5.
+topic_alias_maximum = 0
+
+# Per-client write buffer soft limit in bytes (default: 1048576 = 1MB)
+# When exceeded, QoS 0 messages are dropped (backpressure).
+client_write_buffer_size = 1048576
+
+# Maximum in-flight QoS 1/2 messages per client (broker -> client) (default: 32)
+# Respects client's Receive Maximum if lower.
+max_inflight = 32
+
+[session]
+# Default keep alive in seconds (used when client sends 0)
+default_keep_alive = 60
+
+# Maximum keep alive in seconds (client value capped to this)
+max_keep_alive = 65535
+
+# Maximum topic aliases per client (MQTT v5)
+max_topic_aliases = 0
+
+[mqtt]
+# Maximum QoS level (0, 1, or 2)
+max_qos = 2
+
+# Whether retained messages are available
+retain_available = true
+
+# Whether wildcard subscriptions are available
+wildcard_subscriptions = true
+
+# Whether subscription identifiers are available (MQTT v5)
+subscription_identifiers = true
+
+# Whether shared subscriptions are available
+shared_subscriptions = true
+
+# --- Future Configuration Sections (not yet implemented) ---
+#
+# [auth]
+# enabled = false
+# allow_anonymous = true
+#
+# [[auth.users]]
+# username = "admin"
+# password = "${ADMIN_PASSWORD}"
+# role = "admin"
+#
+# [acl]
+# enabled = false
+#
+# [[acl.roles]]
+# name = "admin"
+# publish = ["#"]
+# subscribe = ["#"]
+#
+# [acl.default]
+# publish = ["#"]
+# subscribe = ["#", "$SYS/#"]
+#
+# [tls]
+# bind = "0.0.0.0:8883"
+# cert = "/path/to/cert.pem"
+# key = "/path/to/key.pem"
+#
+# [websocket]
+# bind = "0.0.0.0:9001"
+# path = "/mqtt"
+#
+# [persistence]
+# enabled = true
+# backend = "sqlite"
+# path = "/var/lib/mqlite"

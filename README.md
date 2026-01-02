@@ -44,7 +44,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed internals includin
 
 ## Roadmap
 
-- [ ] MQTT v5 conformance
+- [x] MQTT v5 conformance
 - [ ] Plugin system (auth, ACL, etc.)
 - [ ] TLS/SSL support
 - [ ] WebSocket support

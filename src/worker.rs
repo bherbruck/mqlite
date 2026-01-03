@@ -845,12 +845,28 @@ impl Worker {
                 props.assigned_client_identifier = Some(id);
             }
 
-            // Set server capabilities
-            props.retain_available = Some(true);
-            props.wildcard_subscription_available = Some(true);
-            props.subscription_identifiers_available = Some(true);
-            props.shared_subscription_available = Some(true);
-            props.maximum_qos = Some(2);
+            // Set server capabilities from config
+            // Per MQTT 5 spec: retain_available defaults to true if absent
+            if !self.config.mqtt.retain_available {
+                props.retain_available = Some(false);
+            }
+            // Per MQTT 5 spec: wildcard_subscription_available defaults to true if absent
+            if !self.config.mqtt.wildcard_subscriptions {
+                props.wildcard_subscription_available = Some(false);
+            }
+            // Per MQTT 5 spec: subscription_identifiers_available defaults to true if absent
+            if !self.config.mqtt.subscription_identifiers {
+                props.subscription_identifiers_available = Some(false);
+            }
+            // Per MQTT 5 spec: shared_subscription_available defaults to true if absent
+            if !self.config.mqtt.shared_subscriptions {
+                props.shared_subscription_available = Some(false);
+            }
+            // Per MQTT 5 spec: Maximum QoS absent = QoS 2 supported
+            // Only send if < 2 (0 or 1), never send value 2
+            if self.config.mqtt.max_qos < 2 {
+                props.maximum_qos = Some(self.config.mqtt.max_qos);
+            }
 
             // Advertise server limits (MQTT 5 flow control)
             props.receive_maximum = Some(self.config.limits.receive_maximum);
@@ -909,13 +925,31 @@ impl Worker {
         // (retained_msg, stored_at, sub_qos, retain_as_published, subscription_id)
         let mut retained_to_send: Vec<(Publish, Instant, QoS, bool, Option<u32>)> = Vec::new();
 
-        let (client_id, clean_session) = {
+        let (client_id, clean_session, is_v5) = {
             let client = self.clients.get(&token);
             (
                 client.and_then(|c| c.client_id.clone()),
                 client.map(|c| c.clean_session).unwrap_or(true),
+                client.map(|c| c.protocol_version == 5).unwrap_or(false),
             )
         };
+
+        // Enforce subscription_identifiers: reject if subscription ID present but feature disabled
+        if subscribe.subscription_id.is_some() && !self.config.mqtt.subscription_identifiers {
+            // MQTT 5: 0xA1 = Subscription Identifiers not supported
+            for _ in &subscribe.topics {
+                return_codes.push(if is_v5 { 0xA1 } else { 0x80 });
+            }
+            if let Some(client) = self.clients.get_mut(&token) {
+                let suback = Suback {
+                    packet_id: subscribe.packet_id,
+                    return_codes,
+                    is_v5,
+                };
+                let _ = client.queue_packet(&Packet::Suback(suback));
+            }
+            return Ok(());
+        }
 
         let handle = self.token_to_handle.get(&token).cloned();
 
@@ -940,6 +974,22 @@ impl Worker {
                     (topic_filter.clone(), None)
                 };
 
+            // Enforce shared_subscriptions: reject if shared subscription but feature disabled
+            if share_group.is_some() && !self.config.mqtt.shared_subscriptions {
+                // MQTT 5: 0x9E = Shared Subscriptions not supported
+                return_codes.push(if is_v5 { 0x9E } else { 0x80 });
+                continue;
+            }
+
+            // Enforce wildcard_subscriptions: reject if wildcard in filter but feature disabled
+            let has_wildcard =
+                actual_filter.contains('+') || actual_filter.contains('#');
+            if has_wildcard && !self.config.mqtt.wildcard_subscriptions {
+                // MQTT 5: 0xA2 = Wildcard Subscriptions not supported
+                return_codes.push(if is_v5 { 0xA2 } else { 0x80 });
+                continue;
+            }
+
             // Validate topic filter length and depth
             if validate_topic(
                 actual_filter.as_bytes(),
@@ -951,8 +1001,6 @@ impl Worker {
                 // Topic too long or too deep - return error code for this subscription
                 // MQTT 5: 0x97 = Quota exceeded (closest match)
                 // MQTT 3.1.1: 0x80 = Failure
-                let client = self.clients.get(&token);
-                let is_v5 = client.map(|c| c.protocol_version == 5).unwrap_or(false);
                 return_codes.push(if is_v5 { 0x97 } else { 0x80 });
                 continue;
             }
@@ -1170,6 +1218,26 @@ impl Worker {
         ) {
             // Topic too long or too deep - disconnect client
             if let Some(client) = self.clients.get_mut(&from_token) {
+                client.state = ClientState::Disconnecting;
+            }
+            return Ok(());
+        }
+
+        // Enforce max_qos: reject publish if QoS exceeds server maximum
+        if publish.qos as u8 > self.config.mqtt.max_qos {
+            if let Some(client) = self.clients.get_mut(&from_token) {
+                // Protocol error - client violated server's advertised Maximum QoS
+                // MQTT 5: 0x9B = QoS not supported
+                client.state = ClientState::Disconnecting;
+            }
+            return Ok(());
+        }
+
+        // Enforce retain_available: reject retained publish if disabled
+        if publish.retain && !self.config.mqtt.retain_available {
+            if let Some(client) = self.clients.get_mut(&from_token) {
+                // Protocol error - client violated server's advertised Retain Available
+                // MQTT 5: 0x9A = Retain not supported
                 client.state = ClientState::Disconnecting;
             }
             return Ok(());

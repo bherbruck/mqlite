@@ -25,6 +25,15 @@ workers = 0
 # $SYS topic publish interval in seconds (0 = disabled)
 sys_interval = 10
 
+# PROXY Protocol Configuration (HAProxy PROXY protocol v1/v2)
+# Enable when running behind a load balancer that sends PROXY headers.
+# This preserves real client IP addresses through the proxy layer.
+# When enabled, connections without a valid PROXY header are rejected.
+#
+# [server.proxy_protocol]
+# enabled = true
+# timeout_secs = 5
+
 [limits]
 # Note: Set any limit to 0 for unbounded (where applicable)
 
@@ -164,6 +173,13 @@ bind = "0.0.0.0:8883"
 cert = "/etc/mqlite/certs/cert.pem"
 # Path to PEM-encoded private key file
 key = "/etc/mqlite/certs/key.pem"
+
+# PROXY Protocol Configuration for TLS listener
+# Note: PROXY header is parsed on the raw socket BEFORE TLS handshake
+#
+# [tls.proxy_protocol]
+# enabled = true
+# timeout_secs = 5
 
 # Generate self-signed certs for testing:
 # openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes

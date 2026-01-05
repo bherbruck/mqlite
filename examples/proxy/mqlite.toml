@@ -1,0 +1,29 @@
+# mqlite configuration with PROXY protocol enabled
+# Used behind HAProxy or other load balancers
+
+[log]
+level = "debug"
+
+[server]
+bind = "0.0.0.0:1883"
+workers = 0
+
+# Enable PROXY protocol to get real client IPs from HAProxy
+[server.proxy_protocol]
+enabled = true
+timeout_secs = 5
+
+[limits]
+max_connections = 10000
+
+[auth]
+enabled = false
+
+[acl]
+enabled = false
+
+[prometheus]
+enabled = false
+
+[tls]
+enabled = false

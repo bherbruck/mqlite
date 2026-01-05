@@ -50,6 +50,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed internals includin
 - [x] $SYS broker statistics topics
 - [x] Prometheus metrics endpoint
 - [x] TLS/SSL support (rustls)
+- [x] PROXY protocol v1/v2 (HAProxy, AWS NLB)
 - [ ] WebSocket support
 - [ ] Rhai scripting (message hooks for inflight data modification)
 - [ ] Enhanced persistence options (database backends)

@@ -15,8 +15,9 @@ use parking_lot::RwLock;
 
 use mio::Token;
 
-use crate::packet::{Publish, SubscriptionOptions};
-use crate::subscription::SubscriptionStore;
+use crate::packet::{Publish, QoS, SubscriptionOptions};
+use crate::publish_encoder::PublishEncoder;
+use crate::subscription::{Subscriber, SubscriptionStore};
 use crate::sys_tree::BrokerMetrics;
 
 /// A retained message with timestamp for expiry countdown.
@@ -84,6 +85,85 @@ impl SharedState {
             client_registry: RwLock::new(HashMap::new()),
             metrics: BrokerMetrics::new(),
         }
+    }
+
+    /// Publish a message internally (for $SYS topics, bridges, etc.).
+    ///
+    /// This method handles:
+    /// - Storing retained messages if `publish.retain` is true
+    /// - Fanout to all matching subscribers
+    /// - Proper retain flag handling per MQTT spec
+    ///
+    /// Used by internal broker components that need to publish messages
+    /// through the same path as regular client publishes.
+    pub fn internal_publish(&self, publish: Publish, subscriber_buf: &mut Vec<Subscriber>) {
+        // 1. Handle retained message storage
+        if publish.retain {
+            let topic_str = String::from_utf8_lossy(&publish.topic).into_owned();
+            if publish.payload.is_empty() {
+                // Empty payload = delete retained message
+                self.retained_messages.write().remove(&topic_str);
+            } else {
+                self.retained_messages.write().insert(
+                    topic_str,
+                    RetainedMessage {
+                        publish: publish.clone(),
+                        stored_at: Instant::now(),
+                    },
+                );
+            }
+        }
+
+        // 2. Find all matching subscribers
+        subscriber_buf.clear();
+        self.subscriptions
+            .read()
+            .match_topic_bytes_into(&publish.topic, subscriber_buf);
+
+        if subscriber_buf.is_empty() {
+            return;
+        }
+
+        // 3. Fanout to each subscriber
+        let mut factory = PublishEncoder::new(
+            publish.topic.clone(),
+            publish.payload.clone(),
+            publish.properties.clone(),
+        );
+
+        for sub in subscriber_buf.iter() {
+            // For internal publishes (like $SYS), preserve the retain flag as-is.
+            // This is broker-originated, not client-forwarding, so retain_as_published
+            // doesn't apply.
+            let out_retain = publish.retain;
+
+            // Downgrade QoS to subscriber's max
+            let effective_qos = std::cmp::min(publish.qos as u8, sub.qos as u8);
+            let out_qos = match effective_qos {
+                0 => QoS::AtMostOnce,
+                1 => QoS::AtLeastOnce,
+                _ => QoS::ExactlyOnce,
+            };
+
+            let packet_id = if out_qos != QoS::AtMostOnce {
+                Some(sub.handle.allocate_packet_id())
+            } else {
+                None
+            };
+
+            // Queue to subscriber (ignore slow client errors)
+            let _ = sub
+                .handle
+                .queue_publish(&mut factory, out_qos, packet_id, out_retain);
+        }
+    }
+
+    /// Convenience method to publish with a fresh subscriber buffer.
+    /// For frequent publishing, prefer `internal_publish` with a reusable buffer.
+    #[allow(dead_code)]
+    pub fn internal_publish_alloc(&self, publish: Publish) {
+        let mut buf = Vec::with_capacity(64);
+        self.internal_publish(publish, &mut buf);
     }
 }
 

@@ -166,7 +166,7 @@ bind = "0.0.0.0:9090"
 
 [tls]
 # Enable TLS listener (default: false)
-enabled = true
+enabled = false
 # TLS bind address (default: 0.0.0.0:8883)
 bind = "0.0.0.0:8883"
 # Path to PEM-encoded certificate file

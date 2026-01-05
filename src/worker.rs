@@ -18,11 +18,10 @@ use std::time::{Duration, Instant};
 use ahash::AHashMap;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
-use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 
 use crate::auth::{AuthContext, AuthProvider, AuthResult, ClientInfo};
-use crate::client::{Client, ClientState, PendingPublish};
+use crate::client::{Client, ClientState, PendingPublish, Transport};
 use crate::client_handle::ClientWriteHandle;
 use crate::config::Config;
 use crate::error::{ProtocolError, Result};
@@ -39,11 +38,10 @@ use crate::util::RateLimitedCounter;
 
 /// Messages sent to workers via channels (control plane only).
 /// Publish delivery uses direct writes, not channels.
-#[derive(Debug)]
 #[allow(dead_code)] // Shutdown variant reserved for graceful shutdown
 pub enum WorkerMsg {
     /// New connection from main thread.
-    NewClient { socket: TcpStream, addr: SocketAddr },
+    NewClient { transport: Transport, addr: SocketAddr },
     /// Disconnect a client (for client takeover).
     Disconnect { token: Token },
     /// Shutdown signal.
@@ -220,8 +218,8 @@ impl Worker {
         // Publish delivery uses direct writes via ClientWriteHandle
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                WorkerMsg::NewClient { socket, addr } => {
-                    self.accept_client(socket, addr)?;
+                WorkerMsg::NewClient { transport, addr } => {
+                    self.accept_client(transport, addr)?;
                 }
                 WorkerMsg::Disconnect { token } => {
                     if let Some(client) = self.clients.get_mut(&token) {
@@ -276,15 +274,15 @@ impl Worker {
     }
 
     /// Accept a new client connection.
-    fn accept_client(&mut self, mut socket: TcpStream, addr: SocketAddr) -> Result<()> {
+    fn accept_client(&mut self, mut transport: Transport, addr: SocketAddr) -> Result<()> {
         let token = Token(self.next_token);
         self.next_token += 1;
 
         self.poll
             .registry()
-            .register(&mut socket, token, Interest::READABLE)?;
+            .register(transport.tcp_stream_mut(), token, Interest::READABLE)?;
 
-        let client = Client::new(token, socket, addr, self.id, self.epoll_fd);
+        let client = Client::new(token, transport, addr, self.id, self.epoll_fd);
         // Store handle for subscription management
         let handle = client.handle.clone();
         self.token_to_handle.insert(token, handle);
@@ -1652,7 +1650,7 @@ impl Worker {
 
         for token in disconnected {
             if let Some(mut client) = self.clients.remove(&token) {
-                let _ = self.poll.registry().deregister(&mut client.socket);
+                let _ = self.poll.registry().deregister(client.transport.tcp_stream_mut());
 
                 // Track client disconnection for $SYS metrics
                 // Only count if client was fully connected (has client_id assigned)

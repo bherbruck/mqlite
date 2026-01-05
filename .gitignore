@@ -25,6 +25,10 @@ bin/
 profile/
 data/
 
+# TLS certificates and keys
+/certs/
+*.pem
+
 # Profiling artifacts
 perf.data
 perf.data.old

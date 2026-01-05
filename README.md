@@ -4,7 +4,7 @@ A high-performance MQTT broker written in Rust.
 
 ## Features
 
-- MQTT 3.1.1 protocol support
+- MQTT 3.1.1 and 5.0 protocol support
 - QoS 0, 1, and 2 message delivery
 - Topic wildcards (`+` and `#`)
 - Retained messages
@@ -49,7 +49,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed internals includin
 - [x] ACL (role-based topic authorization)
 - [x] $SYS broker statistics topics
 - [x] Prometheus metrics endpoint
-- [ ] TLS/SSL support
+- [x] TLS/SSL support (rustls)
 - [ ] WebSocket support
 - [ ] Rhai scripting (message hooks for inflight data modification)
 - [ ] Enhanced persistence options (database backends)

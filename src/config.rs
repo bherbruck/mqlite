@@ -17,7 +17,7 @@
 //! ```
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use config::{Environment, File, FileFormat};
 use regex::Regex;
@@ -91,6 +91,8 @@ pub struct Config {
     pub acl: AclConfig,
     /// Prometheus metrics configuration.
     pub prometheus: PrometheusConfig,
+    /// TLS configuration.
+    pub tls: TlsConfig,
 }
 
 
@@ -120,6 +122,9 @@ pub const DEFAULT_SYS_INTERVAL: u64 = 10;
 
 /// Default Prometheus metrics bind address.
 pub const DEFAULT_PROMETHEUS_BIND: &str = "127.0.0.1:9090";
+
+/// Default TLS bind address.
+pub const DEFAULT_TLS_BIND: &str = "0.0.0.0:8883";
 
 /// Server configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -418,6 +423,40 @@ impl Default for PrometheusConfig {
     }
 }
 
+// === TLS Configuration ===
+
+/// TLS/SSL configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// Enable TLS listener.
+    pub enabled: bool,
+    /// TLS bind address (default: 0.0.0.0:8883).
+    #[serde(default = "default_tls_bind")]
+    pub bind: SocketAddr,
+    /// Path to PEM-encoded certificate file.
+    #[serde(default)]
+    pub cert: PathBuf,
+    /// Path to PEM-encoded private key file.
+    #[serde(default)]
+    pub key: PathBuf,
+}
+
+fn default_tls_bind() -> SocketAddr {
+    DEFAULT_TLS_BIND.parse().unwrap()
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_tls_bind(),
+            cert: PathBuf::new(),
+            key: PathBuf::new(),
+        }
+    }
+}
+
 // === Configuration Error ===
 
 /// Configuration error.
@@ -504,7 +543,10 @@ impl Config {
             .set_default("acl.enabled", false)?
             // Prometheus defaults (disabled by default)
             .set_default("prometheus.enabled", false)?
-            .set_default("prometheus.bind", DEFAULT_PROMETHEUS_BIND)?;
+            .set_default("prometheus.bind", DEFAULT_PROMETHEUS_BIND)?
+            // TLS defaults (disabled by default)
+            .set_default("tls.enabled", false)?
+            .set_default("tls.bind", DEFAULT_TLS_BIND)?;
 
         // Load from file with env var substitution
         let path = path.as_ref();
@@ -578,6 +620,20 @@ impl Config {
         // Validate max_qos
         if self.mqtt.max_qos > 2 {
             return Err(ConfigError::Validation("max_qos must be 0, 1, or 2".into()));
+        }
+
+        // Validate TLS config
+        if self.tls.enabled {
+            if self.tls.cert.as_os_str().is_empty() {
+                return Err(ConfigError::Validation(
+                    "tls.cert is required when TLS is enabled".into(),
+                ));
+            }
+            if self.tls.key.as_os_str().is_empty() {
+                return Err(ConfigError::Validation(
+                    "tls.key is required when TLS is enabled".into(),
+                ));
+            }
         }
 
         Ok(())
@@ -684,5 +740,61 @@ bind = "0.0.0.0:${TEST_PORT}"
         let content = r#"bind = "${NONEXISTENT_VAR:-0.0.0.0:1883}""#;
         let substituted = substitute_env_vars(content);
         assert!(substituted.contains("0.0.0.0:1883"));
+    }
+
+    #[test]
+    fn test_tls_disabled_is_valid() {
+        let config = Config::default();
+        assert!(!config.tls.enabled);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tls_enabled_without_cert_fails() {
+        let mut config = Config::default();
+        config.tls.enabled = true;
+        config.tls.key = PathBuf::from("/path/to/key.pem");
+        // cert is empty
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_tls_enabled_without_key_fails() {
+        let mut config = Config::default();
+        config.tls.enabled = true;
+        config.tls.cert = PathBuf::from("/path/to/cert.pem");
+        // key is empty
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_tls_enabled_with_cert_and_key_is_valid() {
+        let mut config = Config::default();
+        config.tls.enabled = true;
+        config.tls.cert = PathBuf::from("/path/to/cert.pem");
+        config.tls.key = PathBuf::from("/path/to/key.pem");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_parse_tls_config() {
+        let toml = r#"
+[tls]
+enabled = true
+bind = "0.0.0.0:8884"
+cert = "/etc/mqlite/cert.pem"
+key = "/etc/mqlite/key.pem"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(config.tls.enabled);
+        assert_eq!(config.tls.bind.port(), 8884);
+        assert_eq!(config.tls.cert, PathBuf::from("/etc/mqlite/cert.pem"));
+        assert_eq!(config.tls.key, PathBuf::from("/etc/mqlite/key.pem"));
+    }
+
+    #[test]
+    fn test_tls_default_bind() {
+        let config = Config::default();
+        assert_eq!(config.tls.bind.port(), 8883);
     }
 }

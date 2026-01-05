@@ -143,6 +143,15 @@ subscribe = ["$SYS/#"]
 publish = ["public/#"]
 subscribe = ["public/#", "$SYS/#"]
 
+# === Prometheus Metrics ===
+# Exposes broker metrics in Prometheus exposition format
+
+[prometheus]
+# Enable Prometheus metrics endpoint (default: false)
+enabled = false
+# HTTP bind address for /metrics endpoint (default: 127.0.0.1:9090)
+bind = "127.0.0.1:9090"
+
 # --- Future Configuration Sections (not yet implemented) ---
 #
 # [tls]

@@ -89,6 +89,8 @@ pub struct Config {
     pub auth: AuthConfig,
     /// Access control list configuration.
     pub acl: AclConfig,
+    /// Prometheus metrics configuration.
+    pub prometheus: PrometheusConfig,
 }
 
 impl Default for Config {
@@ -101,6 +103,7 @@ impl Default for Config {
             mqtt: MqttConfig::default(),
             auth: AuthConfig::default(),
             acl: AclConfig::default(),
+            prometheus: PrometheusConfig::default(),
         }
     }
 }
@@ -128,6 +131,9 @@ impl Default for LogConfig {
 
 /// Default $SYS topic publish interval in seconds.
 pub const DEFAULT_SYS_INTERVAL: u64 = 10;
+
+/// Default Prometheus metrics bind address.
+pub const DEFAULT_PROMETHEUS_BIND: &str = "127.0.0.1:9090";
 
 /// Server configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -398,6 +404,32 @@ pub struct DefaultPermissions {
     pub subscribe: Vec<String>,
 }
 
+// === Prometheus Configuration ===
+
+/// Prometheus metrics configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PrometheusConfig {
+    /// Enable Prometheus metrics endpoint.
+    pub enabled: bool,
+    /// HTTP bind address for metrics endpoint.
+    #[serde(default = "default_prometheus_bind")]
+    pub bind: SocketAddr,
+}
+
+fn default_prometheus_bind() -> SocketAddr {
+    DEFAULT_PROMETHEUS_BIND.parse().unwrap()
+}
+
+impl Default for PrometheusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_prometheus_bind(),
+        }
+    }
+}
+
 // === Configuration Error ===
 
 /// Configuration error.
@@ -472,7 +504,10 @@ impl Config {
             .set_default("auth.enabled", false)?
             .set_default("auth.allow_anonymous", true)?
             // ACL defaults (disabled by default)
-            .set_default("acl.enabled", false)?;
+            .set_default("acl.enabled", false)?
+            // Prometheus defaults (disabled by default)
+            .set_default("prometheus.enabled", false)?
+            .set_default("prometheus.bind", DEFAULT_PROMETHEUS_BIND)?;
 
         // Load from file with env var substitution
         let path = path.as_ref();

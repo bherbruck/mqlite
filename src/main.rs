@@ -6,6 +6,7 @@ mod client_handle;
 mod config;
 mod error;
 mod packet;
+mod prometheus;
 mod publish_encoder;
 mod server;
 mod shared;

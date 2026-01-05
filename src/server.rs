@@ -16,6 +16,7 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::config::Config;
 use crate::error::Result;
+use crate::prometheus;
 use crate::shared::SharedState;
 use crate::sys_tree::SysTreePublisher;
 use crate::worker::{Worker, WorkerMsg};
@@ -64,6 +65,16 @@ impl Server {
     /// Run the server with workers.
     pub fn run(&mut self) -> Result<()> {
         let shared = Arc::new(SharedState::new());
+        let start_time = Instant::now();
+
+        // Start Prometheus metrics server if enabled
+        if self.config.prometheus.enabled {
+            prometheus::start_metrics_server(
+                self.config.prometheus.bind,
+                Arc::clone(&shared),
+                start_time,
+            );
+        }
 
         // Create $SYS publisher if enabled
         let sys_interval = self.config.server.sys_interval;

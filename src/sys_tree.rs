@@ -11,8 +11,7 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::packet::{Publish, QoS};
-use crate::publish_encoder::PublishEncoder;
-use crate::shared::{RetainedMessage, SharedStateHandle};
+use crate::shared::SharedStateHandle;
 use crate::subscription::Subscriber;
 
 /// Static topic string constants - zero allocation via Bytes::from_static().
@@ -430,7 +429,7 @@ impl SysTreePublisher {
     /// Create a new $SYS tree publisher.
     pub fn new(shared: SharedStateHandle, interval_secs: u64) -> Self {
         // Publish static values on creation
-        let publisher = Self {
+        let mut publisher = Self {
             shared,
             start_time: Instant::now(),
             prev: PreviousValues::default(),
@@ -445,10 +444,15 @@ impl SysTreePublisher {
             format!("mqlite {}", env!("CARGO_PKG_VERSION")),
         );
 
+        // Publish all metrics immediately so they're available as retained
+        // messages from startup (not just after first timer tick)
+        publisher.publish_if_changed();
+
         publisher
     }
 
     /// Publish a static value (no change detection).
+    /// Uses internal_publish to properly store as retained and fanout to subscribers.
     fn publish_static(&self, topic: &'static str, value: String) {
         let topic_bytes = Bytes::from_static(topic.as_bytes());
         let payload = Bytes::from(value);
@@ -463,14 +467,8 @@ impl SysTreePublisher {
             properties: None,
         };
 
-        // Store as retained message
-        self.shared.retained_messages.write().insert(
-            topic.to_string(),
-            RetainedMessage {
-                publish,
-                stored_at: Instant::now(),
-            },
-        );
+        // Use internal_publish to store retained and fanout
+        self.shared.internal_publish_alloc(publish);
     }
 
     /// Publish metrics if changed since last call.
@@ -810,45 +808,21 @@ impl SysTreePublisher {
     }
 
     /// Publish as retained and fan out to $SYS/# subscribers.
-    fn publish_retained_and_fanout(&mut self, topic_str: &str, topic_bytes: Bytes, payload: Bytes) {
+    /// Uses internal_publish for proper retain flag handling.
+    fn publish_retained_and_fanout(&mut self, _topic_str: &str, topic_bytes: Bytes, payload: Bytes) {
         let publish = Publish {
             dup: false,
             qos: QoS::AtMostOnce,
             retain: true,
-            topic: topic_bytes.clone(),
+            topic: topic_bytes,
             packet_id: None,
-            payload: payload.clone(),
+            payload,
             properties: None,
         };
 
-        // Store as retained message
-        self.shared.retained_messages.write().insert(
-            topic_str.to_string(),
-            RetainedMessage {
-                publish: publish.clone(),
-                stored_at: Instant::now(),
-            },
-        );
-
-        // Fan out to subscribers matching $SYS/#
-        self.subscriber_buf.clear();
-        {
-            let subscriptions = self.shared.subscriptions.read();
-            subscriptions.match_topic_bytes_into(&topic_bytes, &mut self.subscriber_buf);
-        }
-
-        if self.subscriber_buf.is_empty() {
-            return;
-        }
-
-        let mut factory = PublishEncoder::new(topic_bytes, payload, None);
-
-        for sub in &self.subscriber_buf {
-            // $SYS topics are always QoS 0
-            let _ = sub
-                .handle
-                .queue_publish(&mut factory, QoS::AtMostOnce, None, false);
-        }
+        // Use internal_publish to store retained and fanout with proper retain handling
+        self.shared
+            .internal_publish(publish, &mut self.subscriber_buf);
     }
 }
 

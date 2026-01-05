@@ -1,0 +1,16 @@
+services:
+  haproxy:
+    image: haproxy:2.9-alpine
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - mqlite
+
+  mqlite:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    volumes:
+      - ./mqlite.toml:/etc/mqlite/mqlite.toml:ro

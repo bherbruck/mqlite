@@ -7,6 +7,7 @@ mod config;
 mod error;
 mod packet;
 mod prometheus;
+mod proxy;
 mod publish_encoder;
 mod server;
 mod shared;

@@ -362,6 +362,30 @@ impl Client {
     pub fn has_pending_writes(&self) -> bool {
         self.handle.has_pending_writes()
     }
+
+    /// Prepend bytes to read buffer (for PROXY protocol remaining bytes).
+    ///
+    /// After parsing a PROXY protocol header, any remaining bytes need to be
+    /// prepended to the client's read buffer so they are processed as part
+    /// of the MQTT stream.
+    pub fn prepend_to_read_buffer(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+
+        // Ensure buffer has enough capacity
+        let new_len = self.read_pos + data.len();
+        if new_len > self.read_buf.len() {
+            self.read_buf.resize(new_len, 0);
+        }
+
+        // Shift existing data to make room at the front
+        self.read_buf.copy_within(0..self.read_pos, data.len());
+
+        // Copy new data to the front
+        self.read_buf[..data.len()].copy_from_slice(data);
+        self.read_pos = new_len;
+    }
 }
 
 #[cfg(test)]

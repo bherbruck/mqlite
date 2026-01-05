@@ -95,7 +95,6 @@ pub struct Config {
     pub tls: TlsConfig,
 }
 
-
 /// Logging configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -126,6 +125,35 @@ pub const DEFAULT_PROMETHEUS_BIND: &str = "127.0.0.1:9090";
 /// Default TLS bind address.
 pub const DEFAULT_TLS_BIND: &str = "0.0.0.0:8883";
 
+/// Default PROXY protocol header timeout in seconds.
+pub const DEFAULT_PROXY_TIMEOUT_SECS: u64 = 5;
+
+// === PROXY Protocol Configuration ===
+
+/// PROXY protocol configuration for a listener.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ProxyProtocolConfig {
+    /// Enable PROXY protocol parsing on this listener.
+    pub enabled: bool,
+    /// Timeout in seconds for reading PROXY header.
+    #[serde(default = "default_proxy_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_proxy_timeout_secs() -> u64 {
+    DEFAULT_PROXY_TIMEOUT_SECS
+}
+
+impl Default for ProxyProtocolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: DEFAULT_PROXY_TIMEOUT_SECS,
+        }
+    }
+}
+
 /// Server configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -139,6 +167,9 @@ pub struct ServerConfig {
     /// $SYS topic publish interval in seconds (0 = disabled).
     #[serde(default = "default_sys_interval")]
     pub sys_interval: u64,
+    /// PROXY protocol configuration.
+    #[serde(default)]
+    pub proxy_protocol: ProxyProtocolConfig,
 }
 
 fn default_sys_interval() -> u64 {
@@ -155,6 +186,7 @@ impl Default for ServerConfig {
             bind: default_bind(),
             workers: 0,
             sys_interval: DEFAULT_SYS_INTERVAL,
+            proxy_protocol: ProxyProtocolConfig::default(),
         }
     }
 }
@@ -440,6 +472,9 @@ pub struct TlsConfig {
     /// Path to PEM-encoded private key file.
     #[serde(default)]
     pub key: PathBuf,
+    /// PROXY protocol configuration.
+    #[serde(default)]
+    pub proxy_protocol: ProxyProtocolConfig,
 }
 
 fn default_tls_bind() -> SocketAddr {
@@ -453,6 +488,7 @@ impl Default for TlsConfig {
             bind: default_tls_bind(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
+            proxy_protocol: ProxyProtocolConfig::default(),
         }
     }
 }

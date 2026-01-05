@@ -41,7 +41,12 @@ use crate::util::RateLimitedCounter;
 #[allow(dead_code)] // Shutdown variant reserved for graceful shutdown
 pub enum WorkerMsg {
     /// New connection from main thread.
-    NewClient { transport: Transport, addr: SocketAddr },
+    NewClient {
+        transport: Transport,
+        addr: SocketAddr,
+        /// Bytes remaining after PROXY header (prepended to MQTT read buffer).
+        preamble: Vec<u8>,
+    },
     /// Disconnect a client (for client takeover).
     Disconnect { token: Token },
     /// Shutdown signal.
@@ -218,8 +223,12 @@ impl Worker {
         // Publish delivery uses direct writes via ClientWriteHandle
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                WorkerMsg::NewClient { transport, addr } => {
-                    self.accept_client(transport, addr)?;
+                WorkerMsg::NewClient {
+                    transport,
+                    addr,
+                    preamble,
+                } => {
+                    self.accept_client(transport, addr, preamble)?;
                 }
                 WorkerMsg::Disconnect { token } => {
                     if let Some(client) = self.clients.get_mut(&token) {
@@ -274,7 +283,12 @@ impl Worker {
     }
 
     /// Accept a new client connection.
-    fn accept_client(&mut self, mut transport: Transport, addr: SocketAddr) -> Result<()> {
+    fn accept_client(
+        &mut self,
+        mut transport: Transport,
+        addr: SocketAddr,
+        preamble: Vec<u8>,
+    ) -> Result<()> {
         let token = Token(self.next_token);
         self.next_token += 1;
 
@@ -282,7 +296,13 @@ impl Worker {
             .registry()
             .register(transport.tcp_stream_mut(), token, Interest::READABLE)?;
 
-        let client = Client::new(token, transport, addr, self.id, self.epoll_fd);
+        let mut client = Client::new(token, transport, addr, self.id, self.epoll_fd);
+
+        // Prepend any remaining bytes from PROXY protocol parsing
+        if !preamble.is_empty() {
+            client.prepend_to_read_buffer(&preamble);
+        }
+
         // Store handle for subscription management
         let handle = client.handle.clone();
         self.token_to_handle.insert(token, handle);
@@ -406,7 +426,9 @@ impl Worker {
         if hit_rate < CACHE_MIN_HIT_RATE {
             self.cache_stats.disabled_count += 1;
             // Only log first disable and every 100th after that
-            if self.cache_stats.disabled_count == 1 || self.cache_stats.disabled_count.is_multiple_of(100) {
+            if self.cache_stats.disabled_count == 1
+                || self.cache_stats.disabled_count.is_multiple_of(100)
+            {
                 log::info!(
                     "Worker {}: Route cache disabled (hit rate {:.1}% < {:.1}% threshold, {} hits / {} total, disabled {} times)",
                     self.id,
@@ -1650,7 +1672,10 @@ impl Worker {
 
         for token in disconnected {
             if let Some(mut client) = self.clients.remove(&token) {
-                let _ = self.poll.registry().deregister(client.transport.tcp_stream_mut());
+                let _ = self
+                    .poll
+                    .registry()
+                    .deregister(client.transport.tcp_stream_mut());
 
                 // Track client disconnection for $SYS metrics
                 // Only count if client was fully connected (has client_id assigned)

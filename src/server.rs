@@ -21,6 +21,7 @@ use crate::client::Transport;
 use crate::config::Config;
 use crate::error::Result;
 use crate::prometheus;
+use crate::proxy;
 use crate::shared::SharedState;
 use crate::sys_tree::SysTreePublisher;
 use crate::worker::{Worker, WorkerMsg};
@@ -96,7 +97,10 @@ impl Server {
         let cert_file = File::open(&config.tls.cert).map_err(|e| {
             crate::error::Error::Io(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("Failed to open TLS certificate file {:?}: {}", config.tls.cert, e),
+                format!(
+                    "Failed to open TLS certificate file {:?}: {}",
+                    config.tls.cert, e
+                ),
             ))
         })?;
         let mut cert_reader = BufReader::new(cert_file);
@@ -277,7 +281,30 @@ impl Server {
     fn accept_connections(&mut self) -> Result<()> {
         loop {
             match self.listener.accept() {
-                Ok((socket, addr)) => {
+                Ok((socket, mut addr)) => {
+                    let mut preamble = Vec::new();
+
+                    // Parse PROXY protocol header if enabled
+                    if self.config.server.proxy_protocol.enabled {
+                        let timeout =
+                            Duration::from_secs(self.config.server.proxy_protocol.timeout_secs);
+                        match proxy::parse_proxy_header(&socket, timeout) {
+                            Ok((real_addr, remaining)) => {
+                                debug!(
+                                    "PROXY protocol: {} -> {} (real client IP)",
+                                    addr, real_addr
+                                );
+                                addr = real_addr;
+                                preamble = remaining;
+                            }
+                            Err(e) => {
+                                debug!("PROXY header error from {}: {}", addr, e);
+                                // Connection rejected - PROXY protocol is required when enabled
+                                continue;
+                            }
+                        }
+                    }
+
                     let worker_id = self.next_worker;
                     self.next_worker = (self.next_worker + 1) % self.num_workers;
 
@@ -287,8 +314,11 @@ impl Server {
                     );
 
                     let transport = Transport::plain(socket);
-                    let _ = self.worker_senders[worker_id]
-                        .send(WorkerMsg::NewClient { transport, addr });
+                    let _ = self.worker_senders[worker_id].send(WorkerMsg::NewClient {
+                        transport,
+                        addr,
+                        preamble,
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;
@@ -312,7 +342,30 @@ impl Server {
 
         loop {
             match tls_listener.accept() {
-                Ok((socket, addr)) => {
+                Ok((socket, mut addr)) => {
+                    let mut preamble = Vec::new();
+
+                    // Parse PROXY protocol header on raw socket BEFORE TLS handshake
+                    if self.config.tls.proxy_protocol.enabled {
+                        let timeout =
+                            Duration::from_secs(self.config.tls.proxy_protocol.timeout_secs);
+                        match proxy::parse_proxy_header(&socket, timeout) {
+                            Ok((real_addr, remaining)) => {
+                                debug!(
+                                    "PROXY protocol (TLS): {} -> {} (real client IP)",
+                                    addr, real_addr
+                                );
+                                addr = real_addr;
+                                preamble = remaining;
+                            }
+                            Err(e) => {
+                                debug!("PROXY header error from {} (TLS): {}", addr, e);
+                                // Connection rejected - PROXY protocol is required when enabled
+                                continue;
+                            }
+                        }
+                    }
+
                     let worker_id = self.next_worker;
                     self.next_worker = (self.next_worker + 1) % self.num_workers;
 
@@ -331,8 +384,11 @@ impl Server {
                     };
 
                     let transport = Transport::tls(tls_conn, socket);
-                    let _ = self.worker_senders[worker_id]
-                        .send(WorkerMsg::NewClient { transport, addr });
+                    let _ = self.worker_senders[worker_id].send(WorkerMsg::NewClient {
+                        transport,
+                        addr,
+                        preamble,
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;

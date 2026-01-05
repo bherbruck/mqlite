@@ -47,11 +47,11 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed internals includin
 - [x] MQTT v5 conformance
 - [x] Authentication (static users, argon2 password hashing)
 - [x] ACL (role-based topic authorization)
-- [ ] $SYS broker statistics topics
+- [x] $SYS broker statistics topics
+- [x] Prometheus metrics endpoint
 - [ ] TLS/SSL support
 - [ ] WebSocket support
 - [ ] Rhai scripting (message hooks for inflight data modification)
-- [ ] Metrics and observability
 - [ ] Enhanced persistence options (database backends)
 - [ ] Clustering and high availability
 - [ ] Plugin system

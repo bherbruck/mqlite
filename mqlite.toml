@@ -148,7 +148,7 @@ subscribe = ["public/#", "$SYS/#"]
 
 [prometheus]
 # Enable Prometheus metrics endpoint (default: false)
-enabled = true
+enabled = false
 # HTTP bind address for /metrics endpoint (default: 127.0.0.1:9090)
 bind = "127.0.0.1:9090"
 

@@ -1543,7 +1543,7 @@ pub fn encode_subscribe(subscribe: &Subscribe, buf: &mut Vec<u8>) {
         let opts_byte = (options.qos as u8)
             | if options.no_local { 0x04 } else { 0 }
             | if options.retain_as_published { 0x08 } else { 0 }
-            | ((options.retain_handling as u8) << 4);
+            | (options.retain_handling << 4);
         payload.push(opts_byte);
     }
 

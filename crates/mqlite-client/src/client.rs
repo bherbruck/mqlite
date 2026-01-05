@@ -179,11 +179,7 @@ impl Client {
             .unwrap_or_else(|| self.config.client_id.clone());
         let clean_session = opts.clean_session.unwrap_or(self.config.clean_session);
 
-        let protocol_name = if self.config.protocol_version == 5 {
-            "MQTT".to_string()
-        } else {
-            "MQTT".to_string()
-        };
+        let protocol_name = "MQTT".to_string();
 
         let connect = Connect {
             protocol_name,

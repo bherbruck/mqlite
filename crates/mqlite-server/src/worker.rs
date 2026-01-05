@@ -212,6 +212,15 @@ impl Worker {
         // Process mio events
         for event in events.iter() {
             let token = event.token();
+
+            // Check for socket errors/closure first (dead connection detection)
+            if event.is_error() || event.is_read_closed() || event.is_write_closed() {
+                if let Some(client) = self.clients.get_mut(&token) {
+                    client.state = ClientState::Disconnecting;
+                }
+                continue;
+            }
+
             if event.is_readable() {
                 self.handle_readable(token)?;
             }
@@ -877,7 +886,12 @@ impl Worker {
 
         let client = self.clients.get_mut(&token).unwrap();
         client.client_id = Some(connect.client_id.clone());
-        client.keep_alive = connect.keep_alive;
+        // Apply keep-alive policy: use default if client sends 0, cap to max
+        client.keep_alive = if connect.keep_alive == 0 {
+            self.config.session.default_keep_alive
+        } else {
+            connect.keep_alive.min(self.config.session.max_keep_alive)
+        };
         client.clean_session = connect.clean_session;
         client.will = connect.will.clone();
         client.protocol_version = connect.protocol_version;
@@ -1689,6 +1703,15 @@ impl Worker {
                     .subscriptions
                     .write()
                     .remove_client(self.id, token);
+
+                // Remove this client from route cache to release Arc<ClientWriteHandle>.
+                // Stale cache entries would otherwise hold onto dead client handles
+                // until the same topic is published to again.
+                for cached in self.route_cache.values_mut() {
+                    cached
+                        .subscribers
+                        .retain(|s| !(s.worker_id() == self.id && s.token() == token));
+                }
 
                 if let Some(ref client_id) = client.client_id {
                     // Check if we're still the owner of this client registration

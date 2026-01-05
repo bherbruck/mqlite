@@ -73,7 +73,7 @@ max_inflight = 32
 default_keep_alive = 60
 
 # Maximum keep alive in seconds (client value capped to this)
-max_keep_alive = 65535
+max_keep_alive = 60
 
 # Maximum topic aliases per client (MQTT v5)
 max_topic_aliases = 0

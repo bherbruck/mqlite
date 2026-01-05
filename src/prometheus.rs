@@ -25,7 +25,10 @@ pub fn start_metrics_server(bind: SocketAddr, shared: Arc<SharedState>, start_ti
         })
         .expect("Failed to spawn prometheus thread");
 
-    info!("Prometheus metrics endpoint enabled at http://{}/metrics", bind);
+    info!(
+        "Prometheus metrics endpoint enabled at http://{}/metrics",
+        bind
+    );
 }
 
 /// Run the metrics HTTP server (blocking).
@@ -77,7 +80,12 @@ fn handle_request(
 
     // Only handle GET /metrics
     if method != "GET" {
-        return send_response(&mut stream, 405, "Method Not Allowed", "Only GET is supported");
+        return send_response(
+            &mut stream,
+            405,
+            "Method Not Allowed",
+            "Only GET is supported",
+        );
     }
 
     if path != "/metrics" && path != "/metrics/" {
@@ -95,16 +103,16 @@ fn handle_request(
 
     // Generate metrics
     let body = format_metrics(shared, start_time);
-    send_response(
-        &mut stream,
-        200,
-        "OK",
-        &body,
-    )
+    send_response(&mut stream, 200, "OK", &body)
 }
 
 /// Send an HTTP response.
-fn send_response(stream: &mut TcpStream, status: u16, status_text: &str, body: &str) -> std::io::Result<()> {
+fn send_response(
+    stream: &mut TcpStream,
+    status: u16,
+    status_text: &str,
+    body: &str,
+) -> std::io::Result<()> {
     let content_type = if status == 200 {
         "text/plain; version=0.0.4; charset=utf-8"
     } else {
@@ -118,7 +126,11 @@ fn send_response(stream: &mut TcpStream, status: u16, status_text: &str, body: &
          Connection: close\r\n\
          \r\n\
          {}",
-        status, status_text, content_type, body.len(), body
+        status,
+        status_text,
+        content_type,
+        body.len(),
+        body
     );
 
     stream.write_all(response.as_bytes())?;

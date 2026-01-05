@@ -50,6 +50,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed internals includin
 - [ ] $SYS broker statistics topics
 - [ ] TLS/SSL support
 - [ ] WebSocket support
+- [ ] Rhai scripting (message hooks for inflight data modification)
 - [ ] Metrics and observability
 - [ ] Enhanced persistence options (database backends)
 - [ ] Clustering and high availability

@@ -87,10 +87,8 @@ fn main() {
     };
 
     // Initialize logger with configured level
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(&config.log.level),
-    )
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&config.log.level))
+        .init();
 
     // Determine worker count (0 = auto)
     let num_workers = if config.server.workers == 0 {

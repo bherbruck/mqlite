@@ -120,6 +120,7 @@ pub struct BrokerMetrics {
     pub sockets_opened: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl BrokerMetrics {
     pub const fn new() -> Self {
         Self {
@@ -234,6 +235,7 @@ impl Default for BrokerMetrics {
 
 /// Previous values for change detection.
 #[derive(Default)]
+#[allow(dead_code)]
 struct PreviousValues {
     bytes_received: u64,
     bytes_sent: u64,
@@ -324,6 +326,7 @@ impl LoadAverageState {
     }
 
     /// Update all load averages and return the values.
+    #[allow(clippy::too_many_arguments)]
     fn update(
         &mut self,
         msgs_received: u64,
@@ -684,13 +687,22 @@ impl SysTreePublisher {
     fn publish_load_averages(&mut self, loads: &LoadAverageValues) {
         // Messages received
         if Self::load_changed(loads.msgs_received[0], &mut self.prev_load.msgs_received[0]) {
-            self.format_and_publish_load(topics::LOAD_MESSAGES_RECEIVED_1MIN, loads.msgs_received[0]);
+            self.format_and_publish_load(
+                topics::LOAD_MESSAGES_RECEIVED_1MIN,
+                loads.msgs_received[0],
+            );
         }
         if Self::load_changed(loads.msgs_received[1], &mut self.prev_load.msgs_received[1]) {
-            self.format_and_publish_load(topics::LOAD_MESSAGES_RECEIVED_5MIN, loads.msgs_received[1]);
+            self.format_and_publish_load(
+                topics::LOAD_MESSAGES_RECEIVED_5MIN,
+                loads.msgs_received[1],
+            );
         }
         if Self::load_changed(loads.msgs_received[2], &mut self.prev_load.msgs_received[2]) {
-            self.format_and_publish_load(topics::LOAD_MESSAGES_RECEIVED_15MIN, loads.msgs_received[2]);
+            self.format_and_publish_load(
+                topics::LOAD_MESSAGES_RECEIVED_15MIN,
+                loads.msgs_received[2],
+            );
         }
 
         // Messages sent
@@ -723,7 +735,10 @@ impl SysTreePublisher {
             self.format_and_publish_load(topics::LOAD_PUBLISH_RECEIVED_5MIN, loads.pub_received[1]);
         }
         if Self::load_changed(loads.pub_received[2], &mut self.prev_load.pub_received[2]) {
-            self.format_and_publish_load(topics::LOAD_PUBLISH_RECEIVED_15MIN, loads.pub_received[2]);
+            self.format_and_publish_load(
+                topics::LOAD_PUBLISH_RECEIVED_15MIN,
+                loads.pub_received[2],
+            );
         }
 
         // Publish sent
@@ -738,14 +753,26 @@ impl SysTreePublisher {
         }
 
         // Bytes received
-        if Self::load_changed(loads.bytes_received[0], &mut self.prev_load.bytes_received[0]) {
+        if Self::load_changed(
+            loads.bytes_received[0],
+            &mut self.prev_load.bytes_received[0],
+        ) {
             self.format_and_publish_load(topics::LOAD_BYTES_RECEIVED_1MIN, loads.bytes_received[0]);
         }
-        if Self::load_changed(loads.bytes_received[1], &mut self.prev_load.bytes_received[1]) {
+        if Self::load_changed(
+            loads.bytes_received[1],
+            &mut self.prev_load.bytes_received[1],
+        ) {
             self.format_and_publish_load(topics::LOAD_BYTES_RECEIVED_5MIN, loads.bytes_received[1]);
         }
-        if Self::load_changed(loads.bytes_received[2], &mut self.prev_load.bytes_received[2]) {
-            self.format_and_publish_load(topics::LOAD_BYTES_RECEIVED_15MIN, loads.bytes_received[2]);
+        if Self::load_changed(
+            loads.bytes_received[2],
+            &mut self.prev_load.bytes_received[2],
+        ) {
+            self.format_and_publish_load(
+                topics::LOAD_BYTES_RECEIVED_15MIN,
+                loads.bytes_received[2],
+            );
         }
 
         // Bytes sent
@@ -783,12 +810,7 @@ impl SysTreePublisher {
     }
 
     /// Publish as retained and fan out to $SYS/# subscribers.
-    fn publish_retained_and_fanout(
-        &mut self,
-        topic_str: &str,
-        topic_bytes: Bytes,
-        payload: Bytes,
-    ) {
+    fn publish_retained_and_fanout(&mut self, topic_str: &str, topic_bytes: Bytes, payload: Bytes) {
         let publish = Publish {
             dup: false,
             qos: QoS::AtMostOnce,
@@ -823,7 +845,9 @@ impl SysTreePublisher {
 
         for sub in &self.subscriber_buf {
             // $SYS topics are always QoS 0
-            let _ = sub.handle.queue_publish(&mut factory, QoS::AtMostOnce, None, false);
+            let _ = sub
+                .handle
+                .queue_publish(&mut factory, QoS::AtMostOnce, None, false);
         }
     }
 }

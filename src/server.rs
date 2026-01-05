@@ -79,7 +79,10 @@ impl Server {
         // Create $SYS publisher if enabled
         let sys_interval = self.config.server.sys_interval;
         let mut sys_publisher = if sys_interval > 0 {
-            info!("$SYS topic publishing enabled (interval: {}s)", sys_interval);
+            info!(
+                "$SYS topic publishing enabled (interval: {}s)",
+                sys_interval
+            );
             Some(SysTreePublisher::new(Arc::clone(&shared), sys_interval))
         } else {
             None

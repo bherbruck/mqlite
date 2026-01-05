@@ -87,6 +87,7 @@ impl QuotaTracker {
 
     /// Check if quota is available.
     #[inline]
+    #[allow(dead_code)]
     pub fn has_quota(&self) -> bool {
         self.current > 0
     }

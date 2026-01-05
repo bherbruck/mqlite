@@ -72,7 +72,7 @@ fn substitute_env_vars(content: &str) -> String {
 // === Configuration Structures ===
 
 /// Root configuration structure.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Logging configuration.
@@ -93,20 +93,6 @@ pub struct Config {
     pub prometheus: PrometheusConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            log: LogConfig::default(),
-            server: ServerConfig::default(),
-            limits: LimitsConfig::default(),
-            session: SessionConfig::default(),
-            mqtt: MqttConfig::default(),
-            auth: AuthConfig::default(),
-            acl: AclConfig::default(),
-            prometheus: PrometheusConfig::default(),
-        }
-    }
-}
 
 /// Logging configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -171,6 +157,7 @@ impl Default for ServerConfig {
 /// Limits configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[allow(dead_code)]
 pub struct LimitsConfig {
     /// Maximum MQTT packet size in bytes.
     /// Packets exceeding this are rejected. Advertised in CONNACK for MQTT 5.
@@ -254,6 +241,7 @@ impl Default for LimitsConfig {
 /// Session configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[allow(dead_code)]
 pub struct SessionConfig {
     /// Default keep alive in seconds (used when client sends 0).
     #[serde(default = "default_keep_alive")]
@@ -488,13 +476,22 @@ impl Config {
             .set_default("limits.max_topic_length", DEFAULT_MAX_TOPIC_LENGTH as i64)?
             .set_default("limits.max_topic_levels", DEFAULT_MAX_TOPIC_LEVELS as i64)?
             .set_default("limits.receive_maximum", DEFAULT_RECEIVE_MAXIMUM as i64)?
-            .set_default("limits.topic_alias_maximum", DEFAULT_TOPIC_ALIAS_MAXIMUM as i64)?
-            .set_default("limits.client_write_buffer_size", DEFAULT_CLIENT_WRITE_BUFFER_SIZE as i64)?
+            .set_default(
+                "limits.topic_alias_maximum",
+                DEFAULT_TOPIC_ALIAS_MAXIMUM as i64,
+            )?
+            .set_default(
+                "limits.client_write_buffer_size",
+                DEFAULT_CLIENT_WRITE_BUFFER_SIZE as i64,
+            )?
             .set_default("limits.max_inflight", DEFAULT_MAX_INFLIGHT as i64)?
             .set_default("limits.max_connections", DEFAULT_MAX_CONNECTIONS as i64)?
             .set_default("session.default_keep_alive", DEFAULT_KEEP_ALIVE as i64)?
             .set_default("session.max_keep_alive", DEFAULT_MAX_KEEP_ALIVE as i64)?
-            .set_default("session.max_topic_aliases", DEFAULT_TOPIC_ALIAS_MAXIMUM as i64)?
+            .set_default(
+                "session.max_topic_aliases",
+                DEFAULT_TOPIC_ALIAS_MAXIMUM as i64,
+            )?
             .set_default("mqtt.max_qos", 2)?
             .set_default("mqtt.retain_available", true)?
             .set_default("mqtt.wildcard_subscriptions", true)?
@@ -536,16 +533,17 @@ impl Config {
     }
 
     /// Load configuration from environment variables only (no file).
+    #[allow(dead_code)]
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::load(Path::new(""))
     }
 
     /// Parse configuration from a TOML string (for testing).
+    #[allow(dead_code)]
     pub fn parse(content: &str) -> Result<Self, ConfigError> {
         let substituted = substitute_env_vars(content);
-        let config: Config = toml::from_str(&substituted).map_err(|e| {
-            ConfigError::Validation(format!("TOML parse error: {}", e))
-        })?;
+        let config: Config = toml::from_str(&substituted)
+            .map_err(|e| ConfigError::Validation(format!("TOML parse error: {}", e)))?;
         config.validate()?;
         Ok(config)
     }
@@ -579,9 +577,7 @@ impl Config {
 
         // Validate max_qos
         if self.mqtt.max_qos > 2 {
-            return Err(ConfigError::Validation(
-                "max_qos must be 0, 1, or 2".into(),
-            ));
+            return Err(ConfigError::Validation("max_qos must be 0, 1, or 2".into()));
         }
 
         Ok(())

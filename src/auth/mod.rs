@@ -41,20 +41,20 @@ impl AuthResult {
     #[allow(dead_code)]
     pub fn to_connack_code_v3(self) -> u8 {
         match self {
-            AuthResult::Allow => 0x00,                // Connection Accepted
-            AuthResult::DenyBadCredentials => 0x04,   // Bad username or password
-            AuthResult::DenyNotAuthorized => 0x05,    // Not authorized
-            AuthResult::DenyServerError => 0x03,      // Server unavailable
+            AuthResult::Allow => 0x00,              // Connection Accepted
+            AuthResult::DenyBadCredentials => 0x04, // Bad username or password
+            AuthResult::DenyNotAuthorized => 0x05,  // Not authorized
+            AuthResult::DenyServerError => 0x03,    // Server unavailable
         }
     }
 
     /// Convert to MQTT v5 reason code.
     pub fn to_reason_code_v5(self) -> u8 {
         match self {
-            AuthResult::Allow => 0x00,                // Success
-            AuthResult::DenyBadCredentials => 0x86,   // Bad User Name or Password
-            AuthResult::DenyNotAuthorized => 0x87,    // Not authorized
-            AuthResult::DenyServerError => 0x88,      // Server unavailable
+            AuthResult::Allow => 0x00,              // Success
+            AuthResult::DenyBadCredentials => 0x86, // Bad User Name or Password
+            AuthResult::DenyNotAuthorized => 0x87,  // Not authorized
+            AuthResult::DenyServerError => 0x88,    // Server unavailable
         }
     }
 }
@@ -96,6 +96,7 @@ pub struct ClientInfo {
     pub is_anonymous: bool,
 }
 
+#[allow(dead_code)]
 impl ClientInfo {
     /// Create a new ClientInfo for an anonymous client.
     pub fn anonymous(client_id: String) -> Self {
@@ -108,7 +109,11 @@ impl ClientInfo {
     }
 
     /// Create a new ClientInfo for an authenticated client.
-    pub fn authenticated(client_id: String, username: Option<String>, role: Option<String>) -> Self {
+    pub fn authenticated(
+        client_id: String,
+        username: Option<String>,
+        role: Option<String>,
+    ) -> Self {
         Self {
             client_id,
             username,
@@ -206,12 +211,11 @@ impl AuthProvider {
                 (Box::new(AllowAllAuth), false, true)
             };
 
-        let (authorizer, acl_enabled): (Box<dyn Authorizer>, bool) =
-            if config.acl.enabled {
-                (Box::new(AclAuthorizer::new(&config.acl)), true)
-            } else {
-                (Box::new(AllowAllAcl), false)
-            };
+        let (authorizer, acl_enabled): (Box<dyn Authorizer>, bool) = if config.acl.enabled {
+            (Box::new(AclAuthorizer::new(&config.acl)), true)
+        } else {
+            (Box::new(AllowAllAcl), false)
+        };
 
         Self {
             authenticator,

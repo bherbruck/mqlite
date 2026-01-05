@@ -97,7 +97,13 @@ pub struct Client {
 
 impl Client {
     /// Create a new client with a shared write handle.
-    pub fn new(token: Token, socket: TcpStream, remote_addr: SocketAddr, worker_id: usize, epoll_fd: i32) -> Self {
+    pub fn new(
+        token: Token,
+        socket: TcpStream,
+        remote_addr: SocketAddr,
+        worker_id: usize,
+        epoll_fd: i32,
+    ) -> Self {
         let socket_fd = socket.as_raw_fd();
         let handle = Arc::new(ClientWriteHandle::new(
             worker_id, epoll_fd, socket_fd, token,
@@ -115,14 +121,14 @@ impl Client {
             graceful_disconnect: false,
             username: None,
             role: None,
-            is_anonymous: true, // Default to anonymous until authenticated
+            is_anonymous: true,  // Default to anonymous until authenticated
             protocol_version: 4, // Default to 3.1.1, updated on CONNECT
             next_packet_id: 1,
             last_packet_time: Instant::now(),
             pending_qos1: AHashMap::new(),
             pending_qos2: AHashMap::new(),
-            client_max_packet_size: 0,  // 0 = unlimited
-            quota: QuotaTracker::new(65535),  // Default per MQTT 5 spec
+            client_max_packet_size: 0,       // 0 = unlimited
+            quota: QuotaTracker::new(65535), // Default per MQTT 5 spec
             backpressure_log: RateLimitedCounter::new(Duration::from_secs(10)),
             read_buf: vec![0u8; INITIAL_BUFFER_SIZE],
             read_pos: 0,
@@ -212,6 +218,7 @@ impl Client {
 
     /// Check if we can send a QoS 1/2 message (quota available).
     #[inline]
+    #[allow(dead_code)]
     pub fn has_quota(&self) -> bool {
         self.quota.has_quota()
     }

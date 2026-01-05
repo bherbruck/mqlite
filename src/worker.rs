@@ -408,7 +408,7 @@ impl Worker {
         if hit_rate < CACHE_MIN_HIT_RATE {
             self.cache_stats.disabled_count += 1;
             // Only log first disable and every 100th after that
-            if self.cache_stats.disabled_count == 1 || self.cache_stats.disabled_count % 100 == 0 {
+            if self.cache_stats.disabled_count == 1 || self.cache_stats.disabled_count.is_multiple_of(100) {
                 log::info!(
                     "Worker {}: Route cache disabled (hit rate {:.1}% < {:.1}% threshold, {} hits / {} total, disabled {} times)",
                     self.id,
@@ -1050,8 +1050,7 @@ impl Worker {
             }
 
             // Enforce wildcard_subscriptions: reject if wildcard in filter but feature disabled
-            let has_wildcard =
-                actual_filter.contains('+') || actual_filter.contains('#');
+            let has_wildcard = actual_filter.contains('+') || actual_filter.contains('#');
             if has_wildcard && !self.config.mqtt.wildcard_subscriptions {
                 // MQTT 5: 0xA2 = Wildcard Subscriptions not supported
                 return_codes.push(if is_v5 { 0xA2 } else { 0x80 });
@@ -1622,7 +1621,10 @@ impl Worker {
 
         // Log accumulated backpressure drops (rate limited to every 10s per worker)
         if backpressure_count > 0 {
-            if let Some(count) = self.subscriber_backpressure_log.increment_by(backpressure_count as u64) {
+            if let Some(count) = self
+                .subscriber_backpressure_log
+                .increment_by(backpressure_count as u64)
+            {
                 if let Some((worker_id, token)) = last_backpressure_sub {
                     log::warn!(
                         "Backpressure: dropped {} messages to slow subscribers (last: worker={}, token={:?})",
@@ -1858,14 +1860,18 @@ impl Worker {
                 {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         will_backpressure_count += 1;
-                        last_will_backpressure_sub = Some((sub.handle.worker_id(), sub.handle.token()));
+                        last_will_backpressure_sub =
+                            Some((sub.handle.worker_id(), sub.handle.token()));
                     }
                 }
             }
 
             // Log accumulated will backpressure drops (rate limited to every 10s per worker)
             if will_backpressure_count > 0 {
-                if let Some(count) = self.subscriber_backpressure_log.increment_by(will_backpressure_count as u64) {
+                if let Some(count) = self
+                    .subscriber_backpressure_log
+                    .increment_by(will_backpressure_count as u64)
+                {
                     if let Some((worker_id, token)) = last_will_backpressure_sub {
                         log::warn!(
                             "Backpressure: dropped {} will messages to slow subscribers (last: worker={}, token={:?})",
@@ -1978,14 +1984,18 @@ impl Worker {
                 {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         delayed_backpressure_count += 1;
-                        last_delayed_backpressure_sub = Some((sub.handle.worker_id(), sub.handle.token()));
+                        last_delayed_backpressure_sub =
+                            Some((sub.handle.worker_id(), sub.handle.token()));
                     }
                 }
             }
 
             // Log accumulated delayed will backpressure drops (rate limited to every 10s per worker)
             if delayed_backpressure_count > 0 {
-                if let Some(count) = self.subscriber_backpressure_log.increment_by(delayed_backpressure_count as u64) {
+                if let Some(count) = self
+                    .subscriber_backpressure_log
+                    .increment_by(delayed_backpressure_count as u64)
+                {
                     if let Some((worker_id, token)) = last_delayed_backpressure_sub {
                         log::warn!(
                             "Backpressure: dropped {} delayed will messages to slow subscribers (last: worker={}, token={:?})",

@@ -74,11 +74,7 @@ impl AclAuthorizer {
     }
 
     /// Get patterns for a client based on their role and anonymous status.
-    fn get_patterns<'a>(
-        &'a self,
-        client: &ClientInfo,
-        is_publish: bool,
-    ) -> &'a [String] {
+    fn get_patterns<'a>(&'a self, client: &ClientInfo, is_publish: bool) -> &'a [String] {
         // Anonymous users get anonymous permissions
         if client.is_anonymous {
             return if is_publish {
@@ -217,7 +213,10 @@ mod tests {
         assert!(topic_matches_pattern("sensors/temp", "sensors/+"));
         assert!(topic_matches_pattern("sensors/humidity", "sensors/+"));
         assert!(!topic_matches_pattern("sensors/room1/temp", "sensors/+"));
-        assert!(topic_matches_pattern("sensors/room1/temp", "sensors/+/temp"));
+        assert!(topic_matches_pattern(
+            "sensors/room1/temp",
+            "sensors/+/temp"
+        ));
         assert!(topic_matches_pattern("sensors/room1/temp", "+/+/+"));
     }
 

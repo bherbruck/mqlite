@@ -85,6 +85,10 @@ pub struct Config {
     pub session: SessionConfig,
     /// MQTT feature configuration.
     pub mqtt: MqttConfig,
+    /// Authentication configuration.
+    pub auth: AuthConfig,
+    /// Access control list configuration.
+    pub acl: AclConfig,
 }
 
 impl Default for Config {
@@ -95,6 +99,8 @@ impl Default for Config {
             limits: LimitsConfig::default(),
             session: SessionConfig::default(),
             mqtt: MqttConfig::default(),
+            auth: AuthConfig::default(),
+            acl: AclConfig::default(),
         }
     }
 }
@@ -306,6 +312,81 @@ impl Default for MqttConfig {
     }
 }
 
+// === Authentication Configuration ===
+
+/// Authentication configuration.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// Enable authentication.
+    pub enabled: bool,
+    /// Allow anonymous connections when auth is enabled.
+    pub allow_anonymous: bool,
+    /// Static user list.
+    #[serde(default)]
+    pub users: Vec<UserConfig>,
+}
+
+/// User configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserConfig {
+    /// Username.
+    pub username: String,
+    /// Plaintext password (use password_hash for production).
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Argon2 password hash.
+    #[serde(default)]
+    pub password_hash: Option<String>,
+    /// ACL role reference.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+// === ACL Configuration ===
+
+/// ACL (Access Control List) configuration.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct AclConfig {
+    /// Enable ACL.
+    pub enabled: bool,
+    /// Role definitions.
+    #[serde(default)]
+    pub roles: Vec<RoleConfig>,
+    /// Default permissions for authenticated users without an explicit role.
+    #[serde(default)]
+    pub default: DefaultPermissions,
+    /// Permissions for anonymous (unauthenticated) connections.
+    #[serde(default)]
+    pub anonymous: DefaultPermissions,
+}
+
+/// Role configuration with publish/subscribe patterns.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoleConfig {
+    /// Role name.
+    pub name: String,
+    /// Topics this role can publish to.
+    /// Supports %c (client_id) and %u (username) substitution.
+    #[serde(default)]
+    pub publish: Vec<String>,
+    /// Topic filters this role can subscribe to.
+    /// Supports %c (client_id) and %u (username) substitution.
+    #[serde(default)]
+    pub subscribe: Vec<String>,
+}
+
+/// Default permissions for users without an explicit role.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct DefaultPermissions {
+    /// Topics that can be published to.
+    pub publish: Vec<String>,
+    /// Topic filters that can be subscribed to.
+    pub subscribe: Vec<String>,
+}
+
 // === Configuration Error ===
 
 /// Configuration error.
@@ -374,7 +455,12 @@ impl Config {
             .set_default("mqtt.retain_available", true)?
             .set_default("mqtt.wildcard_subscriptions", true)?
             .set_default("mqtt.subscription_identifiers", true)?
-            .set_default("mqtt.shared_subscriptions", true)?;
+            .set_default("mqtt.shared_subscriptions", true)?
+            // Auth defaults (disabled by default)
+            .set_default("auth.enabled", false)?
+            .set_default("auth.allow_anonymous", true)?
+            // ACL defaults (disabled by default)
+            .set_default("acl.enabled", false)?;
 
         // Load from file with env var substitution
         let path = path.as_ref();
@@ -440,12 +526,9 @@ impl Config {
             ));
         }
 
-        // Sanity check on max inflight
-        if self.limits.max_inflight == 0 {
-            return Err(ConfigError::Validation(
-                "max_inflight must be at least 1".into(),
-            ));
-        }
+        // Note: max_inflight = 0 means unbounded (uses 65535)
+        // Note: max_connections = 0 means unbounded
+        // Note: max_packet_size = 0 means unbounded (uses protocol max)
 
         // Validate max_qos
         if self.mqtt.max_qos > 2 {

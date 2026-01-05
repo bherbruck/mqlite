@@ -23,6 +23,8 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 config = "0.15"
 regex = "1.11"
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["std"] }
 
 [profile.release]
 opt-level = 3

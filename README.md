@@ -45,12 +45,15 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed internals includin
 ## Roadmap
 
 - [x] MQTT v5 conformance
-- [ ] Plugin system (auth, ACL, etc.)
+- [x] Authentication (static users, argon2 password hashing)
+- [x] ACL (role-based topic authorization)
+- [ ] $SYS broker statistics topics
 - [ ] TLS/SSL support
 - [ ] WebSocket support
 - [ ] Metrics and observability
 - [ ] Enhanced persistence options (database backends)
 - [ ] Clustering and high availability
+- [ ] Plugin system
 
 ## License
 

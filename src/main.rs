@@ -1,5 +1,6 @@
 //! mqlite - A high-performance MQTT broker.
 
+mod auth;
 mod client;
 mod client_handle;
 mod config;

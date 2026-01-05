@@ -1,6 +1,7 @@
 //! Per-client state and buffer management.
 
 use std::io::{self, Read};
+use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,6 +44,7 @@ pub enum ClientState {
 pub struct Client {
     pub token: Token,
     pub socket: TcpStream,
+    pub remote_addr: SocketAddr,
     pub state: ClientState,
     pub client_id: Option<String>,
     pub keep_alive: u16,
@@ -51,6 +53,14 @@ pub struct Client {
     pub will: Option<Will>,
     /// Whether the client sent a DISCONNECT packet (graceful disconnect).
     pub graceful_disconnect: bool,
+
+    // Authentication info
+    /// Username (if authenticated with one).
+    pub username: Option<String>,
+    /// Role assigned during authentication (for ACL lookups).
+    pub role: Option<String>,
+    /// Whether this is an anonymous (unauthenticated) connection.
+    pub is_anonymous: bool,
 
     /// MQTT protocol version (3=3.1, 4=3.1.1, 5=5.0).
     pub protocol_version: u8,
@@ -87,7 +97,7 @@ pub struct Client {
 
 impl Client {
     /// Create a new client with a shared write handle.
-    pub fn new(token: Token, socket: TcpStream, worker_id: usize, epoll_fd: i32) -> Self {
+    pub fn new(token: Token, socket: TcpStream, remote_addr: SocketAddr, worker_id: usize, epoll_fd: i32) -> Self {
         let socket_fd = socket.as_raw_fd();
         let handle = Arc::new(ClientWriteHandle::new(
             worker_id, epoll_fd, socket_fd, token,
@@ -96,12 +106,16 @@ impl Client {
         Self {
             token,
             socket,
+            remote_addr,
             state: ClientState::Connecting,
             client_id: None,
             keep_alive: 0,
             clean_session: true,
             will: None,
             graceful_disconnect: false,
+            username: None,
+            role: None,
+            is_anonymous: true, // Default to anonymous until authenticated
             protocol_version: 4, // Default to 3.1.1, updated on CONNECT
             next_packet_id: 1,
             last_packet_time: Instant::now(),

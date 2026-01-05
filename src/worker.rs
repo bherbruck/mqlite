@@ -21,6 +21,7 @@ use crossbeam_channel::{Receiver, Sender};
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 
+use crate::auth::{AuthContext, AuthProvider, AuthResult, ClientInfo};
 use crate::client::{Client, ClientState, PendingPublish};
 use crate::client_handle::ClientWriteHandle;
 use crate::config::Config;
@@ -138,6 +139,9 @@ pub struct Worker {
 
     /// Broker configuration.
     config: Arc<Config>,
+
+    /// Authentication and authorization provider.
+    auth: AuthProvider,
 }
 
 impl Worker {
@@ -175,6 +179,7 @@ impl Worker {
             },
             delayed_wills: Vec::new(),
             subscriber_backpressure_log: RateLimitedCounter::new(Duration::from_secs(10)),
+            auth: AuthProvider::from_config(&config),
             config,
         })
     }
@@ -271,7 +276,7 @@ impl Worker {
     }
 
     /// Accept a new client connection.
-    fn accept_client(&mut self, mut socket: TcpStream, _addr: SocketAddr) -> Result<()> {
+    fn accept_client(&mut self, mut socket: TcpStream, addr: SocketAddr) -> Result<()> {
         let token = Token(self.next_token);
         self.next_token += 1;
 
@@ -279,7 +284,7 @@ impl Worker {
             .registry()
             .register(&mut socket, token, Interest::READABLE)?;
 
-        let client = Client::new(token, socket, self.id, self.epoll_fd);
+        let client = Client::new(token, socket, addr, self.id, self.epoll_fd);
         // Store handle for subscription management
         let handle = client.handle.clone();
         self.token_to_handle.insert(token, handle);
@@ -622,6 +627,60 @@ impl Worker {
             let _ = client.queue_packet(&Packet::Connack(connack));
             client.state = ClientState::Disconnecting;
             return Ok(());
+        }
+
+        // Authentication check
+        let (auth_result, auth_role) = {
+            let client = self.clients.get(&token).unwrap();
+            let auth_ctx = AuthContext {
+                client_id: &connect.client_id,
+                username: connect.username.as_deref(),
+                password: connect.password.as_deref(),
+                remote_addr: client.remote_addr,
+            };
+            self.auth.authenticate(&auth_ctx)
+        };
+
+        if !auth_result.is_allowed() {
+            let client = self.clients.get_mut(&token).unwrap();
+            client.protocol_version = connect.protocol_version;
+            let connack = if is_v5 {
+                Connack {
+                    session_present: false,
+                    code: ConnackCode::NotAuthorized,
+                    reason_code: Some(auth_result.to_reason_code_v5()),
+                    properties: Some(ConnackProperties::default()),
+                }
+            } else {
+                Connack {
+                    session_present: false,
+                    code: if matches!(auth_result, AuthResult::DenyBadCredentials) {
+                        ConnackCode::BadUsernamePassword
+                    } else {
+                        ConnackCode::NotAuthorized
+                    },
+                    reason_code: None,
+                    properties: None,
+                }
+            };
+            let _ = client.queue_packet(&Packet::Connack(connack));
+            client.state = ClientState::Disconnecting;
+            log::debug!(
+                "Authentication failed for client {:?} from {}: {:?}",
+                connect.client_id,
+                client.remote_addr,
+                auth_result
+            );
+            return Ok(());
+        }
+
+        // Store auth info in client
+        {
+            let client = self.clients.get_mut(&token).unwrap();
+            client.username = connect.username.clone();
+            client.role = auth_role;
+            // Determine if anonymous: no username and no password provided
+            client.is_anonymous = connect.username.is_none() && connect.password.is_none();
         }
 
         // MQTT-3.1.4-2: If ClientId already exists, disconnect existing client
@@ -1005,6 +1064,34 @@ impl Worker {
                 continue;
             }
 
+            // ACL check for subscribe permission
+            let acl_result = {
+                let client = self.clients.get(&token);
+                if let Some(c) = client {
+                    let client_info = ClientInfo {
+                        client_id: c.client_id.clone().unwrap_or_default(),
+                        username: c.username.clone(),
+                        role: c.role.clone(),
+                        is_anonymous: c.is_anonymous,
+                    };
+                    self.auth.check_subscribe(&client_info, &actual_filter)
+                } else {
+                    AuthResult::DenyNotAuthorized
+                }
+            };
+
+            if !acl_result.is_allowed() {
+                // MQTT 5: 0x87 = Not authorized
+                // MQTT 3.1.1: 0x80 = Failure
+                return_codes.push(if is_v5 { 0x87 } else { 0x80 });
+                log::debug!(
+                    "ACL denied subscribe to '{}' for client {:?}",
+                    actual_filter,
+                    client_id
+                );
+                continue;
+            }
+
             if let Some(ref h) = handle {
                 self.shared.subscriptions.write().subscribe(
                     topic_filter,
@@ -1240,6 +1327,57 @@ impl Worker {
                 // MQTT 5: 0x9A = Retain not supported
                 client.state = ClientState::Disconnecting;
             }
+            return Ok(());
+        }
+
+        // ACL check for publish permission
+        let (acl_allowed, is_v5) = {
+            let client = self.clients.get(&from_token);
+            if let Some(c) = client {
+                let topic_str = String::from_utf8_lossy(&publish.topic);
+                let client_info = ClientInfo {
+                    client_id: c.client_id.clone().unwrap_or_default(),
+                    username: c.username.clone(),
+                    role: c.role.clone(),
+                    is_anonymous: c.is_anonymous,
+                };
+                let result = self.auth.check_publish(&client_info, &topic_str);
+                (result.is_allowed(), c.protocol_version == 5)
+            } else {
+                (false, false)
+            }
+        };
+
+        if !acl_allowed {
+            // Log the ACL denial
+            log::debug!(
+                "ACL denied publish to '{}' for client at token {:?}",
+                String::from_utf8_lossy(&publish.topic),
+                from_token
+            );
+
+            // For MQTT v5: send PUBACK/PUBREC with 0x87 (Not authorized) reason code
+            // For MQTT v3.1.1: silently drop (no error mechanism in PUBACK)
+            if is_v5 {
+                if publish.qos == QoS::AtLeastOnce {
+                    if let Some(packet_id) = publish.packet_id {
+                        if let Some(client) = self.clients.get_mut(&from_token) {
+                            // TODO: Add reason_code support to Puback packet
+                            // For now, just send regular PUBACK (client may retry)
+                            let _ = client.queue_packet(&Packet::Puback { packet_id });
+                        }
+                    }
+                }
+                if publish.qos == QoS::ExactlyOnce {
+                    if let Some(packet_id) = publish.packet_id {
+                        if let Some(client) = self.clients.get_mut(&from_token) {
+                            // TODO: Add reason_code support to Pubrec packet
+                            let _ = client.queue_packet(&Packet::Pubrec { packet_id });
+                        }
+                    }
+                }
+            }
+            // Don't forward the message - ACL denied
             return Ok(());
         }
 

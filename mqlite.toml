@@ -83,28 +83,65 @@ subscription_identifiers = true
 # Whether shared subscriptions are available
 shared_subscriptions = true
 
-# --- Future Configuration Sections (not yet implemented) ---
-#
-# [auth]
-# enabled = false
-# allow_anonymous = true
+# === Authentication ===
+# Static user authentication with plaintext passwords (dev) or argon2 hashes (production)
+
+[auth]
+# Enable authentication (default: false)
+enabled = false
+
+# Allow anonymous connections when auth is enabled (default: false)
+# If true, clients without credentials use ACL anonymous permissions
+allow_anonymous = false
+
+# Static user list - use password_hash for production!
+# Generate password hashes with: echo -n "password" | argon2 $(openssl rand -base64 16) -id -e
 #
 # [[auth.users]]
 # username = "admin"
-# password = "${ADMIN_PASSWORD}"
+# password = "secret"  # Use only for development!
+# # password_hash = "$argon2id$v=19$..."  # Use for production
 # role = "admin"
 #
-# [acl]
-# enabled = false
+# [[auth.users]]
+# username = "device001"
+# password_hash = "${DEVICE_PASSWORD_HASH}"  # env var substitution
+# role = "device"
+
+# === Access Control List (ACL) ===
+# Topic-based authorization with pattern matching
+
+[acl]
+# Enable ACL (default: false)
+enabled = false
+
+# Role definitions with publish/subscribe patterns
+# Patterns support:
+# - MQTT wildcards: + (single level), # (multi-level)
+# - Variable substitution: %c (client_id), %u (username)
 #
 # [[acl.roles]]
 # name = "admin"
 # publish = ["#"]
 # subscribe = ["#"]
 #
-# [acl.default]
-# publish = ["#"]
-# subscribe = ["#", "$SYS/#"]
+# [[acl.roles]]
+# name = "device"
+# publish = ["sensors/%c/#"]       # Devices publish to their own topic tree
+# subscribe = ["commands/%c/#"]    # Devices receive commands on their topic
+
+# Default permissions for authenticated users without an explicit role
+[acl.default]
+publish = []
+subscribe = ["$SYS/#"]
+
+# Permissions for anonymous (unauthenticated) connections
+# Only applies when auth.allow_anonymous = true
+[acl.anonymous]
+publish = ["public/#"]
+subscribe = ["public/#", "$SYS/#"]
+
+# --- Future Configuration Sections (not yet implemented) ---
 #
 # [tls]
 # bind = "0.0.0.0:8883"

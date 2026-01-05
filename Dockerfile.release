@@ -12,5 +12,5 @@ ARG TARGETARCH
 COPY mqlite-${TARGETARCH} /mqlite
 COPY mqlite.toml /etc/mqlite/mqlite.toml
 
-EXPOSE 1883 9090
+EXPOSE 1883 8883 9090
 ENTRYPOINT ["/mqlite", "-c", "/etc/mqlite/mqlite.toml"]

@@ -152,12 +152,23 @@ enabled = true
 # HTTP bind address for /metrics endpoint (default: 127.0.0.1:9090)
 bind = "0.0.0.0:9090"
 
+# === TLS Configuration ===
+# Secure MQTT connections on port 8883
+
+[tls]
+# Enable TLS listener (default: false)
+enabled = false
+# TLS bind address (default: 0.0.0.0:8883)
+bind = "0.0.0.0:8883"
+# Path to PEM-encoded certificate file
+# cert = "/etc/mqlite/cert.pem"
+# Path to PEM-encoded private key file
+# key = "/etc/mqlite/key.pem"
+
+# Generate self-signed certs for testing:
+# openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+
 # --- Future Configuration Sections (not yet implemented) ---
-#
-# [tls]
-# bind = "0.0.0.0:8883"
-# cert = "/path/to/cert.pem"
-# key = "/path/to/key.pem"
 #
 # [websocket]
 # bind = "0.0.0.0:9001"

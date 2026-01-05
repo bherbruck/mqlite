@@ -4,6 +4,7 @@ services:
     build: .
     ports:
       - 1883:1883
+      - 8883:8883 # TLS
       - 9090:9090 # Prometheus metrics
     volumes:
       - mqlite_data:/var/lib/mqlite

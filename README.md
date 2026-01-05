@@ -49,7 +49,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed internals includin
 - [x] ACL (role-based topic authorization)
 - [x] $SYS broker statistics topics
 - [x] Prometheus metrics endpoint
-- [ ] TLS/SSL support
+- [x] TLS/SSL support (rustls)
 - [ ] WebSocket support
 - [ ] Rhai scripting (message hooks for inflight data modification)
 - [ ] Enhanced persistence options (database backends)

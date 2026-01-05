@@ -3,7 +3,8 @@
 //! The server accepts connections and distributes them to workers.
 //! Supports single-threaded (1 worker) or multi-threaded (N workers) modes.
 
-use std::io;
+use std::fs::File;
+use std::io::{self, BufReader};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
@@ -13,7 +14,10 @@ use crossbeam_channel::{bounded, Sender};
 use log::{debug, error, info};
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
 
+use crate::client::Transport;
 use crate::config::Config;
 use crate::error::Result;
 use crate::prometheus;
@@ -21,8 +25,11 @@ use crate::shared::SharedState;
 use crate::sys_tree::SysTreePublisher;
 use crate::worker::{Worker, WorkerMsg};
 
-/// Token for the listener socket.
+/// Token for the plain TCP listener socket.
 const LISTENER: Token = Token(0);
+
+/// Token for the TLS listener socket.
+const LISTENER_TLS: Token = Token(1);
 
 /// Channel capacity for worker messages.
 const CHANNEL_CAPACITY: usize = 4096;
@@ -31,6 +38,10 @@ const CHANNEL_CAPACITY: usize = 4096;
 pub struct Server {
     poll: Poll,
     listener: TcpListener,
+    /// TLS listener (if TLS is enabled).
+    tls_listener: Option<TcpListener>,
+    /// TLS server configuration (if TLS is enabled).
+    tls_config: Option<Arc<ServerConfig>>,
     /// Senders to worker channels.
     worker_senders: Vec<Sender<WorkerMsg>>,
     /// Round-robin counter for connection distribution.
@@ -52,14 +63,94 @@ impl Server {
 
         info!("mqlite listening on {}", addr);
 
+        // Initialize TLS if enabled
+        let (tls_listener, tls_config) = if config.tls.enabled {
+            let tls_config = Self::load_tls_config(&config)?;
+            let mut tls_listener = TcpListener::bind(config.tls.bind)?;
+
+            poll.registry()
+                .register(&mut tls_listener, LISTENER_TLS, Interest::READABLE)?;
+
+            info!("TLS listening on {}", config.tls.bind);
+
+            (Some(tls_listener), Some(Arc::new(tls_config)))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             poll,
             listener,
+            tls_listener,
+            tls_config,
             worker_senders: Vec::new(),
             next_worker: 0,
             num_workers,
             config,
         })
+    }
+
+    /// Load TLS certificates and create server configuration.
+    fn load_tls_config(config: &Config) -> Result<ServerConfig> {
+        // Load certificate chain
+        let cert_file = File::open(&config.tls.cert).map_err(|e| {
+            crate::error::Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Failed to open TLS certificate file {:?}: {}", config.tls.cert, e),
+            ))
+        })?;
+        let mut cert_reader = BufReader::new(cert_file);
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                crate::error::Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to parse TLS certificate: {}", e),
+                ))
+            })?;
+
+        if certs.is_empty() {
+            return Err(crate::error::Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "No certificates found in certificate file",
+            )));
+        }
+
+        // Load private key
+        let key_file = File::open(&config.tls.key).map_err(|e| {
+            crate::error::Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Failed to open TLS key file {:?}: {}", config.tls.key, e),
+            ))
+        })?;
+        let mut key_reader = BufReader::new(key_file);
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|e| {
+                crate::error::Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to parse TLS private key: {}", e),
+                ))
+            })?
+            .ok_or_else(|| {
+                crate::error::Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "No private key found in key file",
+                ))
+            })?;
+
+        // Build TLS config
+        let tls_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| {
+                crate::error::Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to build TLS config: {}", e),
+                ))
+            })?;
+
+        info!("TLS configuration loaded from {:?}", config.tls.cert);
+        Ok(tls_config)
     }
 
     /// Run the server with workers.
@@ -115,8 +206,10 @@ impl Server {
                     .poll(&mut events, Some(Duration::from_millis(1)))?;
 
                 for event in events.iter() {
-                    if event.token() == LISTENER {
-                        self.accept_connections()?;
+                    match event.token() {
+                        LISTENER => self.accept_connections()?,
+                        LISTENER_TLS => self.accept_tls_connections()?,
+                        _ => {}
                     }
                 }
 
@@ -162,8 +255,10 @@ impl Server {
                     .poll(&mut events, Some(Duration::from_millis(100)))?;
 
                 for event in events.iter() {
-                    if event.token() == LISTENER {
-                        self.accept_connections()?;
+                    match event.token() {
+                        LISTENER => self.accept_connections()?,
+                        LISTENER_TLS => self.accept_tls_connections()?,
+                        _ => {}
                     }
                 }
 
@@ -178,7 +273,7 @@ impl Server {
         }
     }
 
-    /// Accept new connections and distribute to workers.
+    /// Accept new plain TCP connections and distribute to workers.
     fn accept_connections(&mut self) -> Result<()> {
         loop {
             match self.listener.accept() {
@@ -191,8 +286,53 @@ impl Server {
                         addr, worker_id
                     );
 
-                    let _ =
-                        self.worker_senders[worker_id].send(WorkerMsg::NewClient { socket, addr });
+                    let transport = Transport::plain(socket);
+                    let _ = self.worker_senders[worker_id]
+                        .send(WorkerMsg::NewClient { transport, addr });
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Accept new TLS connections and distribute to workers.
+    fn accept_tls_connections(&mut self) -> Result<()> {
+        let tls_listener = match &self.tls_listener {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        let tls_config = match &self.tls_config {
+            Some(c) => Arc::clone(c),
+            None => return Ok(()),
+        };
+
+        loop {
+            match tls_listener.accept() {
+                Ok((socket, addr)) => {
+                    let worker_id = self.next_worker;
+                    self.next_worker = (self.next_worker + 1) % self.num_workers;
+
+                    debug!(
+                        "Accepted TLS connection from {}, assigning to worker {}",
+                        addr, worker_id
+                    );
+
+                    // Create TLS server connection
+                    let tls_conn = match rustls::ServerConnection::new(Arc::clone(&tls_config)) {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            error!("Failed to create TLS connection for {}: {}", addr, e);
+                            continue;
+                        }
+                    };
+
+                    let transport = Transport::tls(tls_conn, socket);
+                    let _ = self.worker_senders[worker_id]
+                        .send(WorkerMsg::NewClient { transport, addr });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;

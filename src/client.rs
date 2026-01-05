@@ -1,14 +1,95 @@
 //! Per-client state and buffer management.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
 use mio::net::TcpStream;
 use mio::Token;
+use rustls::ServerConnection;
+
+// === Transport Abstraction ===
+
+/// Transport layer abstraction for plain TCP and TLS connections.
+pub enum Transport {
+    /// Plain TCP connection.
+    Plain(TcpStream),
+    /// TLS-wrapped TCP connection.
+    Tls(Box<rustls::StreamOwned<ServerConnection, TcpStream>>),
+}
+
+impl Transport {
+    /// Create a plain TCP transport.
+    pub fn plain(stream: TcpStream) -> Self {
+        Transport::Plain(stream)
+    }
+
+    /// Create a TLS transport.
+    pub fn tls(tls_conn: ServerConnection, stream: TcpStream) -> Self {
+        Transport::Tls(Box::new(rustls::StreamOwned::new(tls_conn, stream)))
+    }
+
+    /// Get the underlying TCP stream for mio registration.
+    #[allow(dead_code)]
+    pub fn tcp_stream(&self) -> &TcpStream {
+        match self {
+            Transport::Plain(s) => s,
+            Transport::Tls(s) => s.get_ref(),
+        }
+    }
+
+    /// Get mutable reference to underlying TCP stream for mio registration.
+    pub fn tcp_stream_mut(&mut self) -> &mut TcpStream {
+        match self {
+            Transport::Plain(s) => s,
+            Transport::Tls(s) => s.get_mut(),
+        }
+    }
+}
+
+impl Read for Transport {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Transport::Plain(s) => s.read(buf),
+            Transport::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Transport {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Transport::Plain(s) => s.write(buf),
+            Transport::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Transport::Plain(s) => s.flush(),
+            Transport::Tls(s) => s.flush(),
+        }
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            Transport::Plain(s) => s.write_vectored(bufs),
+            Transport::Tls(s) => s.write_vectored(bufs),
+        }
+    }
+}
+
+impl AsRawFd for Transport {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Transport::Plain(s) => s.as_raw_fd(),
+            Transport::Tls(s) => s.get_ref().as_raw_fd(),
+        }
+    }
+}
 
 use crate::client_handle::ClientWriteHandle;
 use crate::error::Result;
@@ -43,7 +124,7 @@ pub enum ClientState {
 #[allow(dead_code)] // token field kept for debugging
 pub struct Client {
     pub token: Token,
-    pub socket: TcpStream,
+    pub transport: Transport,
     pub remote_addr: SocketAddr,
     pub state: ClientState,
     pub client_id: Option<String>,
@@ -99,19 +180,19 @@ impl Client {
     /// Create a new client with a shared write handle.
     pub fn new(
         token: Token,
-        socket: TcpStream,
+        transport: Transport,
         remote_addr: SocketAddr,
         worker_id: usize,
         epoll_fd: i32,
     ) -> Self {
-        let socket_fd = socket.as_raw_fd();
+        let socket_fd = transport.as_raw_fd();
         let handle = Arc::new(ClientWriteHandle::new(
             worker_id, epoll_fd, socket_fd, token,
         ));
 
         Self {
             token,
-            socket,
+            transport,
             remote_addr,
             state: ClientState::Connecting,
             client_id: None,
@@ -162,7 +243,7 @@ impl Client {
                 self.read_buf.resize(new_size, 0);
             }
 
-            match self.socket.read(&mut self.read_buf[self.read_pos..]) {
+            match self.transport.read(&mut self.read_buf[self.read_pos..]) {
                 Ok(0) => {
                     // Connection closed - if there's data to process (e.g., DISCONNECT packet),
                     // return true so packets get processed. Otherwise mark as disconnecting.
@@ -259,7 +340,7 @@ impl Client {
     /// Write queued data to socket.
     /// Returns Ok(true) if all data was written, Ok(false) if would block.
     pub fn flush(&mut self) -> Result<bool> {
-        match self.handle.flush(&mut self.socket) {
+        match self.handle.flush(&mut self.transport) {
             Ok(true) => Ok(true),
             Ok(false) => {
                 // Check if connection was closed (0 bytes written)
@@ -280,5 +361,45 @@ impl Client {
     #[allow(dead_code)]
     pub fn has_pending_writes(&self) -> bool {
         self.handle.has_pending_writes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream as StdTcpStream};
+
+    #[test]
+    fn test_transport_plain_as_raw_fd() {
+        // Create a TCP listener to get a valid socket
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Connect to ourselves
+        let std_stream = StdTcpStream::connect(addr).unwrap();
+        std_stream.set_nonblocking(true).unwrap();
+        let stream = mio::net::TcpStream::from_std(std_stream);
+
+        let fd = stream.as_raw_fd();
+        let transport = Transport::plain(stream);
+
+        // The transport's raw fd should match the original socket's fd
+        assert_eq!(transport.as_raw_fd(), fd);
+    }
+
+    #[test]
+    fn test_transport_tcp_stream_mut() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let std_stream = StdTcpStream::connect(addr).unwrap();
+        std_stream.set_nonblocking(true).unwrap();
+        let stream = mio::net::TcpStream::from_std(std_stream);
+
+        let mut transport = Transport::plain(stream);
+
+        // Should be able to get mutable reference to underlying stream
+        let tcp = transport.tcp_stream_mut();
+        assert!(tcp.peer_addr().is_ok());
     }
 }

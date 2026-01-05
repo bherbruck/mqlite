@@ -18,5 +18,5 @@ COPY mqlite.toml /etc/mqlite/mqlite.toml
 # Create data directory for persistence
 VOLUME /var/lib/mqlite
 
-EXPOSE 1883 9090
+EXPOSE 1883 8883 9090
 ENTRYPOINT ["/mqlite", "-c", "/etc/mqlite/mqlite.toml"]

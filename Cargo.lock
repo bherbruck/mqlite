@@ -503,6 +503,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
  "env_logger",
+ "itoa",
  "libc",
  "log",
  "mio",

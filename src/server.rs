@@ -7,7 +7,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Sender};
 use log::{debug, error, info};
@@ -17,6 +17,7 @@ use mio::{Events, Interest, Poll, Token};
 use crate::config::Config;
 use crate::error::Result;
 use crate::shared::SharedState;
+use crate::sys_tree::SysTreePublisher;
 use crate::worker::{Worker, WorkerMsg};
 
 /// Token for the listener socket.
@@ -64,6 +65,16 @@ impl Server {
     pub fn run(&mut self) -> Result<()> {
         let shared = Arc::new(SharedState::new());
 
+        // Create $SYS publisher if enabled
+        let sys_interval = self.config.server.sys_interval;
+        let mut sys_publisher = if sys_interval > 0 {
+            info!("$SYS topic publishing enabled (interval: {}s)", sys_interval);
+            Some(SysTreePublisher::new(Arc::clone(&shared), sys_interval))
+        } else {
+            None
+        };
+        let mut last_sys_publish = Instant::now();
+
         // Create channels for all workers
         let mut receivers = Vec::with_capacity(self.num_workers);
         for _ in 0..self.num_workers {
@@ -77,7 +88,7 @@ impl Server {
             let rx = receivers.remove(0);
             let mut worker = Worker::new(
                 0,
-                shared,
+                Arc::clone(&shared),
                 rx,
                 self.worker_senders.clone(),
                 Arc::clone(&self.config),
@@ -96,6 +107,14 @@ impl Server {
                 }
 
                 worker.run_once()?;
+
+                // Publish $SYS topics if interval elapsed
+                if let Some(ref mut publisher) = sys_publisher {
+                    if last_sys_publish.elapsed().as_secs() >= sys_interval {
+                        publisher.publish_if_changed();
+                        last_sys_publish = Instant::now();
+                    }
+                }
             }
         } else {
             // Multi-worker: spawn worker threads
@@ -121,7 +140,7 @@ impl Server {
 
             info!("Spawned {} worker threads", self.num_workers);
 
-            // Main thread handles accept loop only
+            // Main thread handles accept loop and $SYS publishing
             let mut events = Events::with_capacity(256);
 
             loop {
@@ -131,6 +150,14 @@ impl Server {
                 for event in events.iter() {
                     if event.token() == LISTENER {
                         self.accept_connections()?;
+                    }
+                }
+
+                // Publish $SYS topics if interval elapsed
+                if let Some(ref mut publisher) = sys_publisher {
+                    if last_sys_publish.elapsed().as_secs() >= sys_interval {
+                        publisher.publish_if_changed();
+                        last_sys_publish = Instant::now();
                     }
                 }
             }

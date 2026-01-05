@@ -126,6 +126,9 @@ impl Default for LogConfig {
     }
 }
 
+/// Default $SYS topic publish interval in seconds.
+pub const DEFAULT_SYS_INTERVAL: u64 = 10;
+
 /// Server configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -136,6 +139,13 @@ pub struct ServerConfig {
     /// Number of worker threads (0 = auto based on CPU count).
     #[serde(default)]
     pub workers: usize,
+    /// $SYS topic publish interval in seconds (0 = disabled).
+    #[serde(default = "default_sys_interval")]
+    pub sys_interval: u64,
+}
+
+fn default_sys_interval() -> u64 {
+    DEFAULT_SYS_INTERVAL
 }
 
 fn default_bind() -> SocketAddr {
@@ -147,6 +157,7 @@ impl Default for ServerConfig {
         Self {
             bind: default_bind(),
             workers: 0,
+            sys_interval: DEFAULT_SYS_INTERVAL,
         }
     }
 }
@@ -440,6 +451,7 @@ impl Config {
             .set_default("log.level", "info")?
             .set_default("server.bind", "0.0.0.0:1883")?
             .set_default("server.workers", 0)?
+            .set_default("server.sys_interval", DEFAULT_SYS_INTERVAL as i64)?
             .set_default("limits.max_packet_size", DEFAULT_MAX_PACKET_SIZE as i64)?
             .set_default("limits.max_topic_length", DEFAULT_MAX_TOPIC_LENGTH as i64)?
             .set_default("limits.max_topic_levels", DEFAULT_MAX_TOPIC_LEVELS as i64)?

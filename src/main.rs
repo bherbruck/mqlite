@@ -10,6 +10,7 @@ mod publish_encoder;
 mod server;
 mod shared;
 mod subscription;
+mod sys_tree;
 mod util;
 mod worker;
 mod write_buffer;

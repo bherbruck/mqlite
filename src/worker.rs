@@ -290,6 +290,9 @@ impl Worker {
         self.token_to_handle.insert(token, handle);
         self.clients.insert(token, client);
 
+        // Track socket opened for $SYS metrics
+        self.shared.metrics.increment_sockets_opened();
+
         Ok(())
     }
 
@@ -462,6 +465,8 @@ impl Worker {
                 match client.decode_packet(self.config.limits.max_packet_size) {
                     Ok(Some(packet)) => {
                         client.last_packet_time = Instant::now();
+                        // Track message received for $SYS metrics
+                        self.shared.metrics.add_msgs_received(1);
                         packet
                     }
                     Ok(None) => break,
@@ -857,6 +862,10 @@ impl Worker {
         client.protocol_version = connect.protocol_version;
         client.handle.set_protocol_version(connect.protocol_version);
         client.state = ClientState::Connected;
+
+        // Track connection for $SYS metrics
+        self.shared.metrics.client_connected();
+        self.shared.metrics.increment_connections_total();
 
         // MQTT 5: Extract client's flow control values
         if is_v5 {
@@ -1288,6 +1297,11 @@ impl Worker {
     }
 
     fn handle_publish(&mut self, from_token: Token, publish: Publish) -> Result<()> {
+        // Track publish received for $SYS metrics (before any validation)
+        let payload_len = publish.payload.len() as u64;
+        self.shared.metrics.add_pub_msgs_received(1);
+        self.shared.metrics.add_pub_bytes_received(payload_len);
+
         // MQTT-3.3.2-2, MQTT-4.7.3-1: Topic Names MUST NOT contain wildcards
         if publish.topic.iter().any(|&b| b == b'+' || b == b'#') {
             // Protocol violation - disconnect client
@@ -1596,7 +1610,13 @@ impl Worker {
                     // Track for rate-limited logging (can't call method due to borrow)
                     backpressure_count += 1;
                     last_backpressure_sub = Some((sub.handle.worker_id(), sub.handle.token()));
+                    // Track dropped publish for $SYS metrics
+                    self.shared.metrics.add_pub_msgs_dropped(1);
                 }
+            } else {
+                // Track successful publish sent for $SYS metrics
+                self.shared.metrics.add_pub_msgs_sent(1);
+                self.shared.metrics.add_pub_bytes_sent(payload_len);
             }
         }
 
@@ -1631,6 +1651,12 @@ impl Worker {
         for token in disconnected {
             if let Some(mut client) = self.clients.remove(&token) {
                 let _ = self.poll.registry().deregister(&mut client.socket);
+
+                // Track client disconnection for $SYS metrics
+                // Only count if client was fully connected (has client_id assigned)
+                if client.client_id.is_some() {
+                    self.shared.metrics.client_disconnected();
+                }
 
                 // Clean up token maps to free memory (WriteBuffer, etc.)
                 self.token_to_handle.remove(&token);

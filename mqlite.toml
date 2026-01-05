@@ -22,6 +22,8 @@ level = "info"
 bind = "0.0.0.0:1883"
 # Number of worker threads (0 = auto, uses CPU count)
 workers = 0
+# $SYS topic publish interval in seconds (0 = disabled)
+sys_interval = 10
 
 [limits]
 # Note: Set any limit to 0 for unbounded (where applicable)

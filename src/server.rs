@@ -7,15 +7,18 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Sender};
 use log::{debug, error, info};
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 
+use crate::config::Config;
 use crate::error::Result;
+use crate::prometheus;
 use crate::shared::SharedState;
+use crate::sys_tree::SysTreePublisher;
 use crate::worker::{Worker, WorkerMsg};
 
 /// Token for the listener socket.
@@ -34,17 +37,13 @@ pub struct Server {
     next_worker: usize,
     /// Number of workers.
     num_workers: usize,
+    /// Broker configuration.
+    config: Arc<Config>,
 }
 
 impl Server {
-    /// Create a new server bound to the given address.
-    #[allow(dead_code)]
-    pub fn new(addr: SocketAddr) -> Result<Self> {
-        Self::with_workers(addr, 1)
-    }
-
-    /// Create a new server with the specified number of workers.
-    pub fn with_workers(addr: SocketAddr, num_workers: usize) -> Result<Self> {
+    /// Create a new server with the specified number of workers and config.
+    pub fn new(addr: SocketAddr, num_workers: usize, config: Arc<Config>) -> Result<Self> {
         let poll = Poll::new()?;
         let mut listener = TcpListener::bind(addr)?;
 
@@ -59,12 +58,36 @@ impl Server {
             worker_senders: Vec::new(),
             next_worker: 0,
             num_workers,
+            config,
         })
     }
 
     /// Run the server with workers.
     pub fn run(&mut self) -> Result<()> {
         let shared = Arc::new(SharedState::new());
+        let start_time = Instant::now();
+
+        // Start Prometheus metrics server if enabled
+        if self.config.prometheus.enabled {
+            prometheus::start_metrics_server(
+                self.config.prometheus.bind,
+                Arc::clone(&shared),
+                start_time,
+            );
+        }
+
+        // Create $SYS publisher if enabled
+        let sys_interval = self.config.server.sys_interval;
+        let mut sys_publisher = if sys_interval > 0 {
+            info!(
+                "$SYS topic publishing enabled (interval: {}s)",
+                sys_interval
+            );
+            Some(SysTreePublisher::new(Arc::clone(&shared), sys_interval))
+        } else {
+            None
+        };
+        let mut last_sys_publish = Instant::now();
 
         // Create channels for all workers
         let mut receivers = Vec::with_capacity(self.num_workers);
@@ -77,7 +100,13 @@ impl Server {
         if self.num_workers == 1 {
             // Single worker: run in main thread (best latency)
             let rx = receivers.remove(0);
-            let mut worker = Worker::new(0, shared, rx, self.worker_senders.clone())?;
+            let mut worker = Worker::new(
+                0,
+                Arc::clone(&shared),
+                rx,
+                self.worker_senders.clone(),
+                Arc::clone(&self.config),
+            )?;
 
             let mut events = Events::with_capacity(1024);
 
@@ -92,6 +121,14 @@ impl Server {
                 }
 
                 worker.run_once()?;
+
+                // Publish $SYS topics if interval elapsed
+                if let Some(ref mut publisher) = sys_publisher {
+                    if last_sys_publish.elapsed().as_secs() >= sys_interval {
+                        publisher.publish_if_changed();
+                        last_sys_publish = Instant::now();
+                    }
+                }
             }
         } else {
             // Multi-worker: spawn worker threads
@@ -100,12 +137,13 @@ impl Server {
             for (id, rx) in receivers.into_iter().enumerate() {
                 let shared = Arc::clone(&shared);
                 let senders = self.worker_senders.clone();
+                let config = Arc::clone(&self.config);
 
                 let handle = thread::Builder::new()
                     .name(format!("worker-{}", id))
                     .spawn(move || {
-                        let mut worker =
-                            Worker::new(id, shared, rx, senders).expect("Failed to create worker");
+                        let mut worker = Worker::new(id, shared, rx, senders, config)
+                            .expect("Failed to create worker");
                         if let Err(e) = worker.run() {
                             error!("Worker {} error: {}", id, e);
                         }
@@ -116,7 +154,7 @@ impl Server {
 
             info!("Spawned {} worker threads", self.num_workers);
 
-            // Main thread handles accept loop only
+            // Main thread handles accept loop and $SYS publishing
             let mut events = Events::with_capacity(256);
 
             loop {
@@ -126,6 +164,14 @@ impl Server {
                 for event in events.iter() {
                     if event.token() == LISTENER {
                         self.accept_connections()?;
+                    }
+                }
+
+                // Publish $SYS topics if interval elapsed
+                if let Some(ref mut publisher) = sys_publisher {
+                    if last_sys_publish.elapsed().as_secs() >= sys_interval {
+                        publisher.publish_if_changed();
+                        last_sys_publish = Instant::now();
                     }
                 }
             }

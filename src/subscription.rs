@@ -144,6 +144,21 @@ impl TrieNode {
         }
     }
 
+    /// Count all subscriptions in this node and children.
+    fn count_subscriptions(&self) -> usize {
+        let mut count = self.subscribers.len() + self.multi_wildcard.len();
+
+        if let Some(child) = &self.single_wildcard {
+            count += child.count_subscriptions();
+        }
+
+        for child in self.children.values() {
+            count += child.count_subscriptions();
+        }
+
+        count
+    }
+
     fn collect_subscribers(&self, levels: &[&str], is_root: bool, result: &mut Vec<Subscriber>) {
         // MQTT-4.7.2-1: Topics starting with $ are not matched by wildcards at root level
         let skip_wildcards = is_root && levels.first().is_some_and(|l| l.starts_with('$'));
@@ -375,6 +390,20 @@ impl SubscriptionStore {
                 }
             }
         }
+    }
+
+    /// Count total number of subscriptions (for $SYS topics).
+    pub fn subscription_count(&self) -> usize {
+        let mut count = self.root.count_subscriptions();
+
+        // Count shared subscriptions
+        for group_map in self.shared.values() {
+            for shared_group in group_map.values() {
+                count += shared_group.subscribers.len();
+            }
+        }
+
+        count
     }
 }
 

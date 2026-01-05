@@ -13,9 +13,10 @@ RUN cp target/release/mqlite /mqlite
 FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /mqlite /mqlite
+COPY mqlite.toml /etc/mqlite/mqlite.toml
 
 # Create data directory for persistence
 VOLUME /var/lib/mqlite
 
-EXPOSE 1883 9001
-ENTRYPOINT ["/mqlite"]
+EXPOSE 1883 9090
+ENTRYPOINT ["/mqlite", "-c", "/etc/mqlite/mqlite.toml"]

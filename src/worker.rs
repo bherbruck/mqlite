@@ -21,18 +21,21 @@ use crossbeam_channel::{Receiver, Sender};
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 
+use crate::auth::{AuthContext, AuthProvider, AuthResult, ClientInfo};
 use crate::client::{Client, ClientState, PendingPublish};
 use crate::client_handle::ClientWriteHandle;
+use crate::config::Config;
 use crate::error::{ProtocolError, Result};
 use crate::packet::{
-    encode_variable_byte_integer, update_message_expiry, Connack, ConnackCode, ConnackProperties,
-    Packet, Publish, QoS, Suback, Unsuback,
+    encode_variable_byte_integer, update_message_expiry, validate_topic, Connack, ConnackCode,
+    ConnackProperties, Packet, Publish, QoS, Suback, Unsuback,
 };
 use crate::publish_encoder::PublishEncoder;
 use crate::shared::{
     ClientLocation, RetainedMessage, Session, SharedStateHandle, StoredSubscription,
 };
 use crate::subscription::{topic_matches_filter, Subscriber};
+use crate::util::RateLimitedCounter;
 
 /// Messages sent to workers via channels (control plane only).
 /// Publish delivery uses direct writes, not channels.
@@ -88,6 +91,8 @@ struct CacheStats {
     enabled: bool,
     /// Lookups since last evaluation.
     lookups_since_eval: u64,
+    /// How many times cache has been disabled (for rate-limited logging).
+    disabled_count: u64,
 }
 
 /// Worker thread that handles a subset of client connections.
@@ -128,6 +133,15 @@ pub struct Worker {
 
     /// Wills scheduled for delayed publication (MQTT v5 Will Delay Interval).
     delayed_wills: Vec<DelayedWill>,
+
+    /// Rate-limited subscriber backpressure logging (for cross-thread drops).
+    subscriber_backpressure_log: RateLimitedCounter,
+
+    /// Broker configuration.
+    config: Arc<Config>,
+
+    /// Authentication and authorization provider.
+    auth: AuthProvider,
 }
 
 impl Worker {
@@ -137,6 +151,7 @@ impl Worker {
         shared: SharedStateHandle,
         rx: Receiver<WorkerMsg>,
         worker_senders: Vec<Sender<WorkerMsg>>,
+        config: Arc<Config>,
     ) -> Result<Self> {
         let poll = Poll::new()?;
         let epoll_fd = poll.as_raw_fd();
@@ -160,8 +175,12 @@ impl Worker {
                 misses: 0,
                 enabled: true, // Start with cache enabled
                 lookups_since_eval: 0,
+                disabled_count: 0,
             },
             delayed_wills: Vec::new(),
+            subscriber_backpressure_log: RateLimitedCounter::new(Duration::from_secs(10)),
+            auth: AuthProvider::from_config(&config),
+            config,
         })
     }
 
@@ -257,7 +276,7 @@ impl Worker {
     }
 
     /// Accept a new client connection.
-    fn accept_client(&mut self, mut socket: TcpStream, _addr: SocketAddr) -> Result<()> {
+    fn accept_client(&mut self, mut socket: TcpStream, addr: SocketAddr) -> Result<()> {
         let token = Token(self.next_token);
         self.next_token += 1;
 
@@ -265,11 +284,14 @@ impl Worker {
             .registry()
             .register(&mut socket, token, Interest::READABLE)?;
 
-        let client = Client::new(token, socket, self.id, self.epoll_fd);
+        let client = Client::new(token, socket, addr, self.id, self.epoll_fd);
         // Store handle for subscription management
         let handle = client.handle.clone();
         self.token_to_handle.insert(token, handle);
         self.clients.insert(token, client);
+
+        // Track socket opened for $SYS metrics
+        self.shared.metrics.increment_sockets_opened();
 
         Ok(())
     }
@@ -384,16 +406,21 @@ impl Worker {
         let hit_rate = self.cache_stats.hits as f64 / total as f64;
 
         if hit_rate < CACHE_MIN_HIT_RATE {
-            log::info!(
-                "Worker {}: Route cache disabled (hit rate {:.1}% < {:.1}% threshold, {} hits / {} total)",
-                self.id,
-                hit_rate * 100.0,
-                CACHE_MIN_HIT_RATE * 100.0,
-                self.cache_stats.hits,
-                total
-            );
+            self.cache_stats.disabled_count += 1;
+            // Only log first disable and every 100th after that
+            if self.cache_stats.disabled_count == 1 || self.cache_stats.disabled_count.is_multiple_of(100) {
+                log::info!(
+                    "Worker {}: Route cache disabled (hit rate {:.1}% < {:.1}% threshold, {} hits / {} total, disabled {} times)",
+                    self.id,
+                    hit_rate * 100.0,
+                    CACHE_MIN_HIT_RATE * 100.0,
+                    self.cache_stats.hits,
+                    total,
+                    self.cache_stats.disabled_count
+                );
+            }
             self.cache_stats.enabled = false;
-            self.route_cache.clear(); // Free memory
+            // Keep cache entries for when re-enabled (avoids warmup penalty)
         } else {
             log::debug!(
                 "Worker {}: Route cache healthy (hit rate {:.1}%, {} hits / {} total)",
@@ -435,9 +462,11 @@ impl Worker {
                     return Ok(());
                 }
 
-                match client.decode_packet() {
+                match client.decode_packet(self.config.limits.max_packet_size) {
                     Ok(Some(packet)) => {
                         client.last_packet_time = Instant::now();
+                        // Track message received for $SYS metrics
+                        self.shared.metrics.add_msgs_received(1);
                         packet
                     }
                     Ok(None) => break,
@@ -502,6 +531,8 @@ impl Worker {
             Packet::Puback { packet_id } => {
                 if let Some(client) = self.clients.get_mut(&token) {
                     client.pending_qos1.remove(&packet_id);
+                    // MQTT 5: Restore outgoing quota when ACK received
+                    client.restore_quota();
                 }
             }
 
@@ -509,10 +540,7 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&token) {
                     if let Err(e) = client.queue_packet(&Packet::Pubrel { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!(
-                                "Backpressure: dropping PUBREL to slow client (token={:?})",
-                                token
-                            );
+                            client.record_backpressure_drop("PUBREL");
                         }
                     }
                 }
@@ -522,10 +550,7 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&token) {
                     if let Err(e) = client.queue_packet(&Packet::Pubcomp { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!(
-                                "Backpressure: dropping PUBCOMP to slow client (token={:?})",
-                                token
-                            );
+                            client.record_backpressure_drop("PUBCOMP");
                         }
                     }
                 }
@@ -534,6 +559,8 @@ impl Worker {
             Packet::Pubcomp { packet_id } => {
                 if let Some(client) = self.clients.get_mut(&token) {
                     client.pending_qos2.remove(&packet_id);
+                    // MQTT 5: Restore outgoing quota when QoS 2 flow completes
+                    client.restore_quota();
                 }
             }
 
@@ -605,6 +632,60 @@ impl Worker {
             let _ = client.queue_packet(&Packet::Connack(connack));
             client.state = ClientState::Disconnecting;
             return Ok(());
+        }
+
+        // Authentication check
+        let (auth_result, auth_role) = {
+            let client = self.clients.get(&token).unwrap();
+            let auth_ctx = AuthContext {
+                client_id: &connect.client_id,
+                username: connect.username.as_deref(),
+                password: connect.password.as_deref(),
+                remote_addr: client.remote_addr,
+            };
+            self.auth.authenticate(&auth_ctx)
+        };
+
+        if !auth_result.is_allowed() {
+            let client = self.clients.get_mut(&token).unwrap();
+            client.protocol_version = connect.protocol_version;
+            let connack = if is_v5 {
+                Connack {
+                    session_present: false,
+                    code: ConnackCode::NotAuthorized,
+                    reason_code: Some(auth_result.to_reason_code_v5()),
+                    properties: Some(ConnackProperties::default()),
+                }
+            } else {
+                Connack {
+                    session_present: false,
+                    code: if matches!(auth_result, AuthResult::DenyBadCredentials) {
+                        ConnackCode::BadUsernamePassword
+                    } else {
+                        ConnackCode::NotAuthorized
+                    },
+                    reason_code: None,
+                    properties: None,
+                }
+            };
+            let _ = client.queue_packet(&Packet::Connack(connack));
+            client.state = ClientState::Disconnecting;
+            log::debug!(
+                "Authentication failed for client {:?} from {}: {:?}",
+                connect.client_id,
+                client.remote_addr,
+                auth_result
+            );
+            return Ok(());
+        }
+
+        // Store auth info in client
+        {
+            let client = self.clients.get_mut(&token).unwrap();
+            client.username = connect.username.clone();
+            client.role = auth_role;
+            // Determine if anonymous: no username and no password provided
+            client.is_anonymous = connect.username.is_none() && connect.password.is_none();
         }
 
         // MQTT-3.1.4-2: If ClientId already exists, disconnect existing client
@@ -782,6 +863,19 @@ impl Worker {
         client.handle.set_protocol_version(connect.protocol_version);
         client.state = ClientState::Connected;
 
+        // Track connection for $SYS metrics
+        self.shared.metrics.client_connected();
+        self.shared.metrics.increment_connections_total();
+
+        // MQTT 5: Extract client's flow control values
+        if is_v5 {
+            if let Some(ref props) = connect.properties {
+                let client_recv_max = props.receive_maximum.unwrap_or(65535);
+                let client_max_pkt = props.maximum_packet_size.unwrap_or(0);
+                client.set_flow_control(client_recv_max, client_max_pkt);
+            }
+        }
+
         if !connect.clean_session && !connect.client_id.is_empty() {
             self.token_to_client_id
                 .insert(token, connect.client_id.clone());
@@ -819,12 +913,35 @@ impl Worker {
                 props.assigned_client_identifier = Some(id);
             }
 
-            // Set server capabilities
-            props.retain_available = Some(true);
-            props.wildcard_subscription_available = Some(true);
-            props.subscription_identifiers_available = Some(true);
-            props.shared_subscription_available = Some(true);
-            props.maximum_qos = Some(2);
+            // Set server capabilities from config
+            // Per MQTT 5 spec: retain_available defaults to true if absent
+            if !self.config.mqtt.retain_available {
+                props.retain_available = Some(false);
+            }
+            // Per MQTT 5 spec: wildcard_subscription_available defaults to true if absent
+            if !self.config.mqtt.wildcard_subscriptions {
+                props.wildcard_subscription_available = Some(false);
+            }
+            // Per MQTT 5 spec: subscription_identifiers_available defaults to true if absent
+            if !self.config.mqtt.subscription_identifiers {
+                props.subscription_identifiers_available = Some(false);
+            }
+            // Per MQTT 5 spec: shared_subscription_available defaults to true if absent
+            if !self.config.mqtt.shared_subscriptions {
+                props.shared_subscription_available = Some(false);
+            }
+            // Per MQTT 5 spec: Maximum QoS absent = QoS 2 supported
+            // Only send if < 2 (0 or 1), never send value 2
+            if self.config.mqtt.max_qos < 2 {
+                props.maximum_qos = Some(self.config.mqtt.max_qos);
+            }
+
+            // Advertise server limits (MQTT 5 flow control)
+            props.receive_maximum = Some(self.config.limits.receive_maximum);
+            if self.config.limits.max_packet_size > 0 {
+                props.maximum_packet_size = Some(self.config.limits.max_packet_size);
+            }
+            props.topic_alias_maximum = Some(self.config.limits.topic_alias_maximum);
 
             Connack {
                 session_present,
@@ -876,13 +993,31 @@ impl Worker {
         // (retained_msg, stored_at, sub_qos, retain_as_published, subscription_id)
         let mut retained_to_send: Vec<(Publish, Instant, QoS, bool, Option<u32>)> = Vec::new();
 
-        let (client_id, clean_session) = {
+        let (client_id, clean_session, is_v5) = {
             let client = self.clients.get(&token);
             (
                 client.and_then(|c| c.client_id.clone()),
                 client.map(|c| c.clean_session).unwrap_or(true),
+                client.map(|c| c.protocol_version == 5).unwrap_or(false),
             )
         };
+
+        // Enforce subscription_identifiers: reject if subscription ID present but feature disabled
+        if subscribe.subscription_id.is_some() && !self.config.mqtt.subscription_identifiers {
+            // MQTT 5: 0xA1 = Subscription Identifiers not supported
+            for _ in &subscribe.topics {
+                return_codes.push(if is_v5 { 0xA1 } else { 0x80 });
+            }
+            if let Some(client) = self.clients.get_mut(&token) {
+                let suback = Suback {
+                    packet_id: subscribe.packet_id,
+                    return_codes,
+                    is_v5,
+                };
+                let _ = client.queue_packet(&Packet::Suback(suback));
+            }
+            return Ok(());
+        }
 
         let handle = self.token_to_handle.get(&token).cloned();
 
@@ -906,6 +1041,64 @@ impl Worker {
                 } else {
                     (topic_filter.clone(), None)
                 };
+
+            // Enforce shared_subscriptions: reject if shared subscription but feature disabled
+            if share_group.is_some() && !self.config.mqtt.shared_subscriptions {
+                // MQTT 5: 0x9E = Shared Subscriptions not supported
+                return_codes.push(if is_v5 { 0x9E } else { 0x80 });
+                continue;
+            }
+
+            // Enforce wildcard_subscriptions: reject if wildcard in filter but feature disabled
+            let has_wildcard = actual_filter.contains('+') || actual_filter.contains('#');
+            if has_wildcard && !self.config.mqtt.wildcard_subscriptions {
+                // MQTT 5: 0xA2 = Wildcard Subscriptions not supported
+                return_codes.push(if is_v5 { 0xA2 } else { 0x80 });
+                continue;
+            }
+
+            // Validate topic filter length and depth
+            if validate_topic(
+                actual_filter.as_bytes(),
+                self.config.limits.max_topic_length,
+                self.config.limits.max_topic_levels,
+            )
+            .is_err()
+            {
+                // Topic too long or too deep - return error code for this subscription
+                // MQTT 5: 0x97 = Quota exceeded (closest match)
+                // MQTT 3.1.1: 0x80 = Failure
+                return_codes.push(if is_v5 { 0x97 } else { 0x80 });
+                continue;
+            }
+
+            // ACL check for subscribe permission
+            let acl_result = {
+                let client = self.clients.get(&token);
+                if let Some(c) = client {
+                    let client_info = ClientInfo {
+                        client_id: c.client_id.clone().unwrap_or_default(),
+                        username: c.username.clone(),
+                        role: c.role.clone(),
+                        is_anonymous: c.is_anonymous,
+                    };
+                    self.auth.check_subscribe(&client_info, &actual_filter)
+                } else {
+                    AuthResult::DenyNotAuthorized
+                }
+            };
+
+            if !acl_result.is_allowed() {
+                // MQTT 5: 0x87 = Not authorized
+                // MQTT 3.1.1: 0x80 = Failure
+                return_codes.push(if is_v5 { 0x87 } else { 0x80 });
+                log::debug!(
+                    "ACL denied subscribe to '{}' for client {:?}",
+                    actual_filter,
+                    client_id
+                );
+                continue;
+            }
 
             if let Some(ref h) = handle {
                 self.shared.subscriptions.write().subscribe(
@@ -1103,6 +1296,11 @@ impl Worker {
     }
 
     fn handle_publish(&mut self, from_token: Token, publish: Publish) -> Result<()> {
+        // Track publish received for $SYS metrics (before any validation)
+        let payload_len = publish.payload.len() as u64;
+        self.shared.metrics.add_pub_msgs_received(1);
+        self.shared.metrics.add_pub_bytes_received(payload_len);
+
         // MQTT-3.3.2-2, MQTT-4.7.3-1: Topic Names MUST NOT contain wildcards
         if publish.topic.iter().any(|&b| b == b'+' || b == b'#') {
             // Protocol violation - disconnect client
@@ -1112,16 +1310,97 @@ impl Worker {
             return Ok(());
         }
 
+        // Validate topic length and depth
+        if let Err(_e) = validate_topic(
+            &publish.topic,
+            self.config.limits.max_topic_length,
+            self.config.limits.max_topic_levels,
+        ) {
+            // Topic too long or too deep - disconnect client
+            if let Some(client) = self.clients.get_mut(&from_token) {
+                client.state = ClientState::Disconnecting;
+            }
+            return Ok(());
+        }
+
+        // Enforce max_qos: reject publish if QoS exceeds server maximum
+        if publish.qos as u8 > self.config.mqtt.max_qos {
+            if let Some(client) = self.clients.get_mut(&from_token) {
+                // Protocol error - client violated server's advertised Maximum QoS
+                // MQTT 5: 0x9B = QoS not supported
+                client.state = ClientState::Disconnecting;
+            }
+            return Ok(());
+        }
+
+        // Enforce retain_available: reject retained publish if disabled
+        if publish.retain && !self.config.mqtt.retain_available {
+            if let Some(client) = self.clients.get_mut(&from_token) {
+                // Protocol error - client violated server's advertised Retain Available
+                // MQTT 5: 0x9A = Retain not supported
+                client.state = ClientState::Disconnecting;
+            }
+            return Ok(());
+        }
+
+        // ACL check for publish permission
+        let (acl_allowed, is_v5) = {
+            let client = self.clients.get(&from_token);
+            if let Some(c) = client {
+                let topic_str = String::from_utf8_lossy(&publish.topic);
+                let client_info = ClientInfo {
+                    client_id: c.client_id.clone().unwrap_or_default(),
+                    username: c.username.clone(),
+                    role: c.role.clone(),
+                    is_anonymous: c.is_anonymous,
+                };
+                let result = self.auth.check_publish(&client_info, &topic_str);
+                (result.is_allowed(), c.protocol_version == 5)
+            } else {
+                (false, false)
+            }
+        };
+
+        if !acl_allowed {
+            // Log the ACL denial
+            log::debug!(
+                "ACL denied publish to '{}' for client at token {:?}",
+                String::from_utf8_lossy(&publish.topic),
+                from_token
+            );
+
+            // For MQTT v5: send PUBACK/PUBREC with 0x87 (Not authorized) reason code
+            // For MQTT v3.1.1: silently drop (no error mechanism in PUBACK)
+            if is_v5 {
+                if publish.qos == QoS::AtLeastOnce {
+                    if let Some(packet_id) = publish.packet_id {
+                        if let Some(client) = self.clients.get_mut(&from_token) {
+                            // TODO: Add reason_code support to Puback packet
+                            // For now, just send regular PUBACK (client may retry)
+                            let _ = client.queue_packet(&Packet::Puback { packet_id });
+                        }
+                    }
+                }
+                if publish.qos == QoS::ExactlyOnce {
+                    if let Some(packet_id) = publish.packet_id {
+                        if let Some(client) = self.clients.get_mut(&from_token) {
+                            // TODO: Add reason_code support to Pubrec packet
+                            let _ = client.queue_packet(&Packet::Pubrec { packet_id });
+                        }
+                    }
+                }
+            }
+            // Don't forward the message - ACL denied
+            return Ok(());
+        }
+
         // Send PUBACK/PUBREC to publisher
         if publish.qos == QoS::AtLeastOnce {
             if let Some(packet_id) = publish.packet_id {
                 if let Some(client) = self.clients.get_mut(&from_token) {
                     if let Err(e) = client.queue_packet(&Packet::Puback { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!(
-                                "Backpressure: dropping PUBACK to slow publisher (token={:?})",
-                                from_token
-                            );
+                            client.record_backpressure_drop("PUBACK");
                         }
                     }
                 }
@@ -1132,10 +1411,7 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&from_token) {
                     if let Err(e) = client.queue_packet(&Packet::Pubrec { packet_id }) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!(
-                                "Backpressure: dropping PUBREC to slow publisher (token={:?})",
-                                from_token
-                            );
+                            client.record_backpressure_drop("PUBREC");
                         }
                     }
                 }
@@ -1185,6 +1461,8 @@ impl Worker {
 
         // Forward to subscribers using direct writes via handles
         // subscriber_buf is already deduplicated by get_subscribers_cached
+        let mut backpressure_count: u32 = 0;
+        let mut last_backpressure_sub: Option<(usize, Token)> = None;
         for sub in &self.subscriber_buf {
             // MQTT-3.8.3.1-2: NoLocal - don't deliver to publishing client
             if sub.options.no_local && sub.token() == from_token && sub.worker_id() == self.id {
@@ -1235,6 +1513,18 @@ impl Worker {
                         }
                     }
                     continue;
+                }
+
+                // MQTT 5 flow control: check quota before sending QoS 1/2
+                if out_qos != QoS::AtMostOnce {
+                    if let Some(client) = self.clients.get_mut(&sub_token) {
+                        if !client.consume_quota() {
+                            // No quota available - skip this message (flow control)
+                            backpressure_count += 1;
+                            last_backpressure_sub = Some((worker_id, sub_token));
+                            continue;
+                        }
+                    }
                 }
 
                 // Track pending for local clients
@@ -1316,11 +1606,31 @@ impl Worker {
                 sub.subscription_id,
             ) {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
+                    // Track for rate-limited logging (can't call method due to borrow)
+                    backpressure_count += 1;
+                    last_backpressure_sub = Some((sub.handle.worker_id(), sub.handle.token()));
+                    // Track dropped publish for $SYS metrics
+                    self.shared.metrics.add_pub_msgs_dropped(1);
+                }
+            } else {
+                // Track successful publish sent for $SYS metrics
+                self.shared.metrics.add_pub_msgs_sent(1);
+                self.shared.metrics.add_pub_bytes_sent(payload_len);
+            }
+        }
+
+        // Log accumulated backpressure drops (rate limited to every 10s per worker)
+        if backpressure_count > 0 {
+            if let Some(count) = self
+                .subscriber_backpressure_log
+                .increment_by(backpressure_count as u64)
+            {
+                if let Some((worker_id, token)) = last_backpressure_sub {
                     log::warn!(
-                        "Backpressure: dropping publish to slow subscriber (worker={}, token={:?}, qos={:?})",
-                        sub.handle.worker_id(),
-                        sub.handle.token(),
-                        out_qos
+                        "Backpressure: dropped {} messages to slow subscribers (last: worker={}, token={:?})",
+                        count,
+                        worker_id,
+                        token
                     );
                 }
             }
@@ -1343,6 +1653,12 @@ impl Worker {
         for token in disconnected {
             if let Some(mut client) = self.clients.remove(&token) {
                 let _ = self.poll.registry().deregister(&mut client.socket);
+
+                // Track client disconnection for $SYS metrics
+                // Only count if client was fully connected (has client_id assigned)
+                if client.client_id.is_some() {
+                    self.shared.metrics.client_disconnected();
+                }
 
                 // Clean up token maps to free memory (WriteBuffer, etc.)
                 self.token_to_handle.remove(&token);
@@ -1462,6 +1778,8 @@ impl Worker {
             );
 
             // subscriber_buf is already deduplicated by get_subscribers_cached
+            let mut will_backpressure_count: u32 = 0;
+            let mut last_will_backpressure_sub: Option<(usize, Token)> = None;
             for sub in &self.subscriber_buf {
                 let worker_id = sub.worker_id();
                 let sub_token = sub.token();
@@ -1541,10 +1859,25 @@ impl Worker {
                     .queue_publish(&mut factory, out_qos, packet_id, false)
                 {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
+                        will_backpressure_count += 1;
+                        last_will_backpressure_sub =
+                            Some((sub.handle.worker_id(), sub.handle.token()));
+                    }
+                }
+            }
+
+            // Log accumulated will backpressure drops (rate limited to every 10s per worker)
+            if will_backpressure_count > 0 {
+                if let Some(count) = self
+                    .subscriber_backpressure_log
+                    .increment_by(will_backpressure_count as u64)
+                {
+                    if let Some((worker_id, token)) = last_will_backpressure_sub {
                         log::warn!(
-                            "Backpressure: dropping will message to slow subscriber (worker={}, token={:?})",
-                            sub.handle.worker_id(),
-                            sub.handle.token()
+                            "Backpressure: dropped {} will messages to slow subscribers (last: worker={}, token={:?})",
+                            count,
+                            worker_id,
+                            token
                         );
                     }
                 }
@@ -1597,6 +1930,8 @@ impl Worker {
                 will_publish.properties.clone(),
             );
 
+            let mut delayed_backpressure_count: u32 = 0;
+            let mut last_delayed_backpressure_sub: Option<(usize, Token)> = None;
             for sub in &self.subscriber_buf {
                 let worker_id = sub.worker_id();
                 let sub_token = sub.token();
@@ -1648,10 +1983,25 @@ impl Worker {
                     .queue_publish(&mut factory, out_qos, packet_id, false)
                 {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
+                        delayed_backpressure_count += 1;
+                        last_delayed_backpressure_sub =
+                            Some((sub.handle.worker_id(), sub.handle.token()));
+                    }
+                }
+            }
+
+            // Log accumulated delayed will backpressure drops (rate limited to every 10s per worker)
+            if delayed_backpressure_count > 0 {
+                if let Some(count) = self
+                    .subscriber_backpressure_log
+                    .increment_by(delayed_backpressure_count as u64)
+                {
+                    if let Some((worker_id, token)) = last_delayed_backpressure_sub {
                         log::warn!(
-                            "Backpressure: dropping delayed will to slow subscriber (worker={}, token={:?})",
-                            sub.handle.worker_id(),
-                            sub.handle.token()
+                            "Backpressure: dropped {} delayed will messages to slow subscribers (last: worker={}, token={:?})",
+                            count,
+                            worker_id,
+                            token
                         );
                     }
                 }

@@ -5,6 +5,7 @@
 //! - Sessions: persistent sessions (read on connect, write on disconnect)
 //! - RetainedMessages: retained message store
 //! - ClientRegistry: maps ClientId → (worker_id, Token) for routing
+//! - BrokerMetrics: atomic counters for $SYS topics
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use mio::Token;
 
 use crate::packet::{Publish, SubscriptionOptions};
 use crate::subscription::SubscriptionStore;
+use crate::sys_tree::BrokerMetrics;
 
 /// A retained message with timestamp for expiry countdown.
 #[derive(Debug, Clone)]
@@ -69,6 +71,8 @@ pub struct SharedState {
     pub retained_messages: RwLock<HashMap<String, RetainedMessage>>,
     /// Maps ClientId → ClientLocation for cross-thread routing and duplicate detection.
     pub client_registry: RwLock<HashMap<String, ClientLocation>>,
+    /// Broker metrics for $SYS topics (NOT behind RwLock - uses atomics).
+    pub metrics: BrokerMetrics,
 }
 
 impl SharedState {
@@ -78,6 +82,7 @@ impl SharedState {
             sessions: RwLock::new(HashMap::new()),
             retained_messages: RwLock::new(HashMap::new()),
             client_registry: RwLock::new(HashMap::new()),
+            metrics: BrokerMetrics::new(),
         }
     }
 }

@@ -47,6 +47,15 @@ pub enum ProtocolError {
 
     #[error("First packet must be CONNECT")]
     FirstPacketNotConnect,
+
+    #[error("Packet too large: {size} bytes exceeds maximum {max}")]
+    PacketTooLarge { size: usize, max: usize },
+
+    #[error("Topic too long: {len} bytes exceeds maximum {max}")]
+    TopicTooLong { len: usize, max: usize },
+
+    #[error("Topic has too many levels: {levels} exceeds maximum {max}")]
+    TopicTooDeep { levels: usize, max: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

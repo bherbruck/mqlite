@@ -1,9 +1,10 @@
 //! Per-client state and buffer management.
 
 use std::io::{self, Read};
+use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
 use mio::net::TcpStream;
@@ -14,6 +15,7 @@ use crate::error::Result;
 use crate::packet;
 use crate::packet::{Packet, Publish, QoS, Will};
 use crate::publish_encoder::PublishEncoder;
+use crate::util::{QuotaTracker, RateLimitedCounter};
 
 /// Pending outgoing QoS 1/2 message awaiting acknowledgment.
 #[derive(Debug, Clone)]
@@ -42,6 +44,7 @@ pub enum ClientState {
 pub struct Client {
     pub token: Token,
     pub socket: TcpStream,
+    pub remote_addr: SocketAddr,
     pub state: ClientState,
     pub client_id: Option<String>,
     pub keep_alive: u16,
@@ -50,6 +53,14 @@ pub struct Client {
     pub will: Option<Will>,
     /// Whether the client sent a DISCONNECT packet (graceful disconnect).
     pub graceful_disconnect: bool,
+
+    // Authentication info
+    /// Username (if authenticated with one).
+    pub username: Option<String>,
+    /// Role assigned during authentication (for ACL lookups).
+    pub role: Option<String>,
+    /// Whether this is an anonymous (unauthenticated) connection.
+    pub is_anonymous: bool,
 
     /// MQTT protocol version (3=3.1, 4=3.1.1, 5=5.0).
     pub protocol_version: u8,
@@ -66,6 +77,15 @@ pub struct Client {
     /// Pending outgoing QoS 2 messages awaiting PUBREC.
     pub pending_qos2: AHashMap<u16, PendingPublish>,
 
+    // MQTT 5 Flow Control
+    /// Client's maximum packet size (from CONNECT properties, 0 = unlimited).
+    pub client_max_packet_size: u32,
+    /// Outgoing quota tracker for QoS 1/2 flow control.
+    pub quota: QuotaTracker,
+
+    /// Rate-limited backpressure logging.
+    pub backpressure_log: RateLimitedCounter,
+
     /// Read buffer for incoming data.
     read_buf: Vec<u8>,
     read_pos: usize,
@@ -77,7 +97,13 @@ pub struct Client {
 
 impl Client {
     /// Create a new client with a shared write handle.
-    pub fn new(token: Token, socket: TcpStream, worker_id: usize, epoll_fd: i32) -> Self {
+    pub fn new(
+        token: Token,
+        socket: TcpStream,
+        remote_addr: SocketAddr,
+        worker_id: usize,
+        epoll_fd: i32,
+    ) -> Self {
         let socket_fd = socket.as_raw_fd();
         let handle = Arc::new(ClientWriteHandle::new(
             worker_id, epoll_fd, socket_fd, token,
@@ -86,20 +112,43 @@ impl Client {
         Self {
             token,
             socket,
+            remote_addr,
             state: ClientState::Connecting,
             client_id: None,
             keep_alive: 0,
             clean_session: true,
             will: None,
             graceful_disconnect: false,
+            username: None,
+            role: None,
+            is_anonymous: true,  // Default to anonymous until authenticated
             protocol_version: 4, // Default to 3.1.1, updated on CONNECT
             next_packet_id: 1,
             last_packet_time: Instant::now(),
             pending_qos1: AHashMap::new(),
             pending_qos2: AHashMap::new(),
+            client_max_packet_size: 0,       // 0 = unlimited
+            quota: QuotaTracker::new(65535), // Default per MQTT 5 spec
+            backpressure_log: RateLimitedCounter::new(Duration::from_secs(10)),
             read_buf: vec![0u8; INITIAL_BUFFER_SIZE],
             read_pos: 0,
             handle,
+        }
+    }
+
+    /// Record a backpressure drop and log if interval has passed.
+    /// Returns true if a log was emitted (for callers that want to add context).
+    pub fn record_backpressure_drop(&mut self, context: &str) -> bool {
+        if let Some(count) = self.backpressure_log.increment() {
+            log::warn!(
+                "Backpressure: dropped {} messages to slow client (token={:?}, {})",
+                count,
+                self.token,
+                context
+            );
+            true
+        } else {
+            false
         }
     }
 
@@ -136,13 +185,14 @@ impl Client {
     }
 
     /// Try to decode the next packet from the read buffer.
-    pub fn decode_packet(&mut self) -> Result<Option<Packet>> {
+    /// max_packet_size: Maximum allowed packet size (0 = no limit).
+    pub fn decode_packet(&mut self, max_packet_size: u32) -> Result<Option<Packet>> {
         if self.read_pos == 0 {
             return Ok(None);
         }
 
         let data = &self.read_buf[..self.read_pos];
-        match packet::decode_packet(data, self.protocol_version)? {
+        match packet::decode_packet(data, self.protocol_version, max_packet_size)? {
             Some((packet, consumed)) => {
                 // Remove consumed bytes from buffer
                 self.read_buf.copy_within(consumed..self.read_pos, 0);
@@ -158,6 +208,31 @@ impl Client {
         let id = self.next_packet_id;
         self.next_packet_id = if id == 65535 { 1 } else { id + 1 };
         id
+    }
+
+    /// Set MQTT 5 flow control values from CONNECT properties.
+    pub fn set_flow_control(&mut self, receive_max: u16, max_packet_size: u32) {
+        self.quota.set_max(receive_max);
+        self.client_max_packet_size = max_packet_size;
+    }
+
+    /// Check if we can send a QoS 1/2 message (quota available).
+    #[inline]
+    #[allow(dead_code)]
+    pub fn has_quota(&self) -> bool {
+        self.quota.has_quota()
+    }
+
+    /// Consume one quota slot when sending QoS 1/2. Returns false if no quota.
+    #[inline]
+    pub fn consume_quota(&mut self) -> bool {
+        self.quota.consume()
+    }
+
+    /// Restore one quota slot when receiving ACK (PUBACK/PUBCOMP).
+    #[inline]
+    pub fn restore_quota(&mut self) {
+        self.quota.restore()
     }
 
     /// Queue a packet for sending.

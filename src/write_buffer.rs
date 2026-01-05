@@ -1,49 +1,117 @@
 //! Power-of-two circular buffer for zero-copy I/O.
 //!
-//! Optimized for sequential writes and reads without reallocations
-//! during normal operation.
+//! Features:
+//! - Scale-to-zero: No allocation until first write
+//! - Lock-free pooling: Reuses buffers across clients via crossbeam-queue
+//! - Optimized for sequential writes and reads without reallocations
 
 use std::io::{self, IoSlice, Write};
+use std::sync::LazyLock;
 
-/// Minimum buffer size (4KB).
+use crossbeam_queue::ArrayQueue;
+
+/// Minimum buffer size (4KB) - smallest pooled size.
 const MIN_SIZE: usize = 4096;
 
 /// Soft limit (1MB) - returns WouldBlock above this for backpressure.
-/// 3100 connections × 1MB = 3.1GB max (but most buffers stay small).
 const SOFT_LIMIT: usize = 1024 * 1024;
 
 /// Maximum buffer size (16MB) - hard cap, returns OutOfMemory.
 const MAX_SIZE: usize = 16 * 1024 * 1024;
 
+/// Pool capacity per size class.
+const POOL_CAPACITY_4K: usize = 256;
+const POOL_CAPACITY_8K: usize = 128;
+const POOL_CAPACITY_16K: usize = 64;
+const POOL_CAPACITY_32K: usize = 32;
+
+// Global lock-free buffer pools by size class.
+static POOL_4K: LazyLock<ArrayQueue<Box<[u8]>>> =
+    LazyLock::new(|| ArrayQueue::new(POOL_CAPACITY_4K));
+static POOL_8K: LazyLock<ArrayQueue<Box<[u8]>>> =
+    LazyLock::new(|| ArrayQueue::new(POOL_CAPACITY_8K));
+static POOL_16K: LazyLock<ArrayQueue<Box<[u8]>>> =
+    LazyLock::new(|| ArrayQueue::new(POOL_CAPACITY_16K));
+static POOL_32K: LazyLock<ArrayQueue<Box<[u8]>>> =
+    LazyLock::new(|| ArrayQueue::new(POOL_CAPACITY_32K));
+
+/// Acquire a buffer from the pool, or allocate a new one.
+#[inline]
+fn pool_acquire(size: usize) -> Box<[u8]> {
+    let size = size.next_power_of_two().max(MIN_SIZE);
+
+    let maybe_buf = match size {
+        4096 => POOL_4K.pop(),
+        8192 => POOL_8K.pop(),
+        16384 => POOL_16K.pop(),
+        32768 => POOL_32K.pop(),
+        _ => None, // Large buffers not pooled
+    };
+
+    maybe_buf.unwrap_or_else(|| vec![0u8; size].into_boxed_slice())
+}
+
+/// Release a buffer back to the pool (drops if pool full or too large).
+#[inline]
+fn pool_release(buf: Box<[u8]>) {
+    match buf.len() {
+        4096 => {
+            let _ = POOL_4K.push(buf);
+        }
+        8192 => {
+            let _ = POOL_8K.push(buf);
+        }
+        16384 => {
+            let _ = POOL_16K.push(buf);
+        }
+        32768 => {
+            let _ = POOL_32K.push(buf);
+        }
+        _ => drop(buf), // Large buffers not pooled
+    }
+}
+
 /// A circular buffer with power-of-two sizing for efficient modulo operations.
+///
+/// Scale-to-zero: Starts with no allocation, acquires buffer on first write,
+/// releases back to pool when emptied.
 pub struct WriteBuffer {
-    buf: Box<[u8]>,
+    /// Buffer storage, None when empty (scale-to-zero).
+    buf: Option<Box<[u8]>>,
     /// Write position (head).
     head: usize,
     /// Read position (tail).
     tail: usize,
     /// Current number of bytes in buffer.
     len: usize,
-    /// Capacity mask (size - 1) for fast modulo.
+    /// Capacity mask (size - 1) for fast modulo. 0 when buf is None.
     mask: usize,
 }
 
 impl WriteBuffer {
-    /// Create a new circular buffer with default size.
+    /// Create a new circular buffer (scale-to-zero: no allocation until first write).
     pub fn new() -> Self {
-        Self::with_capacity(MIN_SIZE)
-    }
-
-    /// Create a new circular buffer with at least the given capacity.
-    /// Capacity will be rounded up to the next power of two.
-    pub fn with_capacity(cap: usize) -> Self {
-        let size = cap.max(MIN_SIZE).next_power_of_two();
         Self {
-            buf: vec![0u8; size].into_boxed_slice(),
+            buf: None,
             head: 0,
             tail: 0,
             len: 0,
-            mask: size - 1,
+            mask: 0,
+        }
+    }
+
+    /// Create a new circular buffer with at least the given capacity.
+    /// Acquires buffer from pool or allocates new one.
+    #[allow(dead_code)]
+    pub fn with_capacity(cap: usize) -> Self {
+        let buf = pool_acquire(cap);
+        let mask = buf.len() - 1;
+        Self {
+            buf: Some(buf),
+            head: 0,
+            tail: 0,
+            len: 0,
+            mask,
         }
     }
 
@@ -62,19 +130,31 @@ impl WriteBuffer {
     /// Returns the number of bytes available for writing.
     #[inline]
     pub fn free_space(&self) -> usize {
-        self.capacity() - self.len
+        if self.buf.is_none() {
+            0 // Will allocate on write
+        } else {
+            self.capacity() - self.len
+        }
     }
 
-    /// Returns the capacity of the buffer.
+    /// Returns the capacity of the buffer (0 if not allocated).
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.mask + 1
+        if self.mask == 0 {
+            0
+        } else {
+            self.mask + 1
+        }
     }
 
     /// Get the maximum contiguous bytes that can be read without wrapping.
     #[inline]
     #[allow(dead_code)]
     pub fn contiguous_read_len(&self) -> usize {
+        if self.buf.is_none() || self.len == 0 {
+            return 0;
+        }
+
         let cap = self.capacity();
         let tail_pos = self.tail & self.mask;
 
@@ -91,14 +171,24 @@ impl WriteBuffer {
     #[inline]
     #[allow(dead_code)]
     pub fn read_slice(&self) -> &[u8] {
-        let tail_pos = self.tail & self.mask;
-        let len = self.contiguous_read_len();
-        &self.buf[tail_pos..tail_pos + len]
+        match &self.buf {
+            None => &[],
+            Some(buf) => {
+                let tail_pos = self.tail & self.mask;
+                let len = self.contiguous_read_len();
+                &buf[tail_pos..tail_pos + len]
+            }
+        }
     }
 
     /// Get two slices for vectored I/O (handles wraparound in one syscall).
     #[inline]
     pub fn as_io_slices(&self) -> [IoSlice<'_>; 2] {
+        let buf = match &self.buf {
+            None => return [IoSlice::new(&[]), IoSlice::new(&[])],
+            Some(buf) => buf,
+        };
+
         if self.len == 0 {
             return [IoSlice::new(&[]), IoSlice::new(&[])];
         }
@@ -108,30 +198,35 @@ impl WriteBuffer {
         if self.tail + self.len <= cap {
             // Contiguous - data doesn't wrap
             [
-                IoSlice::new(&self.buf[self.tail..self.tail + self.len]),
+                IoSlice::new(&buf[self.tail..self.tail + self.len]),
                 IoSlice::new(&[]),
             ]
         } else {
             // Wrapped - two segments
             let first_part = cap - self.tail;
             [
-                IoSlice::new(&self.buf[self.tail..]),
-                IoSlice::new(&self.buf[..self.len - first_part]),
+                IoSlice::new(&buf[self.tail..]),
+                IoSlice::new(&buf[..self.len - first_part]),
             ]
         }
     }
 
     /// Advance the read position after consuming bytes.
+    /// Releases buffer to pool when empty (scale-to-zero).
     #[inline]
     pub fn consume(&mut self, n: usize) {
         debug_assert!(n <= self.len);
         self.tail = (self.tail + n) & self.mask;
         self.len -= n;
 
-        // Reset positions when empty to keep writes contiguous
+        // Release buffer to pool when empty (scale-to-zero)
         if self.len == 0 {
+            if let Some(buf) = self.buf.take() {
+                pool_release(buf);
+            }
             self.head = 0;
             self.tail = 0;
+            self.mask = 0;
         }
     }
 
@@ -141,17 +236,21 @@ impl WriteBuffer {
     pub fn write_bytes(&mut self, data: &[u8]) -> io::Result<()> {
         self.ensure_space(data.len())?;
 
+        // Get these before mutable borrow
         let head_pos = self.head & self.mask;
-        let cap = self.capacity();
+        let cap = self.mask + 1; // capacity when buf is Some
+
+        // SAFETY: ensure_space guarantees buf is Some
+        let buf = self.buf.as_mut().unwrap();
 
         // How much can we write before wrapping?
         let first_chunk = (cap - head_pos).min(data.len());
-        self.buf[head_pos..head_pos + first_chunk].copy_from_slice(&data[..first_chunk]);
+        buf[head_pos..head_pos + first_chunk].copy_from_slice(&data[..first_chunk]);
 
         // Wrap around if needed
         if first_chunk < data.len() {
             let second_chunk = data.len() - first_chunk;
-            self.buf[..second_chunk].copy_from_slice(&data[first_chunk..]);
+            buf[..second_chunk].copy_from_slice(&data[first_chunk..]);
         }
 
         self.head = (self.head + data.len()) & self.mask;
@@ -160,10 +259,19 @@ impl WriteBuffer {
     }
 
     /// Ensure there's space for at least `needed` bytes, growing if necessary.
+    /// Acquires buffer from pool on first write (scale-to-zero).
     /// Returns WouldBlock if growth would exceed soft limit (backpressure).
     /// Returns OutOfMemory if growth would exceed hard limit.
     #[inline]
     fn ensure_space(&mut self, needed: usize) -> io::Result<()> {
+        // First write: acquire buffer from pool
+        if self.buf.is_none() {
+            let buf = pool_acquire(needed);
+            self.mask = buf.len() - 1;
+            self.buf = Some(buf);
+            return Ok(());
+        }
+
         if self.free_space() >= needed {
             return Ok(());
         }
@@ -193,34 +301,49 @@ impl WriteBuffer {
     }
 
     /// Grow the buffer to the new size, preserving contents.
+    /// Releases old buffer to pool.
     fn grow_to(&mut self, new_size: usize) {
-        let mut new_buf = vec![0u8; new_size].into_boxed_slice();
-        let len = self.len;
-        let cap = self.capacity();
-        let tail_pos = self.tail & self.mask;
+        let new_buf = pool_acquire(new_size);
+        let mut new_buf = new_buf; // Make mutable for copy
 
-        if tail_pos + len <= cap {
-            // Data is contiguous - doesn't wrap
-            new_buf[..len].copy_from_slice(&self.buf[tail_pos..tail_pos + len]);
-        } else {
-            // Data wraps around
-            let first_part = cap - tail_pos;
-            new_buf[..first_part].copy_from_slice(&self.buf[tail_pos..]);
-            new_buf[first_part..len].copy_from_slice(&self.buf[..len - first_part]);
+        if let Some(ref old_buf) = self.buf {
+            let len = self.len;
+            let cap = self.capacity();
+            let tail_pos = self.tail & self.mask;
+
+            if tail_pos + len <= cap {
+                // Data is contiguous - doesn't wrap
+                new_buf[..len].copy_from_slice(&old_buf[tail_pos..tail_pos + len]);
+            } else {
+                // Data wraps around
+                let first_part = cap - tail_pos;
+                new_buf[..first_part].copy_from_slice(&old_buf[tail_pos..]);
+                new_buf[first_part..len].copy_from_slice(&old_buf[..len - first_part]);
+            }
         }
 
-        self.buf = new_buf;
+        // Release old buffer to pool
+        if let Some(old_buf) = self.buf.take() {
+            pool_release(old_buf);
+        }
+
+        let len = self.len;
+        self.mask = new_buf.len() - 1;
+        self.buf = Some(new_buf);
         self.tail = 0;
         self.head = len;
-        self.mask = new_size - 1;
     }
 
-    /// Reset the buffer, clearing all data but keeping capacity.
+    /// Reset the buffer, clearing all data and releasing to pool (scale-to-zero).
     #[allow(dead_code)]
     pub fn clear(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            pool_release(buf);
+        }
         self.head = 0;
         self.tail = 0;
         self.len = 0;
+        self.mask = 0;
     }
 
     /// Shrink the buffer if it's very large and mostly empty.
@@ -228,10 +351,22 @@ impl WriteBuffer {
     /// Only shrinks if buffer is 4x the minimum and less than 1/8 full.
     pub fn maybe_shrink(&mut self) {
         let cap = self.capacity();
+        if cap == 0 {
+            return; // Already released
+        }
         // Only shrink if we're at 4x minimum and less than 1/8 full
         if cap >= MIN_SIZE * 4 && self.len() < cap / 8 {
             // Shrink to 2x minimum to avoid thrashing
             self.grow_to(MIN_SIZE * 2);
+        }
+    }
+}
+
+impl Drop for WriteBuffer {
+    fn drop(&mut self) {
+        // Release buffer to pool on drop
+        if let Some(buf) = self.buf.take() {
+            pool_release(buf);
         }
     }
 }

@@ -90,6 +90,8 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&config.log.level))
         .init();
 
+    info!("Loaded configuration from {}", args.config_path);
+
     // Determine worker count (0 = auto)
     let num_workers = if config.server.workers == 0 {
         num_cpus::get()

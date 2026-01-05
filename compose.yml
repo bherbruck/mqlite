@@ -8,9 +8,6 @@ services:
     volumes:
       - mqlite_data:/var/lib/mqlite
     environment:
-      # Prometheus metrics - bind to 0.0.0.0 for Docker access
-      - MQLITE__PROMETHEUS__ENABLED=true
-      - MQLITE__PROMETHEUS__BIND=0.0.0.0:9090
       # yolo mode: 0 = unbounded for all limits
       # - MQLITE__LIMITS__MAX_CONNECTIONS=10000
       - MQLITE__LIMITS__MAX_INFLIGHT=0

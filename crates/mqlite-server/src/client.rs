@@ -91,10 +91,10 @@ impl AsRawFd for Transport {
     }
 }
 
+use mqlite_core::error::Result;
+use mqlite_core::packet::{self, Packet, Publish, QoS, Will};
+
 use crate::client_handle::ClientWriteHandle;
-use crate::error::Result;
-use crate::packet;
-use crate::packet::{Packet, Publish, QoS, Will};
 use crate::publish_encoder::PublishEncoder;
 use crate::util::{QuotaTracker, RateLimitedCounter};
 

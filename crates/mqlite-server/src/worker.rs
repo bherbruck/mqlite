@@ -20,15 +20,16 @@ use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 use mio::{Events, Interest, Poll, Token};
 
+use mqlite_core::error::{ProtocolError, Result};
+use mqlite_core::packet::{
+    encode_variable_byte_integer, update_message_expiry, validate_topic, Connack, ConnackCode,
+    ConnackProperties, Connect, Packet, Publish, QoS, Suback, Subscribe, Unsuback, Unsubscribe,
+};
+
 use crate::auth::{AuthContext, AuthProvider, AuthResult, ClientInfo};
 use crate::client::{Client, ClientState, PendingPublish, Transport};
 use crate::client_handle::ClientWriteHandle;
 use crate::config::Config;
-use crate::error::{ProtocolError, Result};
-use crate::packet::{
-    encode_variable_byte_integer, update_message_expiry, validate_topic, Connack, ConnackCode,
-    ConnackProperties, Packet, Publish, QoS, Suback, Unsuback,
-};
 use crate::publish_encoder::PublishEncoder;
 use crate::shared::{
     ClientLocation, RetainedMessage, Session, SharedStateHandle, StoredSubscription,
@@ -626,7 +627,7 @@ impl Worker {
         Ok(())
     }
 
-    fn handle_connect(&mut self, token: Token, connect: crate::packet::Connect) -> Result<()> {
+    fn handle_connect(&mut self, token: Token, connect: Connect) -> Result<()> {
         let is_v5 = connect.protocol_version == 5;
 
         // MQTT-3.1.3-7: Zero-length ClientId requires CleanSession=1
@@ -1004,11 +1005,7 @@ impl Worker {
         Ok(())
     }
 
-    fn handle_subscribe(
-        &mut self,
-        token: Token,
-        subscribe: crate::packet::Subscribe,
-    ) -> Result<()> {
+    fn handle_subscribe(&mut self, token: Token, subscribe: Subscribe) -> Result<()> {
         let mut return_codes = Vec::with_capacity(subscribe.topics.len());
         // (retained_msg, stored_at, sub_qos, retain_as_published, subscription_id)
         let mut retained_to_send: Vec<(Publish, Instant, QoS, bool, Option<u32>)> = Vec::new();
@@ -1263,11 +1260,7 @@ impl Worker {
         Ok(())
     }
 
-    fn handle_unsubscribe(
-        &mut self,
-        token: Token,
-        unsub: crate::packet::Unsubscribe,
-    ) -> Result<()> {
+    fn handle_unsubscribe(&mut self, token: Token, unsub: Unsubscribe) -> Result<()> {
         let (client_id, clean_session) = {
             let client = self.clients.get(&token);
             (
@@ -1687,12 +1680,15 @@ impl Worker {
                 self.token_to_handle.remove(&token);
                 self.token_to_client_id.remove(&token);
 
-                if client.clean_session {
-                    self.shared
-                        .subscriptions
-                        .write()
-                        .remove_client(self.id, token);
-                }
+                // Always remove subscriptions from the trie on disconnect.
+                // For persistent sessions, subscriptions are saved in Session.subscriptions
+                // and will be restored with the new handle when the client reconnects.
+                // This prevents dead handles from accumulating in the trie and receiving
+                // messages for disconnected clients.
+                self.shared
+                    .subscriptions
+                    .write()
+                    .remove_client(self.id, token);
 
                 if let Some(ref client_id) = client.client_id {
                     // Check if we're still the owner of this client registration

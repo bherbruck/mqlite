@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use mio::Token;
 
+use mqlite_core::packet::{QoS, SubscriptionOptions};
+
 use crate::client_handle::ClientWriteHandle;
-use crate::packet::{QoS, SubscriptionOptions};
 
 /// Subscriber info stored in the trie.
 ///

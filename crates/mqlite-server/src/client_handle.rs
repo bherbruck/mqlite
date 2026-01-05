@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use mio::Token;
 use parking_lot::Mutex;
 
-use crate::packet::{self, Packet, QoS};
+use mqlite_core::packet::{self, Packet, QoS};
 use crate::publish_encoder::PublishEncoder;
 use crate::write_buffer::WriteBuffer;
 

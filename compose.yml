@@ -8,14 +8,12 @@ services:
       - 9090:9090 # Prometheus metrics
     volumes:
       - mqlite_data:/var/lib/mqlite
+      # Mount TLS certs if needed:
+      # - ./certs:/etc/mqlite/certs:ro
     environment:
-      # yolo mode: 0 = unbounded for all limits
-      # - MQLITE__LIMITS__MAX_CONNECTIONS=10000
+      # Set to 0 for unbounded
       - MQLITE__LIMITS__MAX_INFLIGHT=0
-      - MQLITE__LIMITS__MAX_QUEUED_MESSAGES=0
-      - MQLITE__LIMITS__MAX_AWAITING_REL=0
-      - MQLITE__LIMITS__OUTBOUND_CHANNEL_CAPACITY=0
-      - MQLITE__PERSISTENCE__ENABLED=false
+      - MQLITE__LIMITS__MAX_CONNECTIONS=0
     ulimits:
       nofile:
         soft: 65536

@@ -184,6 +184,47 @@ key = "/etc/mqlite/certs/key.pem"
 # Generate self-signed certs for testing:
 # openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
 
+# === Bridge Configuration ===
+# Connect to remote MQTT brokers and sync messages bidirectionally.
+# Each bridge publishes stats to $SYS/broker/bridge/<name>/...
+
+# [[bridge]]
+# name = "cloud"                              # Used in $SYS topics
+# address = "mqtt.example.com:8883"
+#
+# # Authentication
+# remote_username = "bridge-user"
+# remote_password = "${BRIDGE_PASSWORD}"
+# local_username = "bridge-cloud"             # Identity for local ACL
+#
+# # Protocol
+# protocol_version = "mqtt5"                  # mqtt311 | mqtt5
+# keepalive = 60
+# clean_start = true
+# clientid_prefix = "mqlite-bridge"
+#
+# # TLS (optional)
+# tls = true
+# ca_file = "/etc/mqlite/ca.pem"
+# # tls_insecure = false                      # Skip cert verification (dangerous)
+#
+# # Topic routing - subscribe pulls remote→local, publish pushes local→remote
+# [[bridge.subscribe]]
+# topic = "remote/sensors/#"
+# qos = 1
+#
+# [[bridge.publish]]
+# topic = "local/commands/#"
+# qos = 1
+#
+# # Topic prefixing (optional)
+# local_prefix = "cloud/"                     # Prepend to incoming topics
+# # remote_prefix = ""                        # Prepend to outgoing topics
+#
+# # Reconnection
+# reconnect_delay = 5                         # Initial delay (seconds)
+# reconnect_max = 300                         # Max delay with exponential backoff
+
 # --- Future Configuration Sections (not yet implemented) ---
 #
 # [websocket]

@@ -4,7 +4,7 @@
 
 use bytes::Bytes;
 
-use crate::packet::{encode_remaining_length, PacketType, QoS};
+use mqlite_core::packet::{encode_remaining_length, PacketType, QoS};
 
 /// Calculate the encoded length of a variable byte integer.
 #[inline]

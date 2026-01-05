@@ -1244,7 +1244,8 @@ fn encode_connack(connack: &Connack, buf: &mut Vec<u8>) {
     }
 }
 
-fn encode_publish(publish: &Publish, buf: &mut Vec<u8>) {
+/// Encode a PUBLISH packet.
+pub fn encode_publish(publish: &Publish, buf: &mut Vec<u8>) {
     let mut fixed_header = (PacketType::Publish as u8) << 4;
     if publish.dup {
         fixed_header |= 0x08;
@@ -1366,6 +1367,242 @@ fn encode_unsuback(unsuback: &Unsuback, buf: &mut Vec<u8>) {
 fn encode_pingresp(buf: &mut Vec<u8>) {
     buf.push((PacketType::Pingresp as u8) << 4);
     buf.push(0); // Remaining length
+}
+
+// === Client Packet Encoding ===
+
+/// Encode a CONNECT packet.
+pub fn encode_connect(connect: &Connect, buf: &mut Vec<u8>) {
+    let mut payload = Vec::new();
+
+    // Protocol name
+    let protocol_name = connect.protocol_name.as_bytes();
+    payload.extend_from_slice(&(protocol_name.len() as u16).to_be_bytes());
+    payload.extend_from_slice(protocol_name);
+
+    // Protocol version
+    payload.push(connect.protocol_version);
+
+    // Connect flags
+    let mut flags = 0u8;
+    if connect.clean_session {
+        flags |= 0x02;
+    }
+    if connect.will.is_some() {
+        flags |= 0x04;
+        if let Some(ref will) = connect.will {
+            flags |= (will.qos as u8) << 3;
+            if will.retain {
+                flags |= 0x20;
+            }
+        }
+    }
+    if connect.password.is_some() {
+        flags |= 0x40;
+    }
+    if connect.username.is_some() {
+        flags |= 0x80;
+    }
+    payload.push(flags);
+
+    // Keep alive
+    payload.extend_from_slice(&connect.keep_alive.to_be_bytes());
+
+    // MQTT v5 properties
+    if connect.protocol_version == 5 {
+        if let Some(ref props) = connect.properties {
+            encode_connect_properties(props, &mut payload);
+        } else {
+            payload.push(0); // No properties
+        }
+    }
+
+    // Client ID
+    let client_id = connect.client_id.as_bytes();
+    payload.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+    payload.extend_from_slice(client_id);
+
+    // Will message
+    if let Some(ref will) = connect.will {
+        // Will properties (v5 only)
+        if connect.protocol_version == 5 {
+            if let Some(ref props) = will.properties {
+                encode_will_properties(props, &mut payload);
+            } else {
+                payload.push(0);
+            }
+        }
+        // Will topic
+        let topic = will.topic.as_bytes();
+        payload.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        payload.extend_from_slice(topic);
+        // Will message
+        payload.extend_from_slice(&(will.message.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&will.message);
+    }
+
+    // Username
+    if let Some(ref username) = connect.username {
+        let username = username.as_bytes();
+        payload.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        payload.extend_from_slice(username);
+    }
+
+    // Password
+    if let Some(ref password) = connect.password {
+        payload.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        payload.extend_from_slice(password);
+    }
+
+    // Fixed header
+    buf.push((PacketType::Connect as u8) << 4);
+    encode_remaining_length_vec(payload.len(), buf);
+    buf.extend_from_slice(&payload);
+}
+
+fn encode_connect_properties(props: &ConnectProperties, buf: &mut Vec<u8>) {
+    let mut props_buf = Vec::new();
+
+    if let Some(session_expiry) = props.session_expiry_interval {
+        props_buf.push(0x11);
+        props_buf.extend_from_slice(&session_expiry.to_be_bytes());
+    }
+    if let Some(receive_max) = props.receive_maximum {
+        props_buf.push(0x21);
+        props_buf.extend_from_slice(&receive_max.to_be_bytes());
+    }
+    if let Some(max_packet) = props.maximum_packet_size {
+        props_buf.push(0x27);
+        props_buf.extend_from_slice(&max_packet.to_be_bytes());
+    }
+    if let Some(topic_alias_max) = props.topic_alias_maximum {
+        props_buf.push(0x22);
+        props_buf.extend_from_slice(&topic_alias_max.to_be_bytes());
+    }
+
+    encode_variable_byte_integer(props_buf.len() as u32, buf);
+    buf.extend_from_slice(&props_buf);
+}
+
+fn encode_will_properties(props: &WillProperties, buf: &mut Vec<u8>) {
+    let mut props_buf = Vec::new();
+
+    if let Some(delay) = props.will_delay_interval {
+        props_buf.push(0x18);
+        props_buf.extend_from_slice(&delay.to_be_bytes());
+    }
+    if let Some(expiry) = props.message_expiry_interval {
+        props_buf.push(0x02);
+        props_buf.extend_from_slice(&expiry.to_be_bytes());
+    }
+    if let Some(ref content_type) = props.content_type {
+        props_buf.push(0x03);
+        props_buf.extend_from_slice(&(content_type.len() as u16).to_be_bytes());
+        props_buf.extend_from_slice(content_type.as_bytes());
+    }
+    if let Some(ref response_topic) = props.response_topic {
+        props_buf.push(0x08);
+        props_buf.extend_from_slice(&(response_topic.len() as u16).to_be_bytes());
+        props_buf.extend_from_slice(response_topic.as_bytes());
+    }
+    if let Some(ref correlation_data) = props.correlation_data {
+        props_buf.push(0x09);
+        props_buf.extend_from_slice(&(correlation_data.len() as u16).to_be_bytes());
+        props_buf.extend_from_slice(correlation_data);
+    }
+
+    encode_variable_byte_integer(props_buf.len() as u32, buf);
+    buf.extend_from_slice(&props_buf);
+}
+
+/// Encode a SUBSCRIBE packet.
+pub fn encode_subscribe(subscribe: &Subscribe, buf: &mut Vec<u8>) {
+    let mut payload = Vec::new();
+
+    // Packet ID
+    payload.extend_from_slice(&subscribe.packet_id.to_be_bytes());
+
+    // Properties (v5 only) - we always send minimal for now
+    // Note: subscription_id should be sent if present
+    if subscribe.subscription_id.is_some() {
+        let mut props = Vec::new();
+        if let Some(sub_id) = subscribe.subscription_id {
+            props.push(0x0B);
+            encode_variable_byte_integer(sub_id, &mut props);
+        }
+        encode_variable_byte_integer(props.len() as u32, &mut payload);
+        payload.extend_from_slice(&props);
+    }
+
+    // Topic filters
+    for (topic, options) in &subscribe.topics {
+        let topic_bytes = topic.as_bytes();
+        payload.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
+        payload.extend_from_slice(topic_bytes);
+        // Subscription options byte
+        let opts_byte = (options.qos as u8)
+            | if options.no_local { 0x04 } else { 0 }
+            | if options.retain_as_published { 0x08 } else { 0 }
+            | ((options.retain_handling as u8) << 4);
+        payload.push(opts_byte);
+    }
+
+    // Fixed header (flags must be 0x02)
+    buf.push(((PacketType::Subscribe as u8) << 4) | 0x02);
+    encode_remaining_length_vec(payload.len(), buf);
+    buf.extend_from_slice(&payload);
+}
+
+/// Encode an UNSUBSCRIBE packet.
+pub fn encode_unsubscribe(unsubscribe: &Unsubscribe, buf: &mut Vec<u8>) {
+    let mut payload = Vec::new();
+
+    // Packet ID
+    payload.extend_from_slice(&unsubscribe.packet_id.to_be_bytes());
+
+    // Topic filters
+    for topic in &unsubscribe.topics {
+        let topic_bytes = topic.as_bytes();
+        payload.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
+        payload.extend_from_slice(topic_bytes);
+    }
+
+    // Fixed header (flags must be 0x02)
+    buf.push(((PacketType::Unsubscribe as u8) << 4) | 0x02);
+    encode_remaining_length_vec(payload.len(), buf);
+    buf.extend_from_slice(&payload);
+}
+
+/// Encode a PINGREQ packet.
+pub fn encode_pingreq(buf: &mut Vec<u8>) {
+    buf.push((PacketType::Pingreq as u8) << 4);
+    buf.push(0);
+}
+
+/// Encode a DISCONNECT packet.
+pub fn encode_disconnect(reason_code: u8, buf: &mut Vec<u8>) {
+    buf.push((PacketType::Disconnect as u8) << 4);
+    if reason_code == 0 {
+        buf.push(0); // No payload for normal disconnect
+    } else {
+        buf.push(1);
+        buf.push(reason_code);
+    }
+}
+
+/// Helper to encode remaining length into a Vec buffer.
+fn encode_remaining_length_vec(mut len: usize, buf: &mut Vec<u8>) {
+    loop {
+        let mut byte = (len % 128) as u8;
+        len /= 128;
+        if len > 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if len == 0 {
+            break;
+        }
+    }
 }
 
 // === Topic Validation ===

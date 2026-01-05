@@ -564,7 +564,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "mqlite"
+name = "mqlite-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "log",
+ "mio",
+ "mqlite-core",
+ "parking_lot",
+ "rustls",
+ "rustls-pemfile",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "mqlite-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "log",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "mqlite-server"
 version = "0.1.0"
 dependencies = [
  "ahash",
@@ -578,6 +601,8 @@ dependencies = [
  "libc",
  "log",
  "mio",
+ "mqlite-client",
+ "mqlite-core",
  "num_cpus",
  "parking_lot",
  "ppp",

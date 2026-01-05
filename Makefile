@@ -28,16 +28,10 @@ build-profiling:
 	cargo build --profile profiling
 
 # Test targets (cargo tests)
-test: test-unit test-integration test-conformance
+test: test-unit
 
 test-unit:
-	cargo test --lib
-
-test-integration:
-	cargo test --test integration
-
-test-conformance:
-	cargo test --test conformance
+	cargo test --workspace
 
 # Install mqtt-conformance binary
 install-conformance: $(CONFORMANCE_BIN)
@@ -152,8 +146,6 @@ help:
 	@echo "Test targets (cargo tests):"
 	@echo "  test           - Run all cargo tests"
 	@echo "  test-unit      - Run unit tests"
-	@echo "  test-integration - Run integration tests"
-	@echo "  test-conformance - Run conformance tests"
 	@echo ""
 	@echo "External conformance tests (requires running broker):"
 	@echo "  conformance    - Run all conformance tests (v3 + v5)"

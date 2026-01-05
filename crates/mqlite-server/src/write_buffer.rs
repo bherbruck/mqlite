@@ -3,6 +3,7 @@
 //! Features:
 //! - Scale-to-zero: No allocation until first write
 //! - Lock-free pooling: Reuses buffers across clients via crossbeam-queue
+//! - Length derived from head/tail: No separate len field that can become inconsistent
 //! - Optimized for sequential writes and reads without reallocations
 
 use std::io::{self, IoSlice, Write};
@@ -73,19 +74,18 @@ fn pool_release(buf: Box<[u8]>) {
 
 /// A circular buffer with power-of-two sizing for efficient modulo operations.
 ///
+/// Length is derived from `head - tail`, eliminating the possibility of
+/// the length field becoming inconsistent with actual buffer contents.
+///
 /// Scale-to-zero: Starts with no allocation, acquires buffer on first write,
 /// releases back to pool when emptied.
 pub struct WriteBuffer {
     /// Buffer storage, None when empty (scale-to-zero).
     buf: Option<Box<[u8]>>,
-    /// Write position (head).
+    /// Write position (unbounded, wraps naturally).
     head: usize,
-    /// Read position (tail).
+    /// Read position (unbounded, wraps naturally).
     tail: usize,
-    /// Current number of bytes in buffer.
-    len: usize,
-    /// Capacity mask (size - 1) for fast modulo. 0 when buf is None.
-    mask: usize,
 }
 
 impl WriteBuffer {
@@ -95,8 +95,6 @@ impl WriteBuffer {
             buf: None,
             head: 0,
             tail: 0,
-            len: 0,
-            mask: 0,
         }
     }
 
@@ -105,45 +103,42 @@ impl WriteBuffer {
     #[allow(dead_code)]
     pub fn with_capacity(cap: usize) -> Self {
         let buf = pool_acquire(cap);
-        let mask = buf.len() - 1;
         Self {
             buf: Some(buf),
             head: 0,
             tail: 0,
-            len: 0,
-            mask,
         }
     }
 
     /// Returns the number of bytes available for reading.
+    /// Computed from head - tail, so it can never become inconsistent.
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        // wrapping_sub handles the case where head has wrapped around usize::MAX
+        self.head.wrapping_sub(self.tail)
     }
 
     /// Returns true if the buffer is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.head == self.tail
     }
 
     /// Returns the number of bytes available for writing.
     #[inline]
     pub fn free_space(&self) -> usize {
-        if self.buf.is_none() {
-            0 // Will allocate on write
-        } else {
-            self.capacity() - self.len
+        match &self.buf {
+            None => 0, // Will allocate on write
+            Some(buf) => buf.len() - self.len(),
         }
     }
 
     /// Returns the capacity of the buffer (0 if not allocated).
     #[inline]
     pub fn capacity(&self) -> usize {
-        if self.mask == 0 {
-            0
-        } else {
-            self.mask + 1
+        match &self.buf {
+            None => 0,
+            Some(buf) => buf.len(),
         }
     }
 
@@ -151,20 +146,22 @@ impl WriteBuffer {
     #[inline]
     #[allow(dead_code)]
     pub fn contiguous_read_len(&self) -> usize {
-        if self.buf.is_none() || self.len == 0 {
+        let buf = match &self.buf {
+            None => return 0,
+            Some(buf) => buf,
+        };
+
+        let len = self.len();
+        if len == 0 {
             return 0;
         }
 
-        let cap = self.capacity();
-        let tail_pos = self.tail & self.mask;
+        let cap = buf.len();
+        let tail_pos = self.tail % cap;
 
-        if tail_pos + self.len <= cap {
-            // Data is contiguous
-            self.len
-        } else {
-            // Data wraps - return bytes until end of buffer
-            cap - tail_pos
-        }
+        // Bytes from tail_pos to end of buffer
+        let to_end = cap - tail_pos;
+        to_end.min(len)
     }
 
     /// Get a slice of contiguous readable bytes.
@@ -174,9 +171,15 @@ impl WriteBuffer {
         match &self.buf {
             None => &[],
             Some(buf) => {
-                let tail_pos = self.tail & self.mask;
-                let len = self.contiguous_read_len();
-                &buf[tail_pos..tail_pos + len]
+                let len = self.len();
+                if len == 0 {
+                    return &[];
+                }
+
+                let cap = buf.len();
+                let tail_pos = self.tail % cap;
+                let contiguous = (cap - tail_pos).min(len);
+                &buf[tail_pos..tail_pos + contiguous]
             }
         }
     }
@@ -189,24 +192,27 @@ impl WriteBuffer {
             Some(buf) => buf,
         };
 
-        if self.len == 0 {
+        let len = self.len();
+        if len == 0 {
             return [IoSlice::new(&[]), IoSlice::new(&[])];
         }
 
-        let cap = self.capacity();
+        let cap = buf.len();
+        let tail_pos = self.tail % cap;
+        let to_end = cap - tail_pos;
 
-        if self.tail + self.len <= cap {
+        if len <= to_end {
             // Contiguous - data doesn't wrap
             [
-                IoSlice::new(&buf[self.tail..self.tail + self.len]),
+                IoSlice::new(&buf[tail_pos..tail_pos + len]),
                 IoSlice::new(&[]),
             ]
         } else {
             // Wrapped - two segments
-            let first_part = cap - self.tail;
+            let second_len = len - to_end;
             [
-                IoSlice::new(&buf[self.tail..]),
-                IoSlice::new(&buf[..self.len - first_part]),
+                IoSlice::new(&buf[tail_pos..]),
+                IoSlice::new(&buf[..second_len]),
             ]
         }
     }
@@ -215,18 +221,16 @@ impl WriteBuffer {
     /// Releases buffer to pool when empty (scale-to-zero).
     #[inline]
     pub fn consume(&mut self, n: usize) {
-        debug_assert!(n <= self.len);
-        self.tail = (self.tail + n) & self.mask;
-        self.len -= n;
+        debug_assert!(n <= self.len());
+        self.tail = self.tail.wrapping_add(n);
 
         // Release buffer to pool when empty (scale-to-zero)
-        if self.len == 0 {
+        if self.is_empty() {
             if let Some(buf) = self.buf.take() {
                 pool_release(buf);
             }
             self.head = 0;
             self.tail = 0;
-            self.mask = 0;
         }
     }
 
@@ -236,15 +240,14 @@ impl WriteBuffer {
     pub fn write_bytes(&mut self, data: &[u8]) -> io::Result<()> {
         self.ensure_space(data.len())?;
 
-        // Get these before mutable borrow
-        let head_pos = self.head & self.mask;
-        let cap = self.mask + 1; // capacity when buf is Some
-
-        // SAFETY: ensure_space guarantees buf is Some
+        // SAFETY: ensure_space guarantees buf is Some and has enough space
         let buf = self.buf.as_mut().unwrap();
+        let cap = buf.len();
+        let head_pos = self.head % cap;
 
         // How much can we write before wrapping?
-        let first_chunk = (cap - head_pos).min(data.len());
+        let to_end = cap - head_pos;
+        let first_chunk = to_end.min(data.len());
         buf[head_pos..head_pos + first_chunk].copy_from_slice(&data[..first_chunk]);
 
         // Wrap around if needed
@@ -253,8 +256,7 @@ impl WriteBuffer {
             buf[..second_chunk].copy_from_slice(&data[first_chunk..]);
         }
 
-        self.head = (self.head + data.len()) & self.mask;
-        self.len += data.len();
+        self.head = self.head.wrapping_add(data.len());
         Ok(())
     }
 
@@ -267,7 +269,6 @@ impl WriteBuffer {
         // First write: acquire buffer from pool
         if self.buf.is_none() {
             let buf = pool_acquire(needed);
-            self.mask = buf.len() - 1;
             self.buf = Some(buf);
             return Ok(());
         }
@@ -303,22 +304,22 @@ impl WriteBuffer {
     /// Grow the buffer to the new size, preserving contents.
     /// Releases old buffer to pool.
     fn grow_to(&mut self, new_size: usize) {
-        let new_buf = pool_acquire(new_size);
-        let mut new_buf = new_buf; // Make mutable for copy
+        let mut new_buf = pool_acquire(new_size);
 
         if let Some(ref old_buf) = self.buf {
-            let len = self.len;
-            let cap = self.capacity();
-            let tail_pos = self.tail & self.mask;
+            let len = self.len();
+            let old_cap = old_buf.len();
+            let tail_pos = self.tail % old_cap;
+            let to_end = old_cap - tail_pos;
 
-            if tail_pos + len <= cap {
+            if len <= to_end {
                 // Data is contiguous - doesn't wrap
                 new_buf[..len].copy_from_slice(&old_buf[tail_pos..tail_pos + len]);
             } else {
                 // Data wraps around
-                let first_part = cap - tail_pos;
-                new_buf[..first_part].copy_from_slice(&old_buf[tail_pos..]);
-                new_buf[first_part..len].copy_from_slice(&old_buf[..len - first_part]);
+                new_buf[..to_end].copy_from_slice(&old_buf[tail_pos..]);
+                let second_len = len - to_end;
+                new_buf[to_end..len].copy_from_slice(&old_buf[..second_len]);
             }
         }
 
@@ -327,8 +328,8 @@ impl WriteBuffer {
             pool_release(old_buf);
         }
 
-        let len = self.len;
-        self.mask = new_buf.len() - 1;
+        // Reset positions - data is now at start of new buffer
+        let len = self.len();
         self.buf = Some(new_buf);
         self.tail = 0;
         self.head = len;
@@ -342,8 +343,6 @@ impl WriteBuffer {
         }
         self.head = 0;
         self.tail = 0;
-        self.len = 0;
-        self.mask = 0;
     }
 
     /// Shrink the buffer if it's very large and mostly empty.
@@ -354,10 +353,11 @@ impl WriteBuffer {
         if cap == 0 {
             return; // Already released
         }
-        // Only shrink if we're at 4x minimum and less than 1/8 full
-        if cap >= MIN_SIZE * 4 && self.len() < cap / 8 {
-            // Shrink to 2x minimum to avoid thrashing
-            self.grow_to(MIN_SIZE * 2);
+        let len = self.len();
+        let new_size = MIN_SIZE * 2;
+        // Only shrink if we're at 4x minimum, less than 1/8 full, AND data fits in new size
+        if cap >= MIN_SIZE * 4 && len < cap / 8 && len <= new_size {
+            self.grow_to(new_size);
         }
     }
 }
@@ -438,8 +438,7 @@ mod tests {
 
     #[test]
     fn test_grow_with_wraparound() {
-        // This tests the bug where grow_to used head_pos >= tail_pos
-        // to detect wraparound, which fails with unbounded counters
+        // This tests that grow_to correctly handles wrapped data
         let mut buf = WriteBuffer::new();
 
         // Write enough to advance head past capacity
@@ -458,7 +457,7 @@ mod tests {
         buf.consume(2000);
         assert_eq!(buf.len(), 6000);
 
-        // This write should trigger growth - the bug was here
+        // This write should trigger growth
         let more_data = vec![0xCDu8; 5000];
         buf.write_bytes(&more_data).unwrap();
         assert_eq!(buf.len(), 11000);
@@ -508,5 +507,44 @@ mod tests {
         buf.maybe_shrink();
         assert!(buf.capacity() < 32768);
         assert_eq!(buf.len(), 1000); // Data preserved
+    }
+
+    #[test]
+    fn test_len_derived_from_head_tail() {
+        // Verify that len is always consistent with head - tail
+        let mut buf = WriteBuffer::new();
+
+        for i in 0..1000 {
+            let data = vec![i as u8; (i % 100) + 1];
+            buf.write_bytes(&data).unwrap();
+            assert_eq!(buf.len(), buf.head.wrapping_sub(buf.tail));
+
+            if i % 3 == 0 && !buf.is_empty() {
+                let consume = buf.len().min(50);
+                buf.consume(consume);
+                assert_eq!(buf.len(), buf.head.wrapping_sub(buf.tail));
+            }
+        }
+    }
+
+    #[test]
+    fn test_io_slices_correctness() {
+        let mut buf = WriteBuffer::new();
+
+        // Write data that will wrap around
+        buf.write_bytes(&[1u8; 3000]).unwrap();
+        buf.consume(2500);
+        buf.write_bytes(&[2u8; 2000]).unwrap();
+
+        let slices = buf.as_io_slices();
+        let total: usize = slices.iter().map(|s| s.len()).sum();
+        assert_eq!(total, buf.len());
+
+        // Verify we can read all the data
+        let mut collected = Vec::new();
+        for slice in &slices {
+            collected.extend_from_slice(slice);
+        }
+        assert_eq!(collected.len(), buf.len());
     }
 }

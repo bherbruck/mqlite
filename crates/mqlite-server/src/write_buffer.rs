@@ -4,6 +4,7 @@
 //! - Scale-to-zero: No allocation until first write
 //! - Lock-free pooling: Reuses buffers across clients via crossbeam-queue
 //! - Length derived from head/tail: No separate len field that can become inconsistent
+//! - Power-of-two sizing: Enables fast bitmask indexing (`& (cap-1)` vs `% cap`)
 //! - Optimized for sequential writes and reads without reallocations
 
 use std::io::{self, IoSlice, Write};
@@ -21,10 +22,14 @@ const SOFT_LIMIT: usize = 1024 * 1024;
 const MAX_SIZE: usize = 16 * 1024 * 1024;
 
 /// Pool capacity per size class.
+/// Smaller buffers are more common, so we keep more of them.
+/// Larger buffers (64KB, 128KB) are for fan-out scenarios with many subscribers.
 const POOL_CAPACITY_4K: usize = 256;
 const POOL_CAPACITY_8K: usize = 128;
 const POOL_CAPACITY_16K: usize = 64;
-const POOL_CAPACITY_32K: usize = 32;
+const POOL_CAPACITY_32K: usize = 64;
+const POOL_CAPACITY_64K: usize = 32;
+const POOL_CAPACITY_128K: usize = 16;
 
 // Global lock-free buffer pools by size class.
 static POOL_4K: LazyLock<ArrayQueue<Box<[u8]>>> =
@@ -35,8 +40,14 @@ static POOL_16K: LazyLock<ArrayQueue<Box<[u8]>>> =
     LazyLock::new(|| ArrayQueue::new(POOL_CAPACITY_16K));
 static POOL_32K: LazyLock<ArrayQueue<Box<[u8]>>> =
     LazyLock::new(|| ArrayQueue::new(POOL_CAPACITY_32K));
+static POOL_64K: LazyLock<ArrayQueue<Box<[u8]>>> =
+    LazyLock::new(|| ArrayQueue::new(POOL_CAPACITY_64K));
+static POOL_128K: LazyLock<ArrayQueue<Box<[u8]>>> =
+    LazyLock::new(|| ArrayQueue::new(POOL_CAPACITY_128K));
 
 /// Acquire a buffer from the pool, or allocate a new one.
+/// Size is rounded up to the nearest power of two (minimum MIN_SIZE).
+/// Caller must ensure size is pre-validated (<= MAX_SIZE) to avoid large allocations.
 #[inline]
 fn pool_acquire(size: usize) -> Box<[u8]> {
     let size = size.next_power_of_two().max(MIN_SIZE);
@@ -46,7 +57,9 @@ fn pool_acquire(size: usize) -> Box<[u8]> {
         8192 => POOL_8K.pop(),
         16384 => POOL_16K.pop(),
         32768 => POOL_32K.pop(),
-        _ => None, // Large buffers not pooled
+        65536 => POOL_64K.pop(),
+        131072 => POOL_128K.pop(),
+        _ => None, // Very large buffers not pooled
     };
 
     maybe_buf.unwrap_or_else(|| vec![0u8; size].into_boxed_slice())
@@ -68,7 +81,13 @@ fn pool_release(buf: Box<[u8]>) {
         32768 => {
             let _ = POOL_32K.push(buf);
         }
-        _ => drop(buf), // Large buffers not pooled
+        65536 => {
+            let _ = POOL_64K.push(buf);
+        }
+        131072 => {
+            let _ = POOL_128K.push(buf);
+        }
+        _ => {} // Very large buffers not pooled, dropped implicitly
     }
 }
 
@@ -86,6 +105,9 @@ pub struct WriteBuffer {
     head: usize,
     /// Read position (unbounded, wraps naturally).
     tail: usize,
+    /// Primed for shrink (requires two consecutive eligible states before shrinking).
+    /// This prevents shrink/grow cycles during bursty traffic.
+    shrink_primed: bool,
 }
 
 impl WriteBuffer {
@@ -95,6 +117,7 @@ impl WriteBuffer {
             buf: None,
             head: 0,
             tail: 0,
+            shrink_primed: false,
         }
     }
 
@@ -107,6 +130,7 @@ impl WriteBuffer {
             buf: Some(buf),
             head: 0,
             tail: 0,
+            shrink_primed: false,
         }
     }
 
@@ -124,11 +148,28 @@ impl WriteBuffer {
         self.head == self.tail
     }
 
-    /// Returns the number of bytes available for writing.
+    /// Debug-only invariant check. Zero cost in release builds.
+    #[inline]
+    fn debug_check_invariants(&self) {
+        if let Some(buf) = &self.buf {
+            debug_assert!(
+                self.len() <= buf.len(),
+                "invariant violated: len {} > capacity {}",
+                self.len(),
+                buf.len()
+            );
+        } else {
+            debug_assert!(self.len() == 0, "invariant violated: len > 0 with no buffer");
+        }
+    }
+
+    /// Returns free space in the currently allocated buffer.
+    /// Returns 0 if no buffer exists yet (scale-to-zero state).
+    /// Note: 0 does NOT mean writes will fail - buffer will be allocated on demand.
     #[inline]
     pub fn free_space(&self) -> usize {
         match &self.buf {
-            None => 0, // Will allocate on write
+            None => 0,
             Some(buf) => buf.len() - self.len(),
         }
     }
@@ -157,7 +198,7 @@ impl WriteBuffer {
         }
 
         let cap = buf.len();
-        let tail_pos = self.tail % cap;
+        let tail_pos = self.tail & (cap - 1);
 
         // Bytes from tail_pos to end of buffer
         let to_end = cap - tail_pos;
@@ -177,7 +218,7 @@ impl WriteBuffer {
                 }
 
                 let cap = buf.len();
-                let tail_pos = self.tail % cap;
+                let tail_pos = self.tail & (cap - 1);
                 let contiguous = (cap - tail_pos).min(len);
                 &buf[tail_pos..tail_pos + contiguous]
             }
@@ -198,7 +239,7 @@ impl WriteBuffer {
         }
 
         let cap = buf.len();
-        let tail_pos = self.tail % cap;
+        let tail_pos = self.tail & (cap - 1);
         let to_end = cap - tail_pos;
 
         if len <= to_end {
@@ -218,32 +259,47 @@ impl WriteBuffer {
     }
 
     /// Advance the read position after consuming bytes.
-    /// Releases buffer to pool when empty (scale-to-zero).
+    /// Keeps buffer allocated to avoid allocation churn during sustained traffic.
+    /// Buffer is released via maybe_shrink() when truly idle, or Drop when client disconnects.
     #[inline]
     pub fn consume(&mut self, n: usize) {
         debug_assert!(n <= self.len());
         self.tail = self.tail.wrapping_add(n);
 
-        // Release buffer to pool when empty (scale-to-zero)
+        // Reset positions when empty to maximize contiguous write space
+        // But keep buffer allocated to avoid churn during sustained traffic
         if self.is_empty() {
-            if let Some(buf) = self.buf.take() {
-                pool_release(buf);
-            }
             self.head = 0;
             self.tail = 0;
         }
+        self.debug_check_invariants();
     }
 
     /// Write bytes into the buffer, growing if necessary.
-    /// Returns Err if the buffer would exceed MAX_SIZE.
+    /// Returns WouldBlock if buffer would exceed soft limit (for QoS 0 backpressure).
+    /// Returns OutOfMemory if buffer would exceed hard limit.
     #[inline]
     pub fn write_bytes(&mut self, data: &[u8]) -> io::Result<()> {
-        self.ensure_space(data.len())?;
+        self.write_bytes_inner(data, true)
+    }
+
+    /// Write bytes bypassing soft limit (for QoS 1/2 guaranteed delivery).
+    /// Only fails if hard limit (16MB) would be exceeded.
+    /// Use this for QoS 1/2 messages that must not be dropped.
+    #[inline]
+    pub fn write_bytes_guaranteed(&mut self, data: &[u8]) -> io::Result<()> {
+        self.write_bytes_inner(data, false)
+    }
+
+    /// Inner write implementation with configurable soft limit enforcement.
+    #[inline]
+    fn write_bytes_inner(&mut self, data: &[u8], enforce_soft_limit: bool) -> io::Result<()> {
+        self.ensure_space(data.len(), enforce_soft_limit)?;
 
         // SAFETY: ensure_space guarantees buf is Some and has enough space
         let buf = self.buf.as_mut().unwrap();
         let cap = buf.len();
-        let head_pos = self.head % cap;
+        let head_pos = self.head & (cap - 1);
 
         // How much can we write before wrapping?
         let to_end = cap - head_pos;
@@ -257,33 +313,34 @@ impl WriteBuffer {
         }
 
         self.head = self.head.wrapping_add(data.len());
+        self.debug_check_invariants();
         Ok(())
     }
 
     /// Ensure there's space for at least `needed` bytes, growing if necessary.
     /// Acquires buffer from pool on first write (scale-to-zero).
-    /// Returns WouldBlock if growth would exceed soft limit (backpressure).
-    /// Returns OutOfMemory if growth would exceed hard limit.
+    /// If enforce_soft_limit is true, returns WouldBlock above 1MB.
+    /// Returns OutOfMemory if growth would exceed hard limit (16MB).
     #[inline]
-    fn ensure_space(&mut self, needed: usize) -> io::Result<()> {
-        // First write: acquire buffer from pool
-        if self.buf.is_none() {
-            let buf = pool_acquire(needed);
-            self.buf = Some(buf);
-            return Ok(());
-        }
-
+    fn ensure_space(&mut self, needed: usize, enforce_soft_limit: bool) -> io::Result<()> {
+        // Fast path: already have enough space
         if self.free_space() >= needed {
             return Ok(());
         }
 
-        // Need to grow
-        let required = self.len() + needed;
-        let new_size = required.next_power_of_two();
+        // Calculate required size (works for both first write and growth)
+        // Use checked arithmetic to avoid panic on adversarial input
+        let required = self.len().checked_add(needed).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "size overflow")
+        })?;
+        let new_size = required
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(MIN_SIZE);
 
-        // Soft limit: signal backpressure via WouldBlock
-        // Caller can decide policy: disconnect slow client, drop QoS0, retry later
-        if new_size > SOFT_LIMIT && self.capacity() < new_size {
+        // Soft limit: signal backpressure via WouldBlock (only for QoS 0)
+        // QoS 1/2 bypasses this to ensure guaranteed delivery
+        if enforce_soft_limit && new_size > SOFT_LIMIT && self.capacity() < new_size {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "tx buffer soft limit reached",
@@ -297,6 +354,13 @@ impl WriteBuffer {
             ));
         }
 
+        // First write: acquire from pool
+        if self.buf.is_none() {
+            self.buf = Some(pool_acquire(new_size));
+            return Ok(());
+        }
+
+        // Growth: copy to larger buffer
         self.grow_to(new_size);
         Ok(())
     }
@@ -304,12 +368,12 @@ impl WriteBuffer {
     /// Grow the buffer to the new size, preserving contents.
     /// Releases old buffer to pool.
     fn grow_to(&mut self, new_size: usize) {
+        let len = self.len();
         let mut new_buf = pool_acquire(new_size);
 
         if let Some(ref old_buf) = self.buf {
-            let len = self.len();
             let old_cap = old_buf.len();
-            let tail_pos = self.tail % old_cap;
+            let tail_pos = self.tail & (old_cap - 1);
             let to_end = old_cap - tail_pos;
 
             if len <= to_end {
@@ -329,10 +393,10 @@ impl WriteBuffer {
         }
 
         // Reset positions - data is now at start of new buffer
-        let len = self.len();
         self.buf = Some(new_buf);
         self.tail = 0;
         self.head = len;
+        self.debug_check_invariants();
     }
 
     /// Reset the buffer, clearing all data and releasing to pool (scale-to-zero).
@@ -345,20 +409,51 @@ impl WriteBuffer {
         self.tail = 0;
     }
 
-    /// Shrink the buffer if it's very large and mostly empty.
-    /// Call this periodically to reclaim memory from slow clients that caught up.
-    /// Only shrinks if buffer is 4x the minimum and less than 1/8 full.
+    /// Release or shrink the buffer if it's been empty for two consecutive calls.
+    /// Call this periodically to reclaim memory from idle clients.
+    ///
+    /// Uses hysteresis (two-tick debounce) to avoid allocation churn:
+    /// - Only acts when buffer is completely empty
+    /// - Requires two consecutive calls while empty before releasing/shrinking
+    /// - Any data in buffer resets the primed state
+    ///
+    /// For small buffers (<= 64KB): releases back to pool
+    /// For large buffers (> 64KB): shrinks to MIN_SIZE
     pub fn maybe_shrink(&mut self) {
+        // Nothing to do if no buffer
+        if self.buf.is_none() {
+            self.shrink_primed = false;
+            return;
+        }
+
+        // Only consider releasing/shrinking when completely empty
+        if !self.is_empty() {
+            self.shrink_primed = false;
+            return;
+        }
+
+        // First time seeing empty: prime for next time
+        if !self.shrink_primed {
+            self.shrink_primed = true;
+            return;
+        }
+
+        // Second consecutive empty call: actually release or shrink
+        self.shrink_primed = false;
+
         let cap = self.capacity();
-        if cap == 0 {
-            return; // Already released
+        if cap <= 65536 {
+            // Small buffer: release to pool entirely
+            if let Some(buf) = self.buf.take() {
+                pool_release(buf);
+            }
+            self.head = 0;
+            self.tail = 0;
+        } else {
+            // Large buffer: shrink to MIN_SIZE (grow_to checks invariants)
+            self.grow_to(MIN_SIZE);
         }
-        let len = self.len();
-        let new_size = MIN_SIZE * 2;
-        // Only shrink if we're at 4x minimum, less than 1/8 full, AND data fits in new size
-        if cap >= MIN_SIZE * 4 && len < cap / 8 && len <= new_size {
-            self.grow_to(new_size);
-        }
+        self.debug_check_invariants();
     }
 }
 
@@ -381,6 +476,23 @@ impl Write for WriteBuffer {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.write_bytes(buf)?;
+        Ok(buf.len())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Wrapper for guaranteed writes that bypass the soft limit.
+/// Use this for QoS 1/2 messages that must not be dropped.
+pub struct WriteGuaranteed<'a>(pub &'a mut WriteBuffer);
+
+impl Write for WriteGuaranteed<'_> {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write_bytes_guaranteed(buf)?;
         Ok(buf.len())
     }
 
@@ -489,24 +601,72 @@ mod tests {
     }
 
     #[test]
-    fn test_maybe_shrink() {
+    fn test_maybe_shrink_small_buffer() {
+        // Test: small buffer gets released after two idle ticks
         let mut buf = WriteBuffer::new();
+        buf.write_bytes(&[0u8; 1000]).unwrap();
+        assert!(buf.capacity() > 0);
 
-        // Grow the buffer to 32KB (at soft limit, not over)
-        // Write in chunks to stay under limit
-        for _ in 0..4 {
-            buf.write_bytes(&[0u8; 8000]).unwrap();
-        }
-        assert!(buf.capacity() >= 32768);
+        // Consume all data - buffer stays allocated (no scale-to-zero in consume)
+        buf.consume(1000);
+        assert!(buf.buf.is_some()); // Buffer still allocated
 
-        // Consume most data - need <1/8 full for shrink
-        buf.consume(31000);
-        assert_eq!(buf.len(), 1000);
-
-        // Buffer should shrink since it's <1/8 full and >4x min (16KB)
+        // First call while empty: primes but doesn't release
         buf.maybe_shrink();
-        assert!(buf.capacity() < 32768);
-        assert_eq!(buf.len(), 1000); // Data preserved
+        assert!(buf.buf.is_some()); // Still allocated
+
+        // Second call: actually releases
+        buf.maybe_shrink();
+        assert!(buf.buf.is_none()); // Now released
+    }
+
+    #[test]
+    fn test_maybe_shrink_large_buffer() {
+        // Test: large buffer (>64KB) gets shrunk after two idle ticks
+        let mut buf = WriteBuffer::new();
+        buf.write_bytes(&[0u8; 100000]).unwrap(); // >64KB
+        let original_cap = buf.capacity();
+        assert!(original_cap > 65536);
+
+        // Consume all data
+        buf.consume(100000);
+        assert!(buf.buf.is_some());
+
+        // First call while empty: primes but doesn't shrink
+        buf.maybe_shrink();
+        assert_eq!(buf.capacity(), original_cap);
+
+        // Second call: shrinks to MIN_SIZE
+        buf.maybe_shrink();
+        assert_eq!(buf.capacity(), 4096); // Shrunk to MIN_SIZE
+    }
+
+    #[test]
+    fn test_maybe_shrink_resets_on_data() {
+        // Test: maybe_shrink seeing non-empty buffer resets primed state
+        let mut buf = WriteBuffer::new();
+        buf.write_bytes(&[0u8; 1000]).unwrap();
+        buf.consume(1000);
+
+        // First call: primes
+        buf.maybe_shrink();
+        assert!(buf.buf.is_some());
+
+        // Write more data
+        buf.write_bytes(&[0u8; 100]).unwrap();
+
+        // maybe_shrink sees non-empty buffer, resets primed
+        buf.maybe_shrink();
+        assert!(buf.buf.is_some());
+
+        // Consume data
+        buf.consume(100);
+
+        // Now need two more calls to release (primed was reset)
+        buf.maybe_shrink(); // Primes again
+        assert!(buf.buf.is_some());
+        buf.maybe_shrink(); // Now releases
+        assert!(buf.buf.is_none());
     }
 
     #[test]
@@ -546,5 +706,119 @@ mod tests {
             collected.extend_from_slice(slice);
         }
         assert_eq!(collected.len(), buf.len());
+    }
+
+    #[test]
+    fn test_first_write_respects_hard_limit() {
+        // Verify that even first writes check the hard limit (16MB)
+        // Use write_bytes_guaranteed to bypass soft limit and test hard limit
+        let mut buf = WriteBuffer::new();
+        assert!(buf.buf.is_none()); // Start with no allocation
+
+        // Try to write more than MAX_SIZE (16MB) on first write
+        let huge = vec![0u8; 20 * 1024 * 1024]; // 20MB
+        let result = buf.write_bytes_guaranteed(&huge);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::OutOfMemory);
+        assert!(buf.buf.is_none()); // Should not have allocated
+    }
+
+    #[test]
+    fn test_first_write_respects_soft_limit() {
+        // Verify that first writes check soft limit (1MB) for QoS 0
+        let mut buf = WriteBuffer::new();
+        assert!(buf.buf.is_none());
+
+        // Try to write more than SOFT_LIMIT (1MB) on first write
+        let large = vec![0u8; 2 * 1024 * 1024]; // 2MB
+        let result = buf.write_bytes(&large);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(buf.buf.is_none()); // Should not have allocated
+    }
+
+    #[test]
+    fn test_first_write_guaranteed_bypasses_soft_limit() {
+        // Verify that guaranteed writes bypass soft limit but respect hard limit
+        let mut buf = WriteBuffer::new();
+        assert!(buf.buf.is_none());
+
+        // 2MB write with guaranteed (bypasses soft limit)
+        let large = vec![0u8; 2 * 1024 * 1024]; // 2MB
+        let result = buf.write_bytes_guaranteed(&large);
+
+        assert!(result.is_ok());
+        assert!(buf.buf.is_some());
+        assert_eq!(buf.len(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_exceeds_max_size_returns_error() {
+        // Verify that sizes exceeding MAX_SIZE (16MB) return OutOfMemory
+        // The checked arithmetic also prevents panic on usize overflow
+        let mut buf = WriteBuffer::new();
+
+        // 17MB exceeds MAX_SIZE (16MB), should return OutOfMemory
+        let result = buf.write_bytes_guaranteed(&vec![0u8; 17 * 1024 * 1024]);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::OutOfMemory);
+        assert!(buf.buf.is_none()); // Should not have allocated
+    }
+
+    #[test]
+    fn fuzz_random_operations() {
+        // Deterministic pseudo-random fuzz test for write/consume/shrink operations.
+        // Uses a simple LCG for reproducibility without external dependencies.
+        let mut rng = 12345u64; // Seed
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng
+        };
+
+        let mut buf = WriteBuffer::new();
+        let mut expected_len = 0usize;
+
+        for _ in 0..10_000 {
+            let op = next() % 100;
+
+            match op {
+                // 50% chance: write random amount (1-1000 bytes)
+                0..50 => {
+                    let write_size = ((next() % 1000) + 1) as usize;
+                    let data = vec![(next() & 0xFF) as u8; write_size];
+                    if buf.write_bytes(&data).is_ok() {
+                        expected_len += write_size;
+                    }
+                    // Soft limit rejection is fine, just don't advance expected_len
+                }
+                // 35% chance: consume random amount (0 to current len)
+                50..85 => {
+                    if expected_len > 0 {
+                        let consume_amt = (next() as usize % expected_len).max(1);
+                        buf.consume(consume_amt);
+                        expected_len -= consume_amt;
+                    }
+                }
+                // 10% chance: maybe_shrink (tests hysteresis)
+                85..95 => {
+                    buf.maybe_shrink();
+                }
+                // 5% chance: consume all then shrink (tests scale-to-zero path)
+                _ => {
+                    if expected_len > 0 {
+                        buf.consume(expected_len);
+                        expected_len = 0;
+                    }
+                    buf.maybe_shrink();
+                    buf.maybe_shrink(); // Two ticks to actually release
+                }
+            }
+
+            // Invariant checks after every operation
+            assert_eq!(buf.len(), expected_len, "len mismatch after operation");
+            buf.debug_check_invariants();
+        }
     }
 }

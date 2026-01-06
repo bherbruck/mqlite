@@ -100,6 +100,7 @@ impl ClientWriteHandle {
 
     /// Queue a packet for sending. Can be called from any thread.
     /// Returns WouldBlock if client's TX buffer is full (slow client).
+    /// Use `queue_control_packet` for protocol control packets that must not be dropped.
     #[inline]
     pub fn queue_packet(&self, packet: &Packet) -> std::io::Result<()> {
         ENCODE_BUF.with(|buf| {
@@ -108,6 +109,24 @@ impl ClientWriteHandle {
             packet::encode_packet(packet, &mut tmp);
             let mut write_buf = self.write_buf.lock();
             write_buf.write_bytes(&tmp)?;
+            drop(write_buf);
+            self.set_ready_for_writing(true);
+            Ok(())
+        })
+    }
+
+    /// Queue a control packet for sending, bypassing soft limit.
+    /// Use this for protocol control packets (CONNACK, PINGRESP, PUBACK, PUBREC,
+    /// PUBREL, PUBCOMP, SUBACK, UNSUBACK) that must not be dropped.
+    /// Only fails if hard limit (16MB) would be exceeded.
+    #[inline]
+    pub fn queue_control_packet(&self, packet: &Packet) -> std::io::Result<()> {
+        ENCODE_BUF.with(|buf| {
+            let mut tmp = buf.borrow_mut();
+            tmp.clear();
+            packet::encode_packet(packet, &mut tmp);
+            let mut write_buf = self.write_buf.lock();
+            write_buf.write_bytes_guaranteed(&tmp)?;
             drop(write_buf);
             self.set_ready_for_writing(true);
             Ok(())
@@ -182,9 +201,12 @@ impl ClientWriteHandle {
             // This is safe because only the owning worker calls flush()
             let mut buf = self.write_buf.lock();
             if buf.is_empty() {
-                // Clear the ready flag while still holding the lock to prevent race.
-                // If another thread writes after we release, it will set the flag again.
-                self.set_ready_for_writing(false);
+                // NOTE: We intentionally do NOT call set_ready_for_writing(false) here.
+                // Removing EPOLLOUT triggers epoll_ctl syscall, and with high fan-out
+                // (1500 subscribers), each write-flush cycle would cause 2 syscalls per
+                // client. Keeping EPOLLOUT set means poll() returns writable events for
+                // idle clients, but the empty check above is ~100ns vs ~1-5µs for syscall.
+                // This optimization reduces epoll_ctl calls by ~100x in fan-out scenarios.
                 return Ok(true);
             }
 

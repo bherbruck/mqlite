@@ -15,93 +15,12 @@ use mqlite_core::packet::{
     Suback, Subscribe, SubscriptionOptions, Unsuback, Unsubscribe,
 };
 
+use crate::config::{ClientConfig, ConnectOptions};
 use crate::error::{ClientError, Result};
+use crate::events::{ClientEvent, ConnectionState};
 
 const CLIENT: Token = Token(0);
 const DEFAULT_BUFFER_SIZE: usize = 8192;
-
-/// Client configuration.
-#[derive(Debug, Clone)]
-pub struct ClientConfig {
-    /// Remote broker address (host:port).
-    pub address: String,
-    /// Client identifier.
-    pub client_id: String,
-    /// Username for authentication.
-    pub username: Option<String>,
-    /// Password for authentication.
-    pub password: Option<Vec<u8>>,
-    /// Keep-alive interval in seconds (0 = disabled).
-    pub keep_alive: u16,
-    /// Clean session flag.
-    pub clean_session: bool,
-    /// MQTT protocol version (4 = 3.1.1, 5 = 5.0).
-    pub protocol_version: u8,
-    /// Connection timeout.
-    pub connect_timeout: Duration,
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            address: "localhost:1883".to_string(),
-            client_id: String::new(),
-            username: None,
-            password: None,
-            keep_alive: 60,
-            clean_session: true,
-            protocol_version: 4, // MQTT 3.1.1
-            connect_timeout: Duration::from_secs(10),
-        }
-    }
-}
-
-/// Options for connect operation (for reconnection with different settings).
-#[derive(Debug, Clone, Default)]
-pub struct ConnectOptions {
-    /// Override client_id.
-    pub client_id: Option<String>,
-    /// Override clean_session.
-    pub clean_session: Option<bool>,
-}
-
-/// Events returned by the client.
-#[derive(Debug)]
-pub enum ClientEvent {
-    /// Connected to broker.
-    Connected { session_present: bool },
-    /// Disconnected from broker.
-    Disconnected { reason: Option<String> },
-    /// Received a publish message.
-    Message {
-        topic: Bytes,
-        payload: Bytes,
-        qos: QoS,
-        retain: bool,
-        packet_id: Option<u16>,
-    },
-    /// Subscribe acknowledgment.
-    SubAck {
-        packet_id: u16,
-        return_codes: Vec<u8>,
-    },
-    /// Unsubscribe acknowledgment.
-    UnsubAck { packet_id: u16 },
-    /// Publish acknowledgment (QoS 1).
-    PubAck { packet_id: u16 },
-    /// Publish received (QoS 2 step 1).
-    PubRec { packet_id: u16 },
-    /// Publish complete (QoS 2 step 3).
-    PubComp { packet_id: u16 },
-}
-
-/// Connection state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectionState {
-    Disconnected,
-    Connecting,
-    Connected,
-}
 
 /// MQTT client.
 pub struct Client {
@@ -219,8 +138,50 @@ impl Client {
         Ok(())
     }
 
-    /// Subscribe to topics.
+    /// Subscribe to topics with default options.
+    ///
+    /// For MQTT 5.0 subscription options (NoLocal, RetainAsPublished, etc.),
+    /// use `subscribe_with_options` instead.
     pub fn subscribe(&mut self, topics: &[(&str, QoS)]) -> Result<u16> {
+        let subscriptions: Vec<_> = topics
+            .iter()
+            .map(|(topic, qos)| {
+                (
+                    *topic,
+                    SubscriptionOptions {
+                        qos: *qos,
+                        no_local: false,
+                        retain_as_published: false,
+                        retain_handling: 0,
+                    },
+                )
+            })
+            .collect();
+        self.subscribe_with_options(&subscriptions)
+    }
+
+    /// Subscribe to topics with full MQTT 5.0 subscription options.
+    ///
+    /// # Options
+    /// - `no_local`: Don't receive messages published by this client (loop prevention)
+    /// - `retain_as_published`: Keep original retain flag on forwarded messages
+    /// - `retain_handling`: 0=send retained on subscribe, 1=send if new sub, 2=don't send
+    ///
+    /// # Example
+    /// ```ignore
+    /// use mqlite_client::{Client, SubscriptionOptions, QoS};
+    ///
+    /// // Subscribe with NoLocal to prevent message reflection (useful for bridges)
+    /// client.subscribe_with_options(&[
+    ///     ("sensors/#", SubscriptionOptions {
+    ///         qos: QoS::AtLeastOnce,
+    ///         no_local: true,
+    ///         retain_as_published: false,
+    ///         retain_handling: 0,
+    ///     }),
+    /// ])?;
+    /// ```
+    pub fn subscribe_with_options(&mut self, topics: &[(&str, SubscriptionOptions)]) -> Result<u16> {
         if self.state != ConnectionState::Connected {
             return Err(ClientError::NotConnected);
         }
@@ -230,17 +191,7 @@ impl Client {
             packet_id,
             topics: topics
                 .iter()
-                .map(|(topic, qos)| {
-                    (
-                        topic.to_string(),
-                        SubscriptionOptions {
-                            qos: *qos,
-                            no_local: false,
-                            retain_as_published: false,
-                            retain_handling: 0,
-                        },
-                    )
-                })
+                .map(|(topic, opts)| (topic.to_string(), *opts))
                 .collect(),
             subscription_id: None,
         };

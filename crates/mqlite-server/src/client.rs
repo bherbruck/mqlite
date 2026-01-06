@@ -323,6 +323,13 @@ impl Client {
         self.handle.queue_packet(packet)
     }
 
+    /// Queue a control packet for sending, bypassing soft limit.
+    /// Use this for protocol control packets (CONNACK, PINGRESP, PUBACK, PUBREC,
+    /// PUBREL, PUBCOMP, SUBACK, UNSUBACK) that must not be dropped.
+    pub fn queue_control_packet(&self, packet: &Packet) -> std::io::Result<()> {
+        self.handle.queue_control_packet(packet)
+    }
+
     /// Queue a publish packet using the copy factory (zero-copy for payload).
     /// Returns WouldBlock if client's TX buffer is full (slow client).
     #[allow(dead_code)]

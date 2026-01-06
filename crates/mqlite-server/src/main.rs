@@ -99,8 +99,12 @@ fn main() {
         config.server.workers
     };
 
+    // Build ID to verify Docker builds - change this when making fixes
+    const BUILD_ID: &str = "2026-01-06-pingresp-flush";
+
     info!(
-        "Starting mqlite with {} worker threads (max_packet_size={}KB, max_inflight={})",
+        "Starting mqlite [build={}] with {} worker threads (max_packet_size={}KB, max_inflight={})",
+        BUILD_ID,
         num_workers,
         config.limits.max_packet_size / 1024,
         config.limits.max_inflight

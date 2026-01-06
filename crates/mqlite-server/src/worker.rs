@@ -572,20 +572,18 @@ impl Worker {
 
             Packet::Pubrec { packet_id } => {
                 if let Some(client) = self.clients.get_mut(&token) {
-                    if let Err(e) = client.queue_packet(&Packet::Pubrel { packet_id }) {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            client.record_backpressure_drop("PUBREL");
-                        }
+                    // PUBREL is critical for QoS 2 flow - use guaranteed write
+                    if let Err(e) = client.queue_control_packet(&Packet::Pubrel { packet_id }) {
+                        log::warn!("Failed to queue PUBREL for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
                     }
                 }
             }
 
             Packet::Pubrel { packet_id } => {
                 if let Some(client) = self.clients.get_mut(&token) {
-                    if let Err(e) = client.queue_packet(&Packet::Pubcomp { packet_id }) {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            client.record_backpressure_drop("PUBCOMP");
-                        }
+                    // PUBCOMP is critical for QoS 2 flow - use guaranteed write
+                    if let Err(e) = client.queue_control_packet(&Packet::Pubcomp { packet_id }) {
+                        log::warn!("Failed to queue PUBCOMP for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
                     }
                 }
             }
@@ -614,8 +612,13 @@ impl Worker {
 
             Packet::Pingreq => {
                 if let Some(client) = self.clients.get_mut(&token) {
-                    // PINGRESP: not critical, drop if slow
-                    let _ = client.queue_packet(&Packet::Pingresp);
+                    // PINGRESP is critical - client will disconnect if not received
+                    if let Err(e) = client.queue_control_packet(&Packet::Pingresp) {
+                        log::warn!("Failed to queue PINGRESP for client {:?}: {}", client.client_id, e);
+                    }
+                    // Flush immediately - don't wait for next poll() cycle
+                    // This ensures PINGRESP goes out ASAP even if worker is busy with fan-out
+                    let _ = client.flush();
                 }
             }
 
@@ -996,8 +999,10 @@ impl Worker {
                 properties: None,
             }
         };
-        // CONNACK: critical for connection, but client just connected so buffer should be empty
-        let _ = client.queue_packet(&Packet::Connack(connack));
+        // CONNACK is critical - client waiting for connection confirmation
+        if let Err(e) = client.queue_control_packet(&Packet::Connack(connack)) {
+            log::warn!("Failed to queue CONNACK for client {:?}: {}", client.client_id, e);
+        }
 
         // Re-send pending messages from previous session
         for publish in pending_to_resend {
@@ -1049,7 +1054,10 @@ impl Worker {
                     return_codes,
                     is_v5,
                 };
-                let _ = client.queue_packet(&Packet::Suback(suback));
+                // SUBACK is critical - client waiting for subscription confirmation
+                if let Err(e) = client.queue_control_packet(&Packet::Suback(suback)) {
+                    log::warn!("Failed to queue SUBACK for client {:?}: {}", client.client_id, e);
+                }
             }
             return Ok(());
         }
@@ -1203,8 +1211,10 @@ impl Worker {
                 return_codes,
                 is_v5: client.protocol_version == 5,
             };
-            // SUBACK: required response, drop if slow
-            let _ = client.queue_packet(&Packet::Suback(suback));
+            // SUBACK is critical - client waiting for subscription confirmation
+            if let Err(e) = client.queue_control_packet(&Packet::Suback(suback)) {
+                log::warn!("Failed to queue SUBACK for client {:?}: {}", client.client_id, e);
+            }
         }
 
         // Send retained messages for matching topics
@@ -1316,11 +1326,14 @@ impl Worker {
             } else {
                 Vec::new()
             };
-            let _ = client.queue_packet(&Packet::Unsuback(Unsuback {
+            // UNSUBACK is critical - client waiting for unsubscribe confirmation
+            if let Err(e) = client.queue_control_packet(&Packet::Unsuback(Unsuback {
                 packet_id: unsub.packet_id,
                 reason_codes,
                 is_v5,
-            }));
+            })) {
+                log::warn!("Failed to queue UNSUBACK for client {:?}: {}", client.client_id, e);
+            }
         }
 
         Ok(())
@@ -1408,7 +1421,9 @@ impl Worker {
                         if let Some(client) = self.clients.get_mut(&from_token) {
                             // TODO: Add reason_code support to Puback packet
                             // For now, just send regular PUBACK (client may retry)
-                            let _ = client.queue_packet(&Packet::Puback { packet_id });
+                            if let Err(e) = client.queue_control_packet(&Packet::Puback { packet_id }) {
+                                log::warn!("Failed to queue PUBACK for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
+                            }
                         }
                     }
                 }
@@ -1416,7 +1431,9 @@ impl Worker {
                     if let Some(packet_id) = publish.packet_id {
                         if let Some(client) = self.clients.get_mut(&from_token) {
                             // TODO: Add reason_code support to Pubrec packet
-                            let _ = client.queue_packet(&Packet::Pubrec { packet_id });
+                            if let Err(e) = client.queue_control_packet(&Packet::Pubrec { packet_id }) {
+                                log::warn!("Failed to queue PUBREC for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
+                            }
                         }
                     }
                 }
@@ -1425,14 +1442,12 @@ impl Worker {
             return Ok(());
         }
 
-        // Send PUBACK/PUBREC to publisher
+        // Send PUBACK/PUBREC to publisher - critical for QoS flow
         if publish.qos == QoS::AtLeastOnce {
             if let Some(packet_id) = publish.packet_id {
                 if let Some(client) = self.clients.get_mut(&from_token) {
-                    if let Err(e) = client.queue_packet(&Packet::Puback { packet_id }) {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            client.record_backpressure_drop("PUBACK");
-                        }
+                    if let Err(e) = client.queue_control_packet(&Packet::Puback { packet_id }) {
+                        log::warn!("Failed to queue PUBACK for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
                     }
                 }
             }
@@ -1440,10 +1455,8 @@ impl Worker {
         if publish.qos == QoS::ExactlyOnce {
             if let Some(packet_id) = publish.packet_id {
                 if let Some(client) = self.clients.get_mut(&from_token) {
-                    if let Err(e) = client.queue_packet(&Packet::Pubrec { packet_id }) {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            client.record_backpressure_drop("PUBREC");
-                        }
+                    if let Err(e) = client.queue_control_packet(&Packet::Pubrec { packet_id }) {
+                        log::warn!("Failed to queue PUBREC for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
                     }
                 }
             }
@@ -1496,6 +1509,11 @@ impl Worker {
         let mut last_backpressure_sub: Option<(usize, Token)> = None;
         let mut hardlimit_count: u32 = 0;
         let mut last_hardlimit_sub: Option<(usize, Token)> = None;
+
+        // Batch cross-worker pending messages to avoid lock contention
+        // (client_id, packet_id, qos, publish) - written to sessions after loop
+        let mut cross_worker_pending: Vec<(Arc<str>, u16, QoS, Publish)> = Vec::new();
+
         for sub in &self.subscriber_buf {
             // MQTT-3.8.3.1-2: NoLocal - don't deliver to publishing client
             if sub.options.no_local && sub.token() == from_token && sub.worker_id() == self.id {
@@ -1588,31 +1606,24 @@ impl Worker {
                     }
                 }
             } else {
-                // Cross-worker: track pending messages in session for QoS 1/2
-                // The client state is on another worker, so we track in the shared session
+                // Cross-worker: collect pending for batch write later (avoid lock per subscriber)
                 if let Some(pid) = packet_id {
-                    if !sub.client_id.is_empty() {
-                        let mut sessions = self.shared.sessions.write();
-                        if let Some(session) = sessions.get_mut(&*sub.client_id) {
-                            let pending_publish = Publish {
-                                dup: false,
-                                qos: out_qos,
-                                retain: false,
-                                topic: publish.topic.clone(),
-                                packet_id: Some(pid),
-                                payload: publish.payload.clone(),
-                                properties: publish.properties.clone(),
-                            };
-                            match out_qos {
-                                QoS::AtLeastOnce => {
-                                    session.pending_qos1.push((pid, pending_publish));
-                                }
-                                QoS::ExactlyOnce => {
-                                    session.pending_qos2.push((pid, pending_publish));
-                                }
-                                _ => {}
-                            }
-                        }
+                    if !sub.client_id.is_empty() && out_qos != QoS::AtMostOnce {
+                        let pending_publish = Publish {
+                            dup: false,
+                            qos: out_qos,
+                            retain: false,
+                            topic: publish.topic.clone(),
+                            packet_id: Some(pid),
+                            payload: publish.payload.clone(),
+                            properties: publish.properties.clone(),
+                        };
+                        cross_worker_pending.push((
+                            sub.client_id.clone(),
+                            pid,
+                            out_qos,
+                            pending_publish,
+                        ));
                     }
                 }
             }
@@ -1654,6 +1665,24 @@ impl Worker {
                 // Track successful publish sent for $SYS metrics
                 self.shared.metrics.add_pub_msgs_sent(1);
                 self.shared.metrics.add_pub_bytes_sent(payload_len);
+            }
+        }
+
+        // Batch write cross-worker pending messages (one lock acquisition instead of N)
+        if !cross_worker_pending.is_empty() {
+            let mut sessions = self.shared.sessions.write();
+            for (client_id, pid, qos, pending_publish) in cross_worker_pending {
+                if let Some(session) = sessions.get_mut(&*client_id) {
+                    match qos {
+                        QoS::AtLeastOnce => {
+                            session.pending_qos1.push((pid, pending_publish));
+                        }
+                        QoS::ExactlyOnce => {
+                            session.pending_qos2.push((pid, pending_publish));
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
 
@@ -1852,6 +1881,9 @@ impl Worker {
             let mut last_will_backpressure_sub: Option<(usize, Token)> = None;
             let mut will_hardlimit_count: u32 = 0;
             let mut last_will_hardlimit_sub: Option<(usize, Token)> = None;
+            // Batch cross-worker pending for will messages
+            let mut will_cross_worker_pending: Vec<(Arc<str>, u16, QoS, Publish)> = Vec::new();
+
             for sub in &self.subscriber_buf {
                 let worker_id = sub.worker_id();
                 let sub_token = sub.token();
@@ -1896,30 +1928,24 @@ impl Worker {
                         }
                     }
                 } else {
-                    // Cross-worker: track pending messages in session for QoS 1/2
+                    // Cross-worker: collect pending for batch write later
                     if let Some(pid) = packet_id {
-                        if !sub.client_id.is_empty() {
-                            let mut sessions = self.shared.sessions.write();
-                            if let Some(session) = sessions.get_mut(&*sub.client_id) {
-                                let pending_publish = Publish {
-                                    dup: false,
-                                    qos: out_qos,
-                                    retain: false,
-                                    topic: will_publish.topic.clone(),
-                                    packet_id: Some(pid),
-                                    payload: will_publish.payload.clone(),
-                                    properties: will_publish.properties.clone(),
-                                };
-                                match out_qos {
-                                    QoS::AtLeastOnce => {
-                                        session.pending_qos1.push((pid, pending_publish));
-                                    }
-                                    QoS::ExactlyOnce => {
-                                        session.pending_qos2.push((pid, pending_publish));
-                                    }
-                                    _ => {}
-                                }
-                            }
+                        if !sub.client_id.is_empty() && out_qos != QoS::AtMostOnce {
+                            let pending_publish = Publish {
+                                dup: false,
+                                qos: out_qos,
+                                retain: false,
+                                topic: will_publish.topic.clone(),
+                                packet_id: Some(pid),
+                                payload: will_publish.payload.clone(),
+                                properties: will_publish.properties.clone(),
+                            };
+                            will_cross_worker_pending.push((
+                                sub.client_id.clone(),
+                                pid,
+                                out_qos,
+                                pending_publish,
+                            ));
                         }
                     }
                 }
@@ -1938,6 +1964,24 @@ impl Worker {
                         will_hardlimit_count += 1;
                         last_will_hardlimit_sub =
                             Some((sub.handle.worker_id(), sub.handle.token()));
+                    }
+                }
+            }
+
+            // Batch write cross-worker pending for will messages
+            if !will_cross_worker_pending.is_empty() {
+                let mut sessions = self.shared.sessions.write();
+                for (client_id, pid, qos, pending_publish) in will_cross_worker_pending {
+                    if let Some(session) = sessions.get_mut(&*client_id) {
+                        match qos {
+                            QoS::AtLeastOnce => {
+                                session.pending_qos1.push((pid, pending_publish));
+                            }
+                            QoS::ExactlyOnce => {
+                                session.pending_qos2.push((pid, pending_publish));
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }

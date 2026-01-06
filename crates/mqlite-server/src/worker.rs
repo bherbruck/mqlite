@@ -141,6 +141,9 @@ pub struct Worker {
     /// Rate-limited subscriber backpressure logging (for cross-thread drops).
     subscriber_backpressure_log: RateLimitedCounter,
 
+    /// Rate-limited hard limit logging (for 16MB buffer exceeded).
+    hardlimit_log: RateLimitedCounter,
+
     /// Broker configuration.
     config: Arc<Config>,
 
@@ -183,6 +186,7 @@ impl Worker {
             },
             delayed_wills: Vec::new(),
             subscriber_backpressure_log: RateLimitedCounter::new(Duration::from_secs(10)),
+            hardlimit_log: RateLimitedCounter::new(Duration::from_secs(10)),
             auth: AuthProvider::from_config(&config),
             config,
         })
@@ -1490,6 +1494,8 @@ impl Worker {
         // subscriber_buf is already deduplicated by get_subscribers_cached
         let mut backpressure_count: u32 = 0;
         let mut last_backpressure_sub: Option<(usize, Token)> = None;
+        let mut hardlimit_count: u32 = 0;
+        let mut last_hardlimit_sub: Option<(usize, Token)> = None;
         for sub in &self.subscriber_buf {
             // MQTT-3.8.3.1-2: NoLocal - don't deliver to publishing client
             if sub.options.no_local && sub.token() == from_token && sub.worker_id() == self.id {
@@ -1638,6 +1644,11 @@ impl Worker {
                     last_backpressure_sub = Some((sub.handle.worker_id(), sub.handle.token()));
                     // Track dropped publish for $SYS metrics
                     self.shared.metrics.add_pub_msgs_dropped(1);
+                } else if e.kind() == std::io::ErrorKind::OutOfMemory {
+                    // Hard limit (16MB) exceeded - this is serious for QoS 1/2
+                    hardlimit_count += 1;
+                    last_hardlimit_sub = Some((sub.handle.worker_id(), sub.handle.token()));
+                    self.shared.metrics.add_pub_msgs_dropped(1);
                 }
             } else {
                 // Track successful publish sent for $SYS metrics
@@ -1654,7 +1665,24 @@ impl Worker {
             {
                 if let Some((worker_id, token)) = last_backpressure_sub {
                     log::warn!(
-                        "Backpressure: dropped {} messages to slow subscribers (last: worker={}, token={:?})",
+                        "Backpressure: dropped {} QoS 0 messages to slow subscribers (last: worker={}, token={:?})",
+                        count,
+                        worker_id,
+                        token
+                    );
+                }
+            }
+        }
+
+        // Log hard limit drops (more severe - affects QoS 1/2 guaranteed delivery)
+        if hardlimit_count > 0 {
+            if let Some(count) = self
+                .hardlimit_log
+                .increment_by(hardlimit_count as u64)
+            {
+                if let Some((worker_id, token)) = last_hardlimit_sub {
+                    log::error!(
+                        "HARD LIMIT: dropped {} messages (including QoS 1/2) - client buffer exceeded 16MB (worker={}, token={:?})",
                         count,
                         worker_id,
                         token
@@ -1822,6 +1850,8 @@ impl Worker {
             // subscriber_buf is already deduplicated by get_subscribers_cached
             let mut will_backpressure_count: u32 = 0;
             let mut last_will_backpressure_sub: Option<(usize, Token)> = None;
+            let mut will_hardlimit_count: u32 = 0;
+            let mut last_will_hardlimit_sub: Option<(usize, Token)> = None;
             for sub in &self.subscriber_buf {
                 let worker_id = sub.worker_id();
                 let sub_token = sub.token();
@@ -1895,7 +1925,7 @@ impl Worker {
                 }
 
                 // Direct write via handle (works for both local and cross-thread)
-                // Backpressure: drop on slow client (will messages are best-effort)
+                // Backpressure: drop on slow client (will messages are best-effort for QoS 0)
                 if let Err(e) = sub
                     .handle
                     .queue_publish(&mut factory, out_qos, packet_id, false)
@@ -1903,6 +1933,10 @@ impl Worker {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         will_backpressure_count += 1;
                         last_will_backpressure_sub =
+                            Some((sub.handle.worker_id(), sub.handle.token()));
+                    } else if e.kind() == std::io::ErrorKind::OutOfMemory {
+                        will_hardlimit_count += 1;
+                        last_will_hardlimit_sub =
                             Some((sub.handle.worker_id(), sub.handle.token()));
                     }
                 }
@@ -1916,7 +1950,24 @@ impl Worker {
                 {
                     if let Some((worker_id, token)) = last_will_backpressure_sub {
                         log::warn!(
-                            "Backpressure: dropped {} will messages to slow subscribers (last: worker={}, token={:?})",
+                            "Backpressure: dropped {} will messages (QoS 0) to slow subscribers (last: worker={}, token={:?})",
+                            count,
+                            worker_id,
+                            token
+                        );
+                    }
+                }
+            }
+
+            // Log accumulated will hard limit drops
+            if will_hardlimit_count > 0 {
+                if let Some(count) = self
+                    .hardlimit_log
+                    .increment_by(will_hardlimit_count as u64)
+                {
+                    if let Some((worker_id, token)) = last_will_hardlimit_sub {
+                        log::error!(
+                            "HARD LIMIT: dropped {} will messages (including QoS 1/2) - client buffer exceeded 16MB (worker={}, token={:?})",
                             count,
                             worker_id,
                             token
@@ -1974,6 +2025,8 @@ impl Worker {
 
             let mut delayed_backpressure_count: u32 = 0;
             let mut last_delayed_backpressure_sub: Option<(usize, Token)> = None;
+            let mut delayed_hardlimit_count: u32 = 0;
+            let mut last_delayed_hardlimit_sub: Option<(usize, Token)> = None;
             for sub in &self.subscriber_buf {
                 let worker_id = sub.worker_id();
                 let sub_token = sub.token();
@@ -2028,6 +2081,10 @@ impl Worker {
                         delayed_backpressure_count += 1;
                         last_delayed_backpressure_sub =
                             Some((sub.handle.worker_id(), sub.handle.token()));
+                    } else if e.kind() == std::io::ErrorKind::OutOfMemory {
+                        delayed_hardlimit_count += 1;
+                        last_delayed_hardlimit_sub =
+                            Some((sub.handle.worker_id(), sub.handle.token()));
                     }
                 }
             }
@@ -2040,7 +2097,24 @@ impl Worker {
                 {
                     if let Some((worker_id, token)) = last_delayed_backpressure_sub {
                         log::warn!(
-                            "Backpressure: dropped {} delayed will messages to slow subscribers (last: worker={}, token={:?})",
+                            "Backpressure: dropped {} delayed will messages (QoS 0) to slow subscribers (last: worker={}, token={:?})",
+                            count,
+                            worker_id,
+                            token
+                        );
+                    }
+                }
+            }
+
+            // Log accumulated delayed will hard limit drops
+            if delayed_hardlimit_count > 0 {
+                if let Some(count) = self
+                    .hardlimit_log
+                    .increment_by(delayed_hardlimit_count as u64)
+                {
+                    if let Some((worker_id, token)) = last_delayed_hardlimit_sub {
+                        log::error!(
+                            "HARD LIMIT: dropped {} delayed will messages (including QoS 1/2) - client buffer exceeded 16MB (worker={}, token={:?})",
                             count,
                             worker_id,
                             token

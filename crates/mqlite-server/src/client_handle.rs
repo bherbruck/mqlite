@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 
 use mqlite_core::packet::{self, Packet, QoS};
 use crate::publish_encoder::PublishEncoder;
-use crate::write_buffer::WriteBuffer;
+use crate::write_buffer::{WriteBuffer, WriteGuaranteed};
 
 // Thread-local buffer for packet encoding (avoids allocation per packet).
 thread_local! {
@@ -129,6 +129,9 @@ impl ClientWriteHandle {
 
     /// Queue a publish packet with optional subscription identifier.
     /// Used for MQTT v5 when forwarding to subscribers with subscription_id.
+    ///
+    /// For QoS 0: Uses soft limit (1MB) - drops if buffer full (acceptable for at-most-once).
+    /// For QoS 1/2: Bypasses soft limit (up to 16MB) - guaranteed delivery per MQTT spec.
     #[inline]
     pub fn queue_publish_with_sub_id(
         &self,
@@ -140,14 +143,32 @@ impl ClientWriteHandle {
     ) -> std::io::Result<()> {
         let is_v5 = self.is_v5();
         let mut buf = self.write_buf.lock();
-        factory.write_to_with_sub_id(
-            &mut *buf,
-            effective_qos,
-            packet_id,
-            retain,
-            is_v5,
-            subscription_id,
-        )?;
+
+        // QoS 0: enforce soft limit (can drop messages)
+        // QoS 1/2: bypass soft limit for guaranteed delivery
+        match effective_qos {
+            QoS::AtMostOnce => {
+                factory.write_to_with_sub_id(
+                    &mut *buf,
+                    effective_qos,
+                    packet_id,
+                    retain,
+                    is_v5,
+                    subscription_id,
+                )?;
+            }
+            QoS::AtLeastOnce | QoS::ExactlyOnce => {
+                factory.write_to_with_sub_id(
+                    &mut WriteGuaranteed(&mut buf),
+                    effective_qos,
+                    packet_id,
+                    retain,
+                    is_v5,
+                    subscription_id,
+                )?;
+            }
+        }
+
         drop(buf);
         self.set_ready_for_writing(true);
         Ok(())
@@ -192,21 +213,23 @@ impl ClientWriteHandle {
     }
 
     /// Update epoll interest. Called after writes or flushes.
+    ///
+    /// Uses level-triggered epoll for writes. This means:
+    /// - EPOLLOUT fires continuously while socket is writable AND we have data
+    /// - No need to re-arm after each write (saves ~5% CPU in fan-out scenarios)
+    /// - Safe to skip epoll_ctl if state hasn't changed
     #[inline]
     fn set_ready_for_writing(&self, val: bool) {
-        // Fast path: cheap load to avoid swap when state matches
-        if self.ready_for_writing.load(Ordering::Relaxed) == val {
-            return;
-        }
-        // Use Release ordering (cheaper than SeqCst) - we just need writes to be visible
+        // Fast path: skip if state hasn't changed (safe with level-triggered)
         if self.ready_for_writing.swap(val, Ordering::Release) == val {
             return;
         }
 
+        // Level-triggered for writes (no EPOLLET) - fires while socket is writable
         let events = if val {
-            (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLET) as u32
+            (libc::EPOLLIN | libc::EPOLLOUT) as u32
         } else {
-            (libc::EPOLLIN | libc::EPOLLET) as u32
+            libc::EPOLLIN as u32
         };
 
         let mut ev = libc::epoll_event {

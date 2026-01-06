@@ -72,7 +72,7 @@ conformance-ci: build-release $(CONFORMANCE_BIN) broker-start
 
 broker-start:
 	@echo "Starting broker..."
-	@./target/release/mqlite -b 127.0.0.1:1883 & echo $$! > /tmp/mqlite.pid
+	@./target/release/mqlite -c mqlite.toml & echo $$! > /tmp/mqlite.pid
 	@sleep 2
 	@echo "Broker started (PID: $$(cat /tmp/mqlite.pid))"
 
@@ -84,13 +84,13 @@ broker-stop:
 
 # Run the broker
 run:
-	cargo run -- -b 0.0.0.0:1883
+	cargo run -- -c mqlite.toml
 
 run-release:
-	cargo run --release -- -b 0.0.0.0:1883
+	cargo run --release -- -c mqlite.toml
 
 run-profiling:
-	cargo run --profile profiling -- -b 0.0.0.0:1883
+	cargo run --profile profiling -- -c mqlite.toml
 
 # Clean
 clean:
@@ -124,7 +124,7 @@ perf-top:
 
 heaptrack: build-profiling
 	@echo "Starting broker with heaptrack..."
-	heaptrack ./target/profiling/mqlite -b 0.0.0.0:1883
+	heaptrack ./target/profiling/mqlite -c mqlite.toml
 
 heaptrack-report:
 	@FILE=$$(ls -t heaptrack.mqlite.*.zst 2>/dev/null | head -1) && \

@@ -20,6 +20,7 @@ use crate::shared::SharedStateHandle;
 
 /// Bridge statistics for $SYS topics.
 #[derive(Default)]
+#[allow(dead_code)] // Fields are defined for future $SYS publishing
 pub struct BridgeStats {
     /// Whether the bridge is connected.
     pub connected: AtomicBool,
@@ -66,11 +67,13 @@ impl Bridge {
     }
 
     /// Get the bridge name.
+    #[allow(dead_code)] // Will be used for $SYS topic publishing
     pub fn name(&self) -> &str {
         &self.config.name
     }
 
     /// Signal the bridge to shutdown.
+    #[allow(dead_code)] // Will be used for graceful shutdown
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
     }
@@ -340,6 +343,7 @@ impl BridgeManager {
     }
 
     /// Get statistics for all bridges.
+    #[allow(dead_code)] // Will be used for $SYS topic publishing
     pub fn stats(&self) -> Vec<Arc<BridgeStats>> {
         self.bridges.iter().map(|(s, _)| s.clone()).collect()
     }

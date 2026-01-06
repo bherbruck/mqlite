@@ -523,6 +523,7 @@ pub struct BridgeTopic {
 
 /// Bridge configuration for connecting to a remote MQTT broker.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields for future bridge features (TLS, publish routing)
 pub struct BridgeConfig {
     /// Bridge name (used in $SYS/broker/bridge/<name>/...).
     pub name: String,

@@ -1,5 +1,8 @@
 //! mqlite - A high-performance MQTT broker.
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod auth;
 mod bridge;
 mod client;
@@ -100,7 +103,7 @@ fn main() {
     };
 
     // Build ID to verify Docker builds - change this when making fixes
-    const BUILD_ID: &str = "2026-01-06-pingresp-flush";
+    const BUILD_ID: &str = "2026-01-06-read-shrink";
 
     info!(
         "Starting mqlite [build={}] with {} worker threads (max_packet_size={}KB, max_inflight={})",

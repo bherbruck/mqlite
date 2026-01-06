@@ -109,6 +109,10 @@ pub struct PendingPublish {
 /// Initial buffer size (1KB as per spec).
 const INITIAL_BUFFER_SIZE: usize = 1024;
 
+/// Maximum read buffer size before considering shrink (16KB).
+/// Buffers larger than this will be shrunk when idle.
+const READ_BUFFER_SHRINK_THRESHOLD: usize = 16 * 1024;
+
 /// Client connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientState {
@@ -168,8 +172,15 @@ pub struct Client {
     pub backpressure_log: RateLimitedCounter,
 
     /// Read buffer for incoming data.
+    /// Data lives in read_buf[read_start..read_end]. We defer compaction
+    /// (shifting to front) until necessary to avoid memmove on every packet.
     read_buf: Vec<u8>,
-    read_pos: usize,
+    /// Start of unprocessed data in read_buf.
+    read_start: usize,
+    /// End of unprocessed data in read_buf (exclusive).
+    read_end: usize,
+    /// Primed for read buffer shrink (requires two consecutive eligible states).
+    read_buf_shrink_primed: bool,
 
     /// Shared write handle for cross-thread writes.
     /// Any thread can write to this handle, and it will update epoll directly.
@@ -212,7 +223,9 @@ impl Client {
             quota: QuotaTracker::new(65535), // Default per MQTT 5 spec
             backpressure_log: RateLimitedCounter::new(Duration::from_secs(10)),
             read_buf: vec![0u8; INITIAL_BUFFER_SIZE],
-            read_pos: 0,
+            read_start: 0,
+            read_end: 0,
+            read_buf_shrink_primed: false,
             handle,
         }
     }
@@ -237,17 +250,31 @@ impl Client {
     /// Returns Ok(true) if data was read, Ok(false) if would block.
     pub fn read(&mut self) -> Result<bool> {
         loop {
-            // Grow buffer if needed
-            if self.read_pos >= self.read_buf.len() {
-                let new_size = self.read_buf.len() * 2;
-                self.read_buf.resize(new_size, 0);
+            // Check if we need more space
+            if self.read_end >= self.read_buf.len() {
+                // First try to compact if there's significant wasted space at front
+                if self.read_start > self.read_buf.len() / 2 {
+                    self.compact_read_buffer();
+                } else {
+                    // Need to grow
+                    let data_len = self.read_end - self.read_start;
+                    let new_size = self.read_buf.len() * 2;
+
+                    // Compact while growing to avoid wasted space
+                    if self.read_start > 0 {
+                        self.read_buf.copy_within(self.read_start..self.read_end, 0);
+                        self.read_start = 0;
+                        self.read_end = data_len;
+                    }
+                    self.read_buf.resize(new_size, 0);
+                }
             }
 
-            match self.transport.read(&mut self.read_buf[self.read_pos..]) {
+            match self.transport.read(&mut self.read_buf[self.read_end..]) {
                 Ok(0) => {
                     // Connection closed - if there's data to process (e.g., DISCONNECT packet),
                     // return true so packets get processed. Otherwise mark as disconnecting.
-                    if self.read_pos > 0 {
+                    if self.read_end > self.read_start {
                         return Ok(true);
                     } else {
                         self.state = ClientState::Disconnecting;
@@ -255,29 +282,78 @@ impl Client {
                     }
                 }
                 Ok(n) => {
-                    self.read_pos += n;
+                    self.read_end += n;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok(self.read_pos > 0);
+                    return Ok(self.read_end > self.read_start);
                 }
                 Err(e) => return Err(e.into()),
             }
         }
     }
 
+    /// Compact read buffer by shifting data to front.
+    #[inline]
+    fn compact_read_buffer(&mut self) {
+        if self.read_start > 0 {
+            let data_len = self.read_end - self.read_start;
+            self.read_buf.copy_within(self.read_start..self.read_end, 0);
+            self.read_start = 0;
+            self.read_end = data_len;
+        }
+    }
+
+    /// Shrink oversized read buffer if it's been idle for two consecutive calls.
+    /// Call this periodically to reclaim memory from clients that received large packets.
+    ///
+    /// Uses hysteresis (two-tick debounce) to avoid allocation churn:
+    /// - Only acts when buffer is empty and larger than threshold
+    /// - Requires two consecutive calls while eligible before shrinking
+    /// - Any data in buffer or buffer below threshold resets the primed state
+    pub fn maybe_shrink_read_buffer(&mut self) {
+        // Only consider shrinking if buffer is empty and oversized
+        let is_empty = self.read_start == self.read_end;
+        let is_oversized = self.read_buf.len() > READ_BUFFER_SHRINK_THRESHOLD;
+
+        if !is_empty || !is_oversized {
+            self.read_buf_shrink_primed = false;
+            return;
+        }
+
+        // First time seeing eligible: prime for next time
+        if !self.read_buf_shrink_primed {
+            self.read_buf_shrink_primed = true;
+            return;
+        }
+
+        // Second consecutive eligible call: actually shrink
+        self.read_buf_shrink_primed = false;
+        self.read_buf = vec![0u8; INITIAL_BUFFER_SIZE];
+        self.read_start = 0;
+        self.read_end = 0;
+    }
+
     /// Try to decode the next packet from the read buffer.
     /// max_packet_size: Maximum allowed packet size (0 = no limit).
     pub fn decode_packet(&mut self, max_packet_size: u32) -> Result<Option<Packet>> {
-        if self.read_pos == 0 {
+        let data_len = self.read_end - self.read_start;
+        if data_len == 0 {
             return Ok(None);
         }
 
-        let data = &self.read_buf[..self.read_pos];
+        let data = &self.read_buf[self.read_start..self.read_end];
         match packet::decode_packet(data, self.protocol_version, max_packet_size)? {
             Some((packet, consumed)) => {
-                // Remove consumed bytes from buffer
-                self.read_buf.copy_within(consumed..self.read_pos, 0);
-                self.read_pos -= consumed;
+                // Advance start pointer instead of shifting buffer
+                // This avoids memmove on every packet - we only compact when needed
+                self.read_start += consumed;
+
+                // If buffer is now empty, reset pointers to avoid growing forever
+                if self.read_start == self.read_end {
+                    self.read_start = 0;
+                    self.read_end = 0;
+                }
+
                 Ok(Some(packet))
             }
             None => Ok(None),
@@ -380,18 +456,31 @@ impl Client {
             return;
         }
 
-        // Ensure buffer has enough capacity
-        let new_len = self.read_pos + data.len();
-        if new_len > self.read_buf.len() {
-            self.read_buf.resize(new_len, 0);
+        let existing_len = self.read_end - self.read_start;
+        let new_total = existing_len + data.len();
+
+        // Check if we can fit prepended data before read_start
+        if data.len() <= self.read_start {
+            // We have room at the front - just prepend
+            self.read_start -= data.len();
+            self.read_buf[self.read_start..self.read_start + data.len()].copy_from_slice(data);
+        } else {
+            // Need to compact and possibly grow
+            // First ensure capacity
+            if new_total > self.read_buf.len() {
+                self.read_buf.resize(new_total, 0);
+            }
+
+            // Shift existing data to make room at the front
+            if existing_len > 0 {
+                self.read_buf.copy_within(self.read_start..self.read_end, data.len());
+            }
+
+            // Copy new data to the front
+            self.read_buf[..data.len()].copy_from_slice(data);
+            self.read_start = 0;
+            self.read_end = new_total;
         }
-
-        // Shift existing data to make room at the front
-        self.read_buf.copy_within(0..self.read_pos, data.len());
-
-        // Copy new data to the front
-        self.read_buf[..data.len()].copy_from_slice(data);
-        self.read_pos = new_len;
     }
 }
 

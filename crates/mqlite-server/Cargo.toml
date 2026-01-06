@@ -54,3 +54,6 @@ rustls-pemfile = "2"
 
 # PROXY protocol
 ppp = "2"
+
+# Memory allocator
+tikv-jemallocator = "0.6"

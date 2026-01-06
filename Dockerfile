@@ -1,6 +1,6 @@
 # Local development build
 FROM rust:alpine AS builder
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev make
 WORKDIR /app
 
 # Copy workspace files

@@ -282,7 +282,7 @@ impl Worker {
         // Publish any delayed will messages that are ready
         self.publish_delayed_wills();
 
-        // Check keep-alive timeouts
+        // Check keep-alive timeouts and shrink idle read buffers
         let now = Instant::now();
         for (_token, client) in &mut self.clients {
             if client.keep_alive > 0 && client.state == ClientState::Connected {
@@ -291,6 +291,8 @@ impl Worker {
                     client.state = ClientState::Disconnecting;
                 }
             }
+            // Shrink oversized read buffers that have been idle
+            client.maybe_shrink_read_buffer();
         }
 
         Ok(())
@@ -1510,10 +1512,6 @@ impl Worker {
         let mut hardlimit_count: u32 = 0;
         let mut last_hardlimit_sub: Option<(usize, Token)> = None;
 
-        // Batch cross-worker pending messages to avoid lock contention
-        // (client_id, packet_id, qos, publish) - written to sessions after loop
-        let mut cross_worker_pending: Vec<(Arc<str>, u16, QoS, Publish)> = Vec::new();
-
         for sub in &self.subscriber_buf {
             // MQTT-3.8.3.1-2: NoLocal - don't deliver to publishing client
             if sub.options.no_local && sub.token() == from_token && sub.worker_id() == self.id {
@@ -1532,8 +1530,11 @@ impl Worker {
                 None
             };
 
-            // For local clients, track pending messages for QoS 1/2 retransmission
-            if worker_id == self.id {
+            // For local clients, check if disconnected or handle flow control
+            let is_local = worker_id == self.id;
+            let mut quota_consumed = false;
+
+            if is_local {
                 if !self.clients.contains_key(&sub_token) {
                     // Client disconnected - queue for offline delivery
                     // Use sub.client_id directly (token_to_client_id may already be cleaned up)
@@ -1575,55 +1576,7 @@ impl Worker {
                             last_backpressure_sub = Some((worker_id, sub_token));
                             continue;
                         }
-                    }
-                }
-
-                // Track pending for local clients
-                if let Some(pid) = packet_id {
-                    if let Some(client) = self.clients.get_mut(&sub_token) {
-                        let pending_publish = Publish {
-                            dup: false,
-                            qos: out_qos,
-                            retain: false,
-                            topic: publish.topic.clone(),
-                            packet_id: Some(pid),
-                            payload: publish.payload.clone(),
-                            properties: publish.properties.clone(),
-                        };
-                        let pending = PendingPublish {
-                            publish: pending_publish,
-                            sent_at: Instant::now(),
-                        };
-                        match out_qos {
-                            QoS::AtLeastOnce => {
-                                client.pending_qos1.insert(pid, pending);
-                            }
-                            QoS::ExactlyOnce => {
-                                client.pending_qos2.insert(pid, pending);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            } else {
-                // Cross-worker: collect pending for batch write later (avoid lock per subscriber)
-                if let Some(pid) = packet_id {
-                    if !sub.client_id.is_empty() && out_qos != QoS::AtMostOnce {
-                        let pending_publish = Publish {
-                            dup: false,
-                            qos: out_qos,
-                            retain: false,
-                            topic: publish.topic.clone(),
-                            packet_id: Some(pid),
-                            payload: publish.payload.clone(),
-                            properties: publish.properties.clone(),
-                        };
-                        cross_worker_pending.push((
-                            sub.client_id.clone(),
-                            pid,
-                            out_qos,
-                            pending_publish,
-                        ));
+                        quota_consumed = true;
                     }
                 }
             }
@@ -1633,7 +1586,7 @@ impl Worker {
             //
             // Backpressure policy: if WouldBlock, the client is slow.
             // QoS 0: drop (at-most-once, loss is acceptable)
-            // QoS 1/2: message is saved in session for retry on reconnect
+            // QoS 1/2: bypasses soft limit for guaranteed delivery
             //
             // MQTT-3.8.3-4: If Retain As Published is 1, preserve the RETAIN flag
             let out_retain = if sub.options.retain_as_published {
@@ -1642,45 +1595,70 @@ impl Worker {
                 false
             };
             // MQTT-3.8.2.1.2: Include subscription identifier if subscriber has one
-            if let Err(e) = sub.handle.queue_publish_with_sub_id(
+            let queue_result = sub.handle.queue_publish_with_sub_id(
                 &mut factory,
                 out_qos,
                 packet_id,
                 out_retain,
                 sub.subscription_id,
-            ) {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    // Track for rate-limited logging (can't call method due to borrow)
-                    backpressure_count += 1;
-                    last_backpressure_sub = Some((sub.handle.worker_id(), sub.handle.token()));
-                    // Track dropped publish for $SYS metrics
-                    self.shared.metrics.add_pub_msgs_dropped(1);
-                } else if e.kind() == std::io::ErrorKind::OutOfMemory {
-                    // Hard limit (16MB) exceeded - this is serious for QoS 1/2
-                    hardlimit_count += 1;
-                    last_hardlimit_sub = Some((sub.handle.worker_id(), sub.handle.token()));
-                    self.shared.metrics.add_pub_msgs_dropped(1);
-                }
-            } else {
-                // Track successful publish sent for $SYS metrics
-                self.shared.metrics.add_pub_msgs_sent(1);
-                self.shared.metrics.add_pub_bytes_sent(payload_len);
-            }
-        }
+            );
 
-        // Batch write cross-worker pending messages (one lock acquisition instead of N)
-        if !cross_worker_pending.is_empty() {
-            let mut sessions = self.shared.sessions.write();
-            for (client_id, pid, qos, pending_publish) in cross_worker_pending {
-                if let Some(session) = sessions.get_mut(&*client_id) {
-                    match qos {
-                        QoS::AtLeastOnce => {
-                            session.pending_qos1.push((pid, pending_publish));
+            match queue_result {
+                Ok(()) => {
+                    // Track successful publish sent for $SYS metrics
+                    self.shared.metrics.add_pub_msgs_sent(1);
+                    self.shared.metrics.add_pub_bytes_sent(payload_len);
+
+                    // Track pending for local clients ONLY after successful queue
+                    // This prevents memory leak when queue fails due to backpressure
+                    if is_local {
+                        if let Some(pid) = packet_id {
+                            if let Some(client) = self.clients.get_mut(&sub_token) {
+                                let pending_publish = Publish {
+                                    dup: false,
+                                    qos: out_qos,
+                                    retain: false,
+                                    topic: publish.topic.clone(),
+                                    packet_id: Some(pid),
+                                    payload: publish.payload.clone(),
+                                    properties: publish.properties.clone(),
+                                };
+                                let pending = PendingPublish {
+                                    publish: pending_publish,
+                                    sent_at: Instant::now(),
+                                };
+                                match out_qos {
+                                    QoS::AtLeastOnce => {
+                                        client.pending_qos1.insert(pid, pending);
+                                    }
+                                    QoS::ExactlyOnce => {
+                                        client.pending_qos2.insert(pid, pending);
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
-                        QoS::ExactlyOnce => {
-                            session.pending_qos2.push((pid, pending_publish));
+                    }
+                }
+                Err(e) => {
+                    // Restore quota if we consumed it but failed to send
+                    if quota_consumed {
+                        if let Some(client) = self.clients.get_mut(&sub_token) {
+                            client.restore_quota();
                         }
-                        _ => {}
+                    }
+
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        // Track for rate-limited logging (can't call method due to borrow)
+                        backpressure_count += 1;
+                        last_backpressure_sub = Some((sub.handle.worker_id(), sub.handle.token()));
+                        // Track dropped publish for $SYS metrics
+                        self.shared.metrics.add_pub_msgs_dropped(1);
+                    } else if e.kind() == std::io::ErrorKind::OutOfMemory {
+                        // Hard limit (16MB) exceeded - this is serious for QoS 1/2
+                        hardlimit_count += 1;
+                        last_hardlimit_sub = Some((sub.handle.worker_id(), sub.handle.token()));
+                        self.shared.metrics.add_pub_msgs_dropped(1);
                     }
                 }
             }
@@ -1881,8 +1859,6 @@ impl Worker {
             let mut last_will_backpressure_sub: Option<(usize, Token)> = None;
             let mut will_hardlimit_count: u32 = 0;
             let mut last_will_hardlimit_sub: Option<(usize, Token)> = None;
-            // Batch cross-worker pending for will messages
-            let mut will_cross_worker_pending: Vec<(Arc<str>, u16, QoS, Publish)> = Vec::new();
 
             for sub in &self.subscriber_buf {
                 let worker_id = sub.worker_id();
@@ -1899,88 +1875,56 @@ impl Worker {
                     None
                 };
 
-                // Track pending for local clients
-                if worker_id == self.id {
-                    if let Some(pid) = packet_id {
-                        if let Some(client) = self.clients.get_mut(&sub_token) {
-                            let pending_publish = Publish {
-                                dup: false,
-                                qos: out_qos,
-                                retain: false,
-                                topic: will_publish.topic.clone(),
-                                packet_id: Some(pid),
-                                payload: will_publish.payload.clone(),
-                                properties: will_publish.properties.clone(),
-                            };
-                            let pending = PendingPublish {
-                                publish: pending_publish,
-                                sent_at: Instant::now(),
-                            };
-                            match out_qos {
-                                QoS::AtLeastOnce => {
-                                    client.pending_qos1.insert(pid, pending);
-                                }
-                                QoS::ExactlyOnce => {
-                                    client.pending_qos2.insert(pid, pending);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                } else {
-                    // Cross-worker: collect pending for batch write later
-                    if let Some(pid) = packet_id {
-                        if !sub.client_id.is_empty() && out_qos != QoS::AtMostOnce {
-                            let pending_publish = Publish {
-                                dup: false,
-                                qos: out_qos,
-                                retain: false,
-                                topic: will_publish.topic.clone(),
-                                packet_id: Some(pid),
-                                payload: will_publish.payload.clone(),
-                                properties: will_publish.properties.clone(),
-                            };
-                            will_cross_worker_pending.push((
-                                sub.client_id.clone(),
-                                pid,
-                                out_qos,
-                                pending_publish,
-                            ));
-                        }
-                    }
-                }
+                let is_local = worker_id == self.id;
 
                 // Direct write via handle (works for both local and cross-thread)
                 // Backpressure: drop on slow client (will messages are best-effort for QoS 0)
-                if let Err(e) = sub
+                let queue_result = sub
                     .handle
-                    .queue_publish(&mut factory, out_qos, packet_id, false)
-                {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        will_backpressure_count += 1;
-                        last_will_backpressure_sub =
-                            Some((sub.handle.worker_id(), sub.handle.token()));
-                    } else if e.kind() == std::io::ErrorKind::OutOfMemory {
-                        will_hardlimit_count += 1;
-                        last_will_hardlimit_sub =
-                            Some((sub.handle.worker_id(), sub.handle.token()));
-                    }
-                }
-            }
+                    .queue_publish(&mut factory, out_qos, packet_id, false);
 
-            // Batch write cross-worker pending for will messages
-            if !will_cross_worker_pending.is_empty() {
-                let mut sessions = self.shared.sessions.write();
-                for (client_id, pid, qos, pending_publish) in will_cross_worker_pending {
-                    if let Some(session) = sessions.get_mut(&*client_id) {
-                        match qos {
-                            QoS::AtLeastOnce => {
-                                session.pending_qos1.push((pid, pending_publish));
+                match queue_result {
+                    Ok(()) => {
+                        // Track pending for local clients ONLY after successful queue
+                        // This prevents memory leak when queue fails due to backpressure
+                        if is_local {
+                            if let Some(pid) = packet_id {
+                                if let Some(client) = self.clients.get_mut(&sub_token) {
+                                    let pending_publish = Publish {
+                                        dup: false,
+                                        qos: out_qos,
+                                        retain: false,
+                                        topic: will_publish.topic.clone(),
+                                        packet_id: Some(pid),
+                                        payload: will_publish.payload.clone(),
+                                        properties: will_publish.properties.clone(),
+                                    };
+                                    let pending = PendingPublish {
+                                        publish: pending_publish,
+                                        sent_at: Instant::now(),
+                                    };
+                                    match out_qos {
+                                        QoS::AtLeastOnce => {
+                                            client.pending_qos1.insert(pid, pending);
+                                        }
+                                        QoS::ExactlyOnce => {
+                                            client.pending_qos2.insert(pid, pending);
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             }
-                            QoS::ExactlyOnce => {
-                                session.pending_qos2.push((pid, pending_publish));
-                            }
-                            _ => {}
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            will_backpressure_count += 1;
+                            last_will_backpressure_sub =
+                                Some((sub.handle.worker_id(), sub.handle.token()));
+                        } else if e.kind() == std::io::ErrorKind::OutOfMemory {
+                            will_hardlimit_count += 1;
+                            last_will_hardlimit_sub =
+                                Some((sub.handle.worker_id(), sub.handle.token()));
                         }
                     }
                 }
@@ -2086,49 +2030,56 @@ impl Worker {
                     None
                 };
 
-                // Track pending for local clients
-                if worker_id == self.id {
-                    if let Some(pid) = packet_id {
-                        if let Some(client) = self.clients.get_mut(&sub_token) {
-                            let pending_publish = Publish {
-                                dup: false,
-                                qos: out_qos,
-                                retain: false,
-                                topic: will_publish.topic.clone(),
-                                packet_id: Some(pid),
-                                payload: will_publish.payload.clone(),
-                                properties: will_publish.properties.clone(),
-                            };
-                            let pending = PendingPublish {
-                                publish: pending_publish,
-                                sent_at: now,
-                            };
-                            match out_qos {
-                                QoS::AtLeastOnce => {
-                                    client.pending_qos1.insert(pid, pending);
+                let is_local = worker_id == self.id;
+
+                // Direct write via handle
+                let queue_result = sub
+                    .handle
+                    .queue_publish(&mut factory, out_qos, packet_id, false);
+
+                match queue_result {
+                    Ok(()) => {
+                        // Track pending for local clients ONLY after successful queue
+                        // This prevents memory leak when queue fails due to backpressure
+                        if is_local {
+                            if let Some(pid) = packet_id {
+                                if let Some(client) = self.clients.get_mut(&sub_token) {
+                                    let pending_publish = Publish {
+                                        dup: false,
+                                        qos: out_qos,
+                                        retain: false,
+                                        topic: will_publish.topic.clone(),
+                                        packet_id: Some(pid),
+                                        payload: will_publish.payload.clone(),
+                                        properties: will_publish.properties.clone(),
+                                    };
+                                    let pending = PendingPublish {
+                                        publish: pending_publish,
+                                        sent_at: now,
+                                    };
+                                    match out_qos {
+                                        QoS::AtLeastOnce => {
+                                            client.pending_qos1.insert(pid, pending);
+                                        }
+                                        QoS::ExactlyOnce => {
+                                            client.pending_qos2.insert(pid, pending);
+                                        }
+                                        _ => {}
+                                    }
                                 }
-                                QoS::ExactlyOnce => {
-                                    client.pending_qos2.insert(pid, pending);
-                                }
-                                _ => {}
                             }
                         }
                     }
-                }
-
-                // Direct write via handle
-                if let Err(e) = sub
-                    .handle
-                    .queue_publish(&mut factory, out_qos, packet_id, false)
-                {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        delayed_backpressure_count += 1;
-                        last_delayed_backpressure_sub =
-                            Some((sub.handle.worker_id(), sub.handle.token()));
-                    } else if e.kind() == std::io::ErrorKind::OutOfMemory {
-                        delayed_hardlimit_count += 1;
-                        last_delayed_hardlimit_sub =
-                            Some((sub.handle.worker_id(), sub.handle.token()));
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            delayed_backpressure_count += 1;
+                            last_delayed_backpressure_sub =
+                                Some((sub.handle.worker_id(), sub.handle.token()));
+                        } else if e.kind() == std::io::ErrorKind::OutOfMemory {
+                            delayed_hardlimit_count += 1;
+                            last_delayed_hardlimit_sub =
+                                Some((sub.handle.worker_id(), sub.handle.token()));
+                        }
                     }
                 }
             }

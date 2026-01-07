@@ -149,6 +149,9 @@ pub struct Worker {
 
     /// Authentication and authorization provider.
     auth: AuthProvider,
+
+    /// Next packet ID for offline message delivery.
+    next_offline_packet_id: u16,
 }
 
 impl Worker {
@@ -189,6 +192,7 @@ impl Worker {
             hardlimit_log: RateLimitedCounter::new(Duration::from_secs(10)),
             auth: AuthProvider::from_config(&config),
             config,
+            next_offline_packet_id: 1,
         })
     }
 
@@ -747,15 +751,22 @@ impl Worker {
                         if let Some(existing_client) = self.clients.get_mut(&location.token) {
                             if !existing_client.clean_session {
                                 let mut sessions = self.shared.sessions.write();
-                                if let Some(session) = sessions.get_mut(&connect.client_id) {
-                                    for (pid, pending) in &existing_client.pending_qos1 {
-                                        session.pending_qos1.push((*pid, pending.publish.clone()));
-                                    }
-                                    for (pid, pending) in &existing_client.pending_qos2 {
-                                        session.pending_qos2.push((*pid, pending.publish.clone()));
-                                    }
-                                    session.takeover_complete = true;
+                                // Use entry().or_default() to create session if it doesn't exist
+                                // This handles the case where reconnect happens before cleanup runs
+                                let session = sessions.entry(connect.client_id.clone()).or_default();
+                                log::debug!(
+                                    "Same-worker takeover for {}: saving {} QoS1, {} QoS2 pending from old client",
+                                    connect.client_id,
+                                    existing_client.pending_qos1.len(),
+                                    existing_client.pending_qos2.len()
+                                );
+                                for (pid, pending) in &existing_client.pending_qos1 {
+                                    session.pending_qos1.push((*pid, pending.publish.clone()));
                                 }
+                                for (pid, pending) in &existing_client.pending_qos2 {
+                                    session.pending_qos2.push((*pid, pending.publish.clone()));
+                                }
+                                session.takeover_complete = true;
                             }
                             existing_client.state = ClientState::Disconnecting;
                         }
@@ -813,8 +824,8 @@ impl Worker {
 
             let mut sessions = self.shared.sessions.write();
             if let Some(session) = sessions.get_mut(&connect.client_id) {
-                // Clear last_connection since we're taking over
-                session.last_connection = None;
+                // Save last_connection for subscription cleanup (fallback when client_registry cleared)
+                let session_last_connection = session.last_connection.take();
                 // Reset takeover flag for next time
                 session.takeover_complete = true;
 
@@ -830,6 +841,12 @@ impl Worker {
                 let subs_to_restore: Vec<StoredSubscription> = session.subscriptions.clone();
 
                 // Collect pending messages, preserving original packet IDs [MQTT-4.5.0-1]
+                log::debug!(
+                    "Session restore for {}: {} QoS1, {} QoS2 pending",
+                    connect.client_id,
+                    session.pending_qos1.len(),
+                    session.pending_qos2.len()
+                );
                 for (pid, mut publish) in session.pending_qos1.drain(..) {
                     publish.dup = true;
                     publish.packet_id = Some(pid);
@@ -850,6 +867,10 @@ impl Worker {
                     // Remove using old_location from client takeover (most reliable)
                     if let Some(loc) = old_location {
                         subs.remove_client(loc.worker_id, loc.token);
+                    } else if let Some((old_worker, old_token)) = session_last_connection {
+                        // Fallback: use session.last_connection when client_registry was already cleared
+                        // (happens when client disconnected before reconnecting)
+                        subs.remove_client(old_worker, old_token);
                     }
 
                     // Also remove any local old tokens (same-worker reconnect without takeover)
@@ -1512,6 +1533,11 @@ impl Worker {
         let mut hardlimit_count: u32 = 0;
         let mut last_hardlimit_sub: Option<(usize, Token)> = None;
 
+        // Batch cross-worker pending messages to avoid lock contention
+        // (client_id, packet_id, qos, publish) - written to sessions after loop
+        // Only collected AFTER successful queue to prevent memory leak
+        let mut cross_worker_pending: Vec<(Arc<str>, u16, QoS, Publish)> = Vec::new();
+
         for sub in &self.subscriber_buf {
             // MQTT-3.8.3.1-2: NoLocal - don't deliver to publishing client
             if sub.options.no_local && sub.token() == from_token && sub.worker_id() == self.id {
@@ -1609,10 +1635,10 @@ impl Worker {
                     self.shared.metrics.add_pub_msgs_sent(1);
                     self.shared.metrics.add_pub_bytes_sent(payload_len);
 
-                    // Track pending for local clients ONLY after successful queue
-                    // This prevents memory leak when queue fails due to backpressure
-                    if is_local {
-                        if let Some(pid) = packet_id {
+                    // Track pending ONLY after successful queue to prevent memory leak
+                    if let Some(pid) = packet_id {
+                        if is_local {
+                            // Local client: track in client's pending map
                             if let Some(client) = self.clients.get_mut(&sub_token) {
                                 let pending_publish = Publish {
                                     dup: false,
@@ -1627,6 +1653,12 @@ impl Worker {
                                     publish: pending_publish,
                                     sent_at: Instant::now(),
                                 };
+                                log::debug!(
+                                    "Tracking pending {:?} pid={} for local client {:?}",
+                                    out_qos,
+                                    pid,
+                                    client.client_id
+                                );
                                 match out_qos {
                                     QoS::AtLeastOnce => {
                                         client.pending_qos1.insert(pid, pending);
@@ -1637,6 +1669,23 @@ impl Worker {
                                     _ => {}
                                 }
                             }
+                        } else if !sub.client_id.is_empty() && out_qos != QoS::AtMostOnce {
+                            // Cross-worker: collect for batch write to session
+                            let pending_publish = Publish {
+                                dup: false,
+                                qos: out_qos,
+                                retain: false,
+                                topic: publish.topic.clone(),
+                                packet_id: Some(pid),
+                                payload: publish.payload.clone(),
+                                properties: publish.properties.clone(),
+                            };
+                            cross_worker_pending.push((
+                                sub.client_id.clone(),
+                                pid,
+                                out_qos,
+                                pending_publish,
+                            ));
                         }
                     }
                 }
@@ -1698,6 +1747,80 @@ impl Worker {
             }
         }
 
+        // Batch write cross-worker pending messages (one lock acquisition instead of N)
+        if !cross_worker_pending.is_empty() {
+            let mut sessions = self.shared.sessions.write();
+            for (client_id, pid, qos, pending_publish) in cross_worker_pending {
+                if let Some(session) = sessions.get_mut(&*client_id) {
+                    match qos {
+                        QoS::AtLeastOnce => {
+                            session.pending_qos1.push((pid, pending_publish));
+                        }
+                        QoS::ExactlyOnce => {
+                            session.pending_qos2.push((pid, pending_publish));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Deliver to offline persistent sessions [MQTT-4.4.0-1]
+        // Sessions whose clients are disconnected still need to receive QoS 1/2 messages
+        if publish.qos != QoS::AtMostOnce {
+            let topic_str = std::str::from_utf8(&publish.topic).unwrap_or("");
+            let registry = self.shared.client_registry.read();
+            let mut sessions = self.shared.sessions.write();
+
+            for (client_id, session) in sessions.iter_mut() {
+                // Skip if client is currently online
+                if registry.contains_key(client_id) {
+                    continue;
+                }
+
+                // Check if any subscription matches this topic
+                for stored_sub in &session.subscriptions {
+                    if topic_matches_filter(topic_str, &stored_sub.topic_filter) {
+                        // Calculate effective QoS
+                        let effective_qos =
+                            std::cmp::min(publish.qos as u8, stored_sub.options.qos as u8);
+                        let out_qos = QoS::try_from(effective_qos).unwrap_or(QoS::AtMostOnce);
+
+                        if out_qos != QoS::AtMostOnce {
+                            // Allocate packet ID for offline delivery
+                            let pkt_id = self.next_offline_packet_id;
+                            self.next_offline_packet_id = self.next_offline_packet_id.wrapping_add(1);
+                            if self.next_offline_packet_id == 0 {
+                                self.next_offline_packet_id = 1;
+                            }
+
+                            let queued_publish = Publish {
+                                dup: false,
+                                qos: out_qos,
+                                retain: false,
+                                topic: publish.topic.clone(),
+                                packet_id: Some(pkt_id),
+                                payload: publish.payload.clone(),
+                                properties: publish.properties.clone(),
+                            };
+
+                            match out_qos {
+                                QoS::AtLeastOnce => {
+                                    session.pending_qos1.push((pkt_id, queued_publish));
+                                }
+                                QoS::ExactlyOnce => {
+                                    session.pending_qos2.push((pkt_id, queued_publish));
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Only queue once per session even if multiple subscriptions match
+                        break;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1729,11 +1852,10 @@ impl Worker {
                 self.token_to_handle.remove(&token);
                 self.token_to_client_id.remove(&token);
 
-                // Always remove subscriptions from the trie on disconnect.
+                // Always remove subscriptions from the trie on disconnect to free WriteBuffer memory.
                 // For persistent sessions, subscriptions are saved in Session.subscriptions
-                // and will be restored with the new handle when the client reconnects.
-                // This prevents dead handles from accumulating in the trie and receiving
-                // messages for disconnected clients.
+                // and offline message delivery is handled during publish routing by checking
+                // session subscriptions directly.
                 self.shared
                     .subscriptions
                     .write()
@@ -1779,6 +1901,12 @@ impl Worker {
                         }
                         // Always save pending messages - they might not have been
                         // transferred to session yet if this was a takeover
+                        log::debug!(
+                            "cleanup_clients for {}: saving {} QoS1, {} QoS2 pending",
+                            client_id,
+                            client.pending_qos1.len(),
+                            client.pending_qos2.len()
+                        );
                         for (pid, pending) in &client.pending_qos1 {
                             session.pending_qos1.push((*pid, pending.publish.clone()));
                         }
@@ -1859,6 +1987,7 @@ impl Worker {
             let mut last_will_backpressure_sub: Option<(usize, Token)> = None;
             let mut will_hardlimit_count: u32 = 0;
             let mut last_will_hardlimit_sub: Option<(usize, Token)> = None;
+            let mut will_cross_worker_pending: Vec<(Arc<str>, u16, QoS, Publish)> = Vec::new();
 
             for sub in &self.subscriber_buf {
                 let worker_id = sub.worker_id();
@@ -1885,10 +2014,9 @@ impl Worker {
 
                 match queue_result {
                     Ok(()) => {
-                        // Track pending for local clients ONLY after successful queue
-                        // This prevents memory leak when queue fails due to backpressure
-                        if is_local {
-                            if let Some(pid) = packet_id {
+                        // Track pending ONLY after successful queue to prevent memory leak
+                        if let Some(pid) = packet_id {
+                            if is_local {
                                 if let Some(client) = self.clients.get_mut(&sub_token) {
                                     let pending_publish = Publish {
                                         dup: false,
@@ -1913,6 +2041,22 @@ impl Worker {
                                         _ => {}
                                     }
                                 }
+                            } else if !sub.client_id.is_empty() && out_qos != QoS::AtMostOnce {
+                                let pending_publish = Publish {
+                                    dup: false,
+                                    qos: out_qos,
+                                    retain: false,
+                                    topic: will_publish.topic.clone(),
+                                    packet_id: Some(pid),
+                                    payload: will_publish.payload.clone(),
+                                    properties: will_publish.properties.clone(),
+                                };
+                                will_cross_worker_pending.push((
+                                    sub.client_id.clone(),
+                                    pid,
+                                    out_qos,
+                                    pending_publish,
+                                ));
                             }
                         }
                     }
@@ -1925,6 +2069,24 @@ impl Worker {
                             will_hardlimit_count += 1;
                             last_will_hardlimit_sub =
                                 Some((sub.handle.worker_id(), sub.handle.token()));
+                        }
+                    }
+                }
+            }
+
+            // Batch write cross-worker pending for will messages
+            if !will_cross_worker_pending.is_empty() {
+                let mut sessions = self.shared.sessions.write();
+                for (client_id, pid, qos, pending_publish) in will_cross_worker_pending {
+                    if let Some(session) = sessions.get_mut(&*client_id) {
+                        match qos {
+                            QoS::AtLeastOnce => {
+                                session.pending_qos1.push((pid, pending_publish));
+                            }
+                            QoS::ExactlyOnce => {
+                                session.pending_qos2.push((pid, pending_publish));
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -2015,6 +2177,8 @@ impl Worker {
             let mut last_delayed_backpressure_sub: Option<(usize, Token)> = None;
             let mut delayed_hardlimit_count: u32 = 0;
             let mut last_delayed_hardlimit_sub: Option<(usize, Token)> = None;
+            let mut delayed_cross_worker_pending: Vec<(Arc<str>, u16, QoS, Publish)> = Vec::new();
+
             for sub in &self.subscriber_buf {
                 let worker_id = sub.worker_id();
                 let sub_token = sub.token();
@@ -2039,10 +2203,9 @@ impl Worker {
 
                 match queue_result {
                     Ok(()) => {
-                        // Track pending for local clients ONLY after successful queue
-                        // This prevents memory leak when queue fails due to backpressure
-                        if is_local {
-                            if let Some(pid) = packet_id {
+                        // Track pending ONLY after successful queue to prevent memory leak
+                        if let Some(pid) = packet_id {
+                            if is_local {
                                 if let Some(client) = self.clients.get_mut(&sub_token) {
                                     let pending_publish = Publish {
                                         dup: false,
@@ -2067,6 +2230,22 @@ impl Worker {
                                         _ => {}
                                     }
                                 }
+                            } else if !sub.client_id.is_empty() && out_qos != QoS::AtMostOnce {
+                                let pending_publish = Publish {
+                                    dup: false,
+                                    qos: out_qos,
+                                    retain: false,
+                                    topic: will_publish.topic.clone(),
+                                    packet_id: Some(pid),
+                                    payload: will_publish.payload.clone(),
+                                    properties: will_publish.properties.clone(),
+                                };
+                                delayed_cross_worker_pending.push((
+                                    sub.client_id.clone(),
+                                    pid,
+                                    out_qos,
+                                    pending_publish,
+                                ));
                             }
                         }
                     }
@@ -2079,6 +2258,24 @@ impl Worker {
                             delayed_hardlimit_count += 1;
                             last_delayed_hardlimit_sub =
                                 Some((sub.handle.worker_id(), sub.handle.token()));
+                        }
+                    }
+                }
+            }
+
+            // Batch write cross-worker pending for delayed will messages
+            if !delayed_cross_worker_pending.is_empty() {
+                let mut sessions = self.shared.sessions.write();
+                for (client_id, pid, qos, pending_publish) in delayed_cross_worker_pending {
+                    if let Some(session) = sessions.get_mut(&*client_id) {
+                        match qos {
+                            QoS::AtLeastOnce => {
+                                session.pending_qos1.push((pid, pending_publish));
+                            }
+                            QoS::ExactlyOnce => {
+                                session.pending_qos2.push((pid, pending_publish));
+                            }
+                            _ => {}
                         }
                     }
                 }

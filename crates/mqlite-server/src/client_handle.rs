@@ -30,6 +30,9 @@ pub struct ClientWriteHandle {
     write_buf: Mutex<WriteBuffer>,
     /// Atomic flag to avoid redundant epoll_ctl calls.
     ready_for_writing: AtomicBool,
+    /// Count of consecutive empty flushes. Used to detect truly idle clients
+    /// and clear EPOLLOUT only after many cycles, avoiding race conditions under load.
+    idle_flush_count: AtomicU16,
     /// Atomic packet ID counter for cross-thread QoS allocation.
     next_packet_id: AtomicU16,
     /// MQTT protocol version (4=3.1.1, 5=5.0). Set after CONNECT.
@@ -50,6 +53,7 @@ impl ClientWriteHandle {
         Self {
             write_buf: Mutex::new(WriteBuffer::new()),
             ready_for_writing: AtomicBool::new(false),
+            idle_flush_count: AtomicU16::new(0),
             next_packet_id: AtomicU16::new(1),
             protocol_version: AtomicU8::new(4), // Default to 3.1.1
             epoll_fd,
@@ -196,19 +200,40 @@ impl ClientWriteHandle {
     /// Flush the write buffer to the socket. Called by owning worker only.
     /// Returns Ok(true) if all data was written, Ok(false) if would block.
     pub fn flush(&self, socket: &mut impl std::io::Write) -> std::io::Result<bool> {
+        // Threshold for clearing EPOLLOUT. Only clear after this many consecutive
+        // empty flushes to avoid race conditions under active load. Under fan-out,
+        // the counter resets every time data is queued, so we never clear.
+        // When truly idle, ~1000 wakeups is acceptable before clearing.
+        const IDLE_THRESHOLD: u16 = 1000;
+
         loop {
             // Lock and write directly from buffer - no temp copy needed
             // This is safe because only the owning worker calls flush()
             let mut buf = self.write_buf.lock();
+
             if buf.is_empty() {
-                // NOTE: We intentionally do NOT call set_ready_for_writing(false) here.
-                // Removing EPOLLOUT triggers epoll_ctl syscall, and with high fan-out
-                // (1500 subscribers), each write-flush cycle would cause 2 syscalls per
-                // client. Keeping EPOLLOUT set means poll() returns writable events for
-                // idle clients, but the empty check above is ~100ns vs ~1-5µs for syscall.
-                // This optimization reduces epoll_ctl calls by ~100x in fan-out scenarios.
+                // Buffer is empty. Instead of clearing EPOLLOUT immediately (which
+                // causes race conditions under load), count consecutive empty flushes.
+                // Only clear EPOLLOUT for truly idle clients.
+                let count = self.idle_flush_count.fetch_add(1, Ordering::Relaxed);
+                if count >= IDLE_THRESHOLD {
+                    // Client has been idle for many cycles, safe to clear EPOLLOUT
+                    self.idle_flush_count.store(0, Ordering::Relaxed);
+                    drop(buf);
+                    self.set_ready_for_writing(false);
+
+                    // Handle rare race: if data was queued during our epoll_ctl,
+                    // ensure EPOLLOUT is restored
+                    if !self.write_buf.lock().is_empty() {
+                        self.ready_for_writing.store(true, Ordering::Release);
+                        self.update_epoll(true);
+                    }
+                }
                 return Ok(true);
             }
+
+            // Data exists, reset idle counter
+            self.idle_flush_count.store(0, Ordering::Relaxed);
 
             // Use vectored I/O to handle wraparound in one syscall
             let slices = buf.as_io_slices();
@@ -242,13 +267,25 @@ impl ClientWriteHandle {
     /// - Safe to skip epoll_ctl if state hasn't changed
     #[inline]
     fn set_ready_for_writing(&self, val: bool) {
+        // When setting ready (data queued), reset the idle counter.
+        // This prevents clearing EPOLLOUT while client is actively receiving data.
+        if val {
+            self.idle_flush_count.store(0, Ordering::Relaxed);
+        }
+
         // Fast path: skip if state hasn't changed (safe with level-triggered)
         if self.ready_for_writing.swap(val, Ordering::Release) == val {
             return;
         }
 
+        self.update_epoll(val);
+    }
+
+    /// Unconditionally update epoll interest for EPOLLOUT.
+    #[inline]
+    fn update_epoll(&self, include_out: bool) {
         // Level-triggered for writes (no EPOLLET) - fires while socket is writable
-        let events = if val {
+        let events = if include_out {
             (libc::EPOLLIN | libc::EPOLLOUT) as u32
         } else {
             libc::EPOLLIN as u32
@@ -274,3 +311,124 @@ impl ClientWriteHandle {
 // Safety: The write buffer is mutex-protected, and epoll_ctl is thread-safe.
 unsafe impl Send for ClientWriteHandle {}
 unsafe impl Sync for ClientWriteHandle {}
+
+#[cfg(test)]
+impl ClientWriteHandle {
+    /// Test helper: check if EPOLLOUT would be set.
+    fn is_ready_for_writing(&self) -> bool {
+        self.ready_for_writing.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Write};
+
+    /// Mock writer that accepts all writes.
+    struct MockWriter;
+
+    impl Write for MockWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Mock writer that always returns WouldBlock.
+    struct WouldBlockWriter;
+
+    impl Write for WouldBlockWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "would block"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_vectored(&mut self, _bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "would block"))
+        }
+    }
+
+    fn make_test_handle() -> ClientWriteHandle {
+        // Use invalid fds - epoll_ctl will fail but we ignore return value
+        ClientWriteHandle::new(0, -1, -1, Token(1))
+    }
+
+    #[test]
+    fn test_ready_for_writing_set_after_queue() {
+        let handle = make_test_handle();
+        assert!(!handle.is_ready_for_writing(), "should start false");
+
+        let packet = Packet::Pingresp;
+        handle.queue_packet(&packet).unwrap();
+
+        assert!(handle.is_ready_for_writing(), "should be true after queue");
+    }
+
+    #[test]
+    fn test_ready_for_writing_not_cleared_immediately() {
+        let handle = make_test_handle();
+
+        // Queue a packet
+        let packet = Packet::Pingresp;
+        handle.queue_packet(&packet).unwrap();
+        assert!(handle.is_ready_for_writing());
+
+        // Flush writes data, buffer becomes empty
+        let mut writer = MockWriter;
+        let result = handle.flush(&mut writer).unwrap();
+        assert!(result, "flush should complete");
+
+        // ready_for_writing still true (threshold not reached)
+        // This is by design - we don't clear EPOLLOUT immediately to avoid
+        // race conditions under load. Only truly idle clients get cleared.
+        assert!(handle.is_ready_for_writing(),
+            "should still be true - threshold-based clearing");
+    }
+
+    #[test]
+    fn test_ready_for_writing_kept_on_wouldblock() {
+        let handle = make_test_handle();
+
+        // Queue a packet
+        let packet = Packet::Pingresp;
+        handle.queue_packet(&packet).unwrap();
+        assert!(handle.is_ready_for_writing());
+
+        // Try to flush but get WouldBlock
+        let mut writer = WouldBlockWriter;
+        let result = handle.flush(&mut writer).unwrap();
+        assert!(!result, "flush should return false on WouldBlock");
+
+        // ready_for_writing should stay true (data still pending)
+        assert!(handle.is_ready_for_writing(),
+            "should stay true when data pending");
+    }
+
+    #[test]
+    fn test_idle_counter_reset_by_queue() {
+        let handle = make_test_handle();
+
+        // Queue and flush a packet
+        let packet = Packet::Pingresp;
+        handle.queue_packet(&packet).unwrap();
+        let mut writer = MockWriter;
+        handle.flush(&mut writer).unwrap();
+
+        // Idle counter has started, ready_for_writing still true
+        assert!(handle.is_ready_for_writing());
+
+        // Queue another packet - this resets the idle counter
+        handle.queue_packet(&packet).unwrap();
+
+        // Another flush writes the new data
+        handle.flush(&mut writer).unwrap();
+
+        // Still true because idle counter was reset by queue_packet
+        assert!(handle.is_ready_for_writing(),
+            "should still be true - idle counter reset by queue");
+    }
+}

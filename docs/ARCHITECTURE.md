@@ -160,9 +160,10 @@ Per-connection state and buffer management.
 │ Fields:                                                       │
 │   socket: TcpStream             # Raw socket                 │
 │   state: ClientState            # State machine              │
-│   read_buf: BytesMut            # Input buffer               │
-│   pending_qos1: Vec<(u16, Publish)>   # Awaiting PUBACK     │
-│   pending_qos2: Vec<(u16, Publish)>   # Awaiting PUBCOMP    │
+│   read_buf: Vec<u8>             # Input buffer               │
+│   read_start/read_end: usize    # Data window (avoids copy)  │
+│   pending_qos1: HashMap<u16, Publish>   # Awaiting PUBACK   │
+│   pending_qos2: HashMap<u16, Publish>   # Awaiting PUBCOMP  │
 │   handle: Arc<ClientWriteHandle>      # For cross-thread    │
 │   keep_alive_secs: u16          # Timeout setting            │
 │   last_activity: Instant        # For timeout check          │
@@ -556,14 +557,19 @@ and transformation from TCP read to TCP write.
        │
        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ Client.read_buf (BytesMut)                                                  │
+│ Client.read_buf (Vec<u8> with read_start/read_end pointers)                 │
 │                                                                             │
-│ socket.read() appends bytes:                                                │
+│ socket.read() appends bytes at read_end:                                    │
 │ ┌───────────────────────────────────────────────────────────────┐          │
-│ │ 30 0E 00 04 74 65 73 74 68 65 6C 6C 6F 20 77 6F │ ← raw bytes │          │
-│ │ ▲                                                             │          │
-│ │ PUBLISH header                                                │          │
+│ │░░░░░░░│ 30 0E 00 04 74 65 73 74 68 65 6C 6C 6F │░░░░░░░░░░░░░│          │
+│ │       ▲ read_start                              ▲ read_end   │          │
+│ │       │ PUBLISH header + payload                │            │          │
 │ └───────────────────────────────────────────────────────────────┘          │
+│                                                                             │
+│ Pointer-based approach (avoids memmove on every packet):                   │
+│   • read_start advances after each decoded packet                          │
+│   • Compact only when: >50% wasted OR need to grow                         │
+│   • Shrink to 1KB when idle and >16KB (with 2-tick hysteresis)            │
 │                                                                             │
 │ decode_packet() parses:                                                     │
 │   • Fixed header: type=PUBLISH, flags=0x0, remaining_len=14                │
@@ -571,14 +577,7 @@ and transformation from TCP read to TCP write.
 │   • Payload: "hello world"                                                 │
 │                                                                             │
 │ Output: Packet::Publish { topic: Bytes, payload: Bytes, ... }              │
-│         ──────────────────┬─────────────────────────────────               │
-│                           │                                                 │
-│                           ▼                                                 │
-│         ┌─────────────────────────────────────────┐                        │
-│         │ Bytes (Arc<[u8]> + offset + len)        │                        │
-│         │ Points into original read_buf memory    │                        │
-│         │ NO COPY - just reference counting       │                        │
-│         └─────────────────────────────────────────┘                        │
+│         Topic/payload copied to Bytes for zero-copy fan-out                │
 └─────────────────────────────────────────────────────────────────────────────┘
        │
        │ Packet::Publish { topic, payload, qos, ... }
@@ -1214,11 +1213,13 @@ Memory Reuse in Worker:
 │ [x] Keep-alive timeout enforcement                           │
 │ [x] $ topic handling (MQTT-4.7.2-1)                         │
 │ [x] Pending message resend on reconnect                     │
+│ [x] MQTT v5 properties and features                         │
+│ [x] TLS/SSL (rustls)                                        │
+│ [x] PROXY protocol v1/v2 support                            │
+│ [x] Authentication (static users, ACLs)                     │
 │                                                               │
-│ [ ] MQTT v5 (not supported)                                  │
-│ [ ] TLS/SSL (not supported)                                  │
-│ [ ] Authentication (parsed but not validated)               │
 │ [ ] Message expiry                                           │
+│ [ ] Shared subscriptions                                     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -1296,3 +1297,5 @@ mqlite achieves high performance through:
 4. **Efficient I/O** - Vectored writes, epoll with debounced updates
 5. **Smart encoding** - QoS-based caching, stack allocation for small packets
 6. **Minimal contention** - Read-heavy locks, atomic operations where possible
+7. **jemalloc allocator** - Better memory return behavior than system allocator
+8. **Elastic buffers** - Read/write buffers grow under load, shrink when idle

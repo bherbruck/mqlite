@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use crate::packet::{Publish, QoS};
+use mqlite_core::packet::{Publish, QoS};
 use crate::shared::SharedStateHandle;
 use crate::subscription::Subscriber;
 

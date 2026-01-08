@@ -1,11 +1,39 @@
 //! mqlite - A high-performance MQTT broker.
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Configure jemalloc to return memory to OS faster during idle periods.
+/// Default dirty_decay_ms is 10000 (10s). We set it to 1000 (1s) for
+/// faster memory release when idle, with negligible performance impact.
+#[cfg(feature = "jemalloc")]
+fn configure_jemalloc() {
+    use tikv_jemalloc_ctl::raw;
+    // Set dirty page decay time to 1 second (default 10s)
+    // This returns unused memory to OS faster during idle periods
+    let decay_ms: isize = 1000;
+    // SAFETY: We're passing valid null-terminated strings and a valid isize value.
+    // These are standard jemalloc configuration options.
+    unsafe {
+        if let Err(e) = raw::write(b"arenas.dirty_decay_ms\0", decay_ms) {
+            eprintln!("Warning: failed to configure jemalloc dirty_decay_ms: {}", e);
+        }
+        // Also set muzzy decay (purged but still mapped pages)
+        if let Err(e) = raw::write(b"arenas.muzzy_decay_ms\0", decay_ms) {
+            eprintln!("Warning: failed to configure jemalloc muzzy_decay_ms: {}", e);
+        }
+    }
+}
+
+#[cfg(not(feature = "jemalloc"))]
+fn configure_jemalloc() {}
+
 mod auth;
+mod bridge;
 mod client;
 mod client_handle;
 mod config;
-mod error;
-mod packet;
 mod prometheus;
 mod proxy;
 mod publish_encoder;
@@ -75,6 +103,9 @@ fn parse_args() -> Args {
 }
 
 fn main() {
+    // Configure jemalloc memory decay (returns memory to OS faster when idle)
+    configure_jemalloc();
+
     // Parse CLI args first (only for config path and help)
     let args = parse_args();
 
@@ -100,8 +131,12 @@ fn main() {
         config.server.workers
     };
 
+    // Build ID to verify Docker builds - change this when making fixes
+    const BUILD_ID: &str = "2026-01-06-read-shrink";
+
     info!(
-        "Starting mqlite with {} worker threads (max_packet_size={}KB, max_inflight={})",
+        "Starting mqlite [build={}] with {} worker threads (max_packet_size={}KB, max_inflight={})",
+        BUILD_ID,
         num_workers,
         config.limits.max_packet_size / 1024,
         config.limits.max_inflight

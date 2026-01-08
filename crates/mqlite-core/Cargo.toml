@@ -1,0 +1,12 @@
+[package]
+name = "mqlite-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core MQTT types and utilities for mqlite"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

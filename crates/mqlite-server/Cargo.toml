@@ -1,0 +1,64 @@
+[package]
+name = "mqlite-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "High-performance MQTT broker"
+
+[[bin]]
+name = "mqlite"
+path = "src/main.rs"
+
+[dependencies]
+mqlite-core = { workspace = true }
+mqlite-client = { workspace = true }
+
+# Async I/O
+mio = { version = "1.0", features = ["net", "os-poll"] }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Data structures
+bytes = { workspace = true }
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+parking_lot = { workspace = true }
+ahash = "0.8"
+
+# System
+num_cpus = "1.16"
+libc = "0.2"
+
+# Logging
+log = { workspace = true }
+env_logger = "0.11"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+config = "0.15"
+regex = "1.11"
+
+# Authentication
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["std"] }
+
+# Utilities
+itoa = "1.0"
+
+# TLS
+rustls = "0.23"
+rustls-pemfile = "2"
+
+# PROXY protocol
+ppp = "2"
+
+# Memory allocator (disabled with --no-default-features for heap profiling)
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true }
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["tikv-jemallocator", "tikv-jemalloc-ctl"]

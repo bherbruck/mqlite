@@ -17,9 +17,11 @@ use mio::{Events, Interest, Poll, Token};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 
+use mqlite_core::error::{Error, Result};
+
+use crate::bridge::BridgeManager;
 use crate::client::Transport;
 use crate::config::Config;
-use crate::error::Result;
 use crate::prometheus;
 use crate::proxy;
 use crate::shared::SharedState;
@@ -95,7 +97,7 @@ impl Server {
     fn load_tls_config(config: &Config) -> Result<ServerConfig> {
         // Load certificate chain
         let cert_file = File::open(&config.tls.cert).map_err(|e| {
-            crate::error::Error::Io(io::Error::new(
+            Error::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
                     "Failed to open TLS certificate file {:?}: {}",
@@ -107,14 +109,14 @@ impl Server {
         let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| {
-                crate::error::Error::Io(io::Error::new(
+                Error::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("Failed to parse TLS certificate: {}", e),
                 ))
             })?;
 
         if certs.is_empty() {
-            return Err(crate::error::Error::Io(io::Error::new(
+            return Err(Error::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "No certificates found in certificate file",
             )));
@@ -122,7 +124,7 @@ impl Server {
 
         // Load private key
         let key_file = File::open(&config.tls.key).map_err(|e| {
-            crate::error::Error::Io(io::Error::new(
+            Error::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Failed to open TLS key file {:?}: {}", config.tls.key, e),
             ))
@@ -130,13 +132,13 @@ impl Server {
         let mut key_reader = BufReader::new(key_file);
         let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
             .map_err(|e| {
-                crate::error::Error::Io(io::Error::new(
+                Error::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("Failed to parse TLS private key: {}", e),
                 ))
             })?
             .ok_or_else(|| {
-                crate::error::Error::Io(io::Error::new(
+                Error::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "No private key found in key file",
                 ))
@@ -147,7 +149,7 @@ impl Server {
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| {
-                crate::error::Error::Io(io::Error::new(
+                Error::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("Failed to build TLS config: {}", e),
                 ))
@@ -183,6 +185,13 @@ impl Server {
             None
         };
         let mut last_sys_publish = Instant::now();
+
+        // Start bridge connections if configured
+        let mut _bridge_manager = BridgeManager::new();
+        if !self.config.bridge.is_empty() {
+            info!("Starting {} bridge connection(s)", self.config.bridge.len());
+            _bridge_manager.start_bridges(self.config.bridge.clone(), Arc::clone(&shared));
+        }
 
         // Create channels for all workers
         let mut receivers = Vec::with_capacity(self.num_workers);

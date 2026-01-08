@@ -28,16 +28,10 @@ build-profiling:
 	cargo build --profile profiling
 
 # Test targets (cargo tests)
-test: test-unit test-integration test-conformance
+test: test-unit
 
 test-unit:
-	cargo test --lib
-
-test-integration:
-	cargo test --test integration
-
-test-conformance:
-	cargo test --test conformance
+	cargo test --workspace
 
 # Install mqtt-conformance binary
 install-conformance: $(CONFORMANCE_BIN)
@@ -78,7 +72,7 @@ conformance-ci: build-release $(CONFORMANCE_BIN) broker-start
 
 broker-start:
 	@echo "Starting broker..."
-	@./target/release/mqlite -b 127.0.0.1:1883 & echo $$! > /tmp/mqlite.pid
+	@./target/release/mqlite -c mqlite.toml & echo $$! > /tmp/mqlite.pid
 	@sleep 2
 	@echo "Broker started (PID: $$(cat /tmp/mqlite.pid))"
 
@@ -90,13 +84,13 @@ broker-stop:
 
 # Run the broker
 run:
-	cargo run -- -b 0.0.0.0:1883
+	cargo run -- -c mqlite.toml
 
 run-release:
-	cargo run --release -- -b 0.0.0.0:1883
+	cargo run --release -- -c mqlite.toml
 
 run-profiling:
-	cargo run --profile profiling -- -b 0.0.0.0:1883
+	cargo run --profile profiling -- -c mqlite.toml
 
 # Clean
 clean:
@@ -128,17 +122,26 @@ perf-top:
 	if [ -z "$$PID" ]; then echo "Error: mqlite not running"; exit 1; fi && \
 	sudo perf top -p $$PID
 
-heaptrack: build-profiling
+heaptrack:
+	@echo "Building without jemalloc for heap profiling..."
+	cargo build --profile profiling --no-default-features -p mqlite-server
 	@echo "Starting broker with heaptrack..."
-	heaptrack ./target/profiling/mqlite -b 0.0.0.0:1883
+	heaptrack ./target/profiling/mqlite -c mqlite.toml
 
 heaptrack-report:
 	@FILE=$$(ls -t heaptrack.mqlite.*.zst 2>/dev/null | head -1) && \
 	if [ -z "$$FILE" ]; then echo "No heaptrack files found"; exit 1; fi && \
 	echo "Analyzing $$FILE..." && \
+	echo "" && \
+	echo "=== Peak memory contributors ===" && \
 	heaptrack_print --print-peak 1 "$$FILE" 2>/dev/null | \
 	  perl -0777 -ne 'while (/(\d+) calls with ([\d.]+[KMG]?B?) peak.*?mqlite::(\S+?)(?:::h[a-f0-9]+)?\s/gs) { print "$$2\t$$1 calls\t$$3\n" }' | \
-	  sort -hr | head -20
+	  sort -hr | head -15 && \
+	echo "" && \
+	echo "=== Allocation churn (temporary allocs) ===" && \
+	heaptrack_print --print-temporary 1 "$$FILE" 2>/dev/null | \
+	  perl -0777 -ne 'while (/(\d+) calls with ([\d.]+[KMG]?B?).*?mqlite::(\S+?)(?:::h[a-f0-9]+)?\s/gs) { print "$$2\t$$1 calls\t$$3\n" }' | \
+	  sort -hr | head -15
 
 # Help
 help:
@@ -152,8 +155,6 @@ help:
 	@echo "Test targets (cargo tests):"
 	@echo "  test           - Run all cargo tests"
 	@echo "  test-unit      - Run unit tests"
-	@echo "  test-integration - Run integration tests"
-	@echo "  test-conformance - Run conformance tests"
 	@echo ""
 	@echo "External conformance tests (requires running broker):"
 	@echo "  conformance    - Run all conformance tests (v3 + v5)"

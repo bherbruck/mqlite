@@ -84,9 +84,11 @@ impl Client {
         let mut stream = TcpStream::from_std(std_stream);
 
         // Register with poll
-        self.poll
-            .registry()
-            .register(&mut stream, CLIENT, Interest::READABLE | Interest::WRITABLE)?;
+        self.poll.registry().register(
+            &mut stream,
+            CLIENT,
+            Interest::READABLE | Interest::WRITABLE,
+        )?;
 
         self.stream = Some(stream);
         self.state = ConnectionState::Connecting;
@@ -181,7 +183,10 @@ impl Client {
     ///     }),
     /// ])?;
     /// ```
-    pub fn subscribe_with_options(&mut self, topics: &[(&str, SubscriptionOptions)]) -> Result<u16> {
+    pub fn subscribe_with_options(
+        &mut self,
+        topics: &[(&str, SubscriptionOptions)],
+    ) -> Result<u16> {
         if self.state != ConnectionState::Connected {
             return Err(ClientError::NotConnected);
         }
@@ -382,21 +387,18 @@ impl Client {
             Packet::Connack(connack) => self.handle_connack(connack),
             Packet::Publish(publish) => self.handle_publish(publish),
             Packet::Puback { packet_id } => {
-                self.events
-                    .push_back(ClientEvent::PubAck { packet_id });
+                self.events.push_back(ClientEvent::PubAck { packet_id });
                 Ok(())
             }
             Packet::Pubrec { packet_id } => {
                 // QoS 2: respond with PUBREL
                 let pubrel = Packet::Pubrel { packet_id };
                 encode_pubrel_packet(&pubrel, &mut self.write_buf);
-                self.events
-                    .push_back(ClientEvent::PubRec { packet_id });
+                self.events.push_back(ClientEvent::PubRec { packet_id });
                 Ok(())
             }
             Packet::Pubcomp { packet_id } => {
-                self.events
-                    .push_back(ClientEvent::PubComp { packet_id });
+                self.events.push_back(ClientEvent::PubComp { packet_id });
                 Ok(())
             }
             Packet::Suback(suback) => self.handle_suback(suback),
@@ -408,8 +410,7 @@ impl Client {
             Packet::Disconnect { reason_code } => {
                 let reason = Some(format!("Disconnect reason: {}", reason_code));
                 self.cleanup();
-                self.events
-                    .push_back(ClientEvent::Disconnected { reason });
+                self.events.push_back(ClientEvent::Disconnected { reason });
                 Ok(())
             }
             _ => Ok(()), // Ignore unexpected packets

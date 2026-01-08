@@ -104,7 +104,11 @@ impl Bridge {
                 address: self.config.address.clone(),
                 client_id: format!("{}-{}", self.config.clientid_prefix, self.config.name),
                 username: self.config.remote_username.clone(),
-                password: self.config.remote_password.as_ref().map(|p| p.as_bytes().to_vec()),
+                password: self
+                    .config
+                    .remote_password
+                    .as_ref()
+                    .map(|p| p.as_bytes().to_vec()),
                 keep_alive: self.config.keepalive,
                 clean_session: self.config.clean_start,
                 protocol_version: match self.config.protocol_version {
@@ -190,10 +194,7 @@ impl Bridge {
                                 .collect();
 
                             if let Err(e) = client.subscribe(&topics) {
-                                warn!(
-                                    "Bridge '{}' subscribe failed: {}",
-                                    self.config.name, e
-                                );
+                                warn!("Bridge '{}' subscribe failed: {}", self.config.name, e);
                             }
                         }
 
@@ -240,19 +241,16 @@ impl Bridge {
                         retain,
                         ..
                     } => {
-                        self.handle_remote_message(
-                            topic,
-                            payload,
-                            qos,
-                            retain,
-                            subscriber_buf,
-                        );
+                        self.handle_remote_message(topic, payload, qos, retain, subscriber_buf);
                     }
                     ClientEvent::Disconnected { reason } => {
                         self.stats.connected.store(false, Ordering::Relaxed);
                         return Err(reason.unwrap_or_else(|| "Disconnected".to_string()));
                     }
-                    ClientEvent::SubAck { packet_id, return_codes } => {
+                    ClientEvent::SubAck {
+                        packet_id,
+                        return_codes,
+                    } => {
                         debug!(
                             "Bridge '{}' suback packet_id={} codes={:?}",
                             self.config.name, packet_id, return_codes

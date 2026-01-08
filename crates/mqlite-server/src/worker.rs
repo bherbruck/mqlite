@@ -592,7 +592,12 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&token) {
                     // PUBREL is critical for QoS 2 flow - use guaranteed write
                     if let Err(e) = client.queue_control_packet(&Packet::Pubrel { packet_id }) {
-                        log::warn!("Failed to queue PUBREL for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
+                        log::warn!(
+                            "Failed to queue PUBREL for client {:?} packet_id={}: {}",
+                            client.client_id,
+                            packet_id,
+                            e
+                        );
                     }
                 }
             }
@@ -601,7 +606,12 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&token) {
                     // PUBCOMP is critical for QoS 2 flow - use guaranteed write
                     if let Err(e) = client.queue_control_packet(&Packet::Pubcomp { packet_id }) {
-                        log::warn!("Failed to queue PUBCOMP for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
+                        log::warn!(
+                            "Failed to queue PUBCOMP for client {:?} packet_id={}: {}",
+                            client.client_id,
+                            packet_id,
+                            e
+                        );
                     }
                 }
             }
@@ -632,7 +642,11 @@ impl Worker {
                 if let Some(client) = self.clients.get_mut(&token) {
                     // PINGRESP is critical - client will disconnect if not received
                     if let Err(e) = client.queue_control_packet(&Packet::Pingresp) {
-                        log::warn!("Failed to queue PINGRESP for client {:?}: {}", client.client_id, e);
+                        log::warn!(
+                            "Failed to queue PINGRESP for client {:?}: {}",
+                            client.client_id,
+                            e
+                        );
                     }
                     // Flush immediately - don't wait for next poll() cycle
                     // This ensures PINGRESP goes out ASAP even if worker is busy with fan-out
@@ -765,7 +779,8 @@ impl Worker {
                                 let mut sessions = self.shared.sessions.write();
                                 // Use entry().or_default() to create session if it doesn't exist
                                 // This handles the case where reconnect happens before cleanup runs
-                                let session = sessions.entry(connect.client_id.clone()).or_default();
+                                let session =
+                                    sessions.entry(connect.client_id.clone()).or_default();
                                 log::debug!(
                                     "Same-worker takeover for {}: saving {} QoS1, {} QoS2 pending from old client",
                                     connect.client_id,
@@ -1036,7 +1051,11 @@ impl Worker {
         };
         // CONNACK is critical - client waiting for connection confirmation
         if let Err(e) = client.queue_control_packet(&Packet::Connack(connack)) {
-            log::warn!("Failed to queue CONNACK for client {:?}: {}", client.client_id, e);
+            log::warn!(
+                "Failed to queue CONNACK for client {:?}: {}",
+                client.client_id,
+                e
+            );
         }
 
         // Re-send pending messages from previous session
@@ -1091,7 +1110,11 @@ impl Worker {
                 };
                 // SUBACK is critical - client waiting for subscription confirmation
                 if let Err(e) = client.queue_control_packet(&Packet::Suback(suback)) {
-                    log::warn!("Failed to queue SUBACK for client {:?}: {}", client.client_id, e);
+                    log::warn!(
+                        "Failed to queue SUBACK for client {:?}: {}",
+                        client.client_id,
+                        e
+                    );
                 }
             }
             return Ok(());
@@ -1248,7 +1271,11 @@ impl Worker {
             };
             // SUBACK is critical - client waiting for subscription confirmation
             if let Err(e) = client.queue_control_packet(&Packet::Suback(suback)) {
-                log::warn!("Failed to queue SUBACK for client {:?}: {}", client.client_id, e);
+                log::warn!(
+                    "Failed to queue SUBACK for client {:?}: {}",
+                    client.client_id,
+                    e
+                );
             }
         }
 
@@ -1367,7 +1394,11 @@ impl Worker {
                 reason_codes,
                 is_v5,
             })) {
-                log::warn!("Failed to queue UNSUBACK for client {:?}: {}", client.client_id, e);
+                log::warn!(
+                    "Failed to queue UNSUBACK for client {:?}: {}",
+                    client.client_id,
+                    e
+                );
             }
         }
 
@@ -1456,8 +1487,15 @@ impl Worker {
                         if let Some(client) = self.clients.get_mut(&from_token) {
                             // TODO: Add reason_code support to Puback packet
                             // For now, just send regular PUBACK (client may retry)
-                            if let Err(e) = client.queue_control_packet(&Packet::Puback { packet_id }) {
-                                log::warn!("Failed to queue PUBACK for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
+                            if let Err(e) =
+                                client.queue_control_packet(&Packet::Puback { packet_id })
+                            {
+                                log::warn!(
+                                    "Failed to queue PUBACK for client {:?} packet_id={}: {}",
+                                    client.client_id,
+                                    packet_id,
+                                    e
+                                );
                             }
                         }
                     }
@@ -1466,8 +1504,15 @@ impl Worker {
                     if let Some(packet_id) = publish.packet_id {
                         if let Some(client) = self.clients.get_mut(&from_token) {
                             // TODO: Add reason_code support to Pubrec packet
-                            if let Err(e) = client.queue_control_packet(&Packet::Pubrec { packet_id }) {
-                                log::warn!("Failed to queue PUBREC for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
+                            if let Err(e) =
+                                client.queue_control_packet(&Packet::Pubrec { packet_id })
+                            {
+                                log::warn!(
+                                    "Failed to queue PUBREC for client {:?} packet_id={}: {}",
+                                    client.client_id,
+                                    packet_id,
+                                    e
+                                );
                             }
                         }
                     }
@@ -1482,7 +1527,12 @@ impl Worker {
             if let Some(packet_id) = publish.packet_id {
                 if let Some(client) = self.clients.get_mut(&from_token) {
                     if let Err(e) = client.queue_control_packet(&Packet::Puback { packet_id }) {
-                        log::warn!("Failed to queue PUBACK for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
+                        log::warn!(
+                            "Failed to queue PUBACK for client {:?} packet_id={}: {}",
+                            client.client_id,
+                            packet_id,
+                            e
+                        );
                     }
                 }
             }
@@ -1491,7 +1541,12 @@ impl Worker {
             if let Some(packet_id) = publish.packet_id {
                 if let Some(client) = self.clients.get_mut(&from_token) {
                     if let Err(e) = client.queue_control_packet(&Packet::Pubrec { packet_id }) {
-                        log::warn!("Failed to queue PUBREC for client {:?} packet_id={}: {}", client.client_id, packet_id, e);
+                        log::warn!(
+                            "Failed to queue PUBREC for client {:?} packet_id={}: {}",
+                            client.client_id,
+                            packet_id,
+                            e
+                        );
                     }
                 }
             }
@@ -1744,10 +1799,7 @@ impl Worker {
 
         // Log hard limit drops (more severe - affects QoS 1/2 guaranteed delivery)
         if hardlimit_count > 0 {
-            if let Some(count) = self
-                .hardlimit_log
-                .increment_by(hardlimit_count as u64)
-            {
+            if let Some(count) = self.hardlimit_log.increment_by(hardlimit_count as u64) {
                 if let Some((worker_id, token)) = last_hardlimit_sub {
                     log::error!(
                         "HARD LIMIT: dropped {} messages (including QoS 1/2) - client buffer exceeded 16MB (worker={}, token={:?})",
@@ -1801,7 +1853,8 @@ impl Worker {
                         if out_qos != QoS::AtMostOnce {
                             // Allocate packet ID for offline delivery
                             let pkt_id = self.next_offline_packet_id;
-                            self.next_offline_packet_id = self.next_offline_packet_id.wrapping_add(1);
+                            self.next_offline_packet_id =
+                                self.next_offline_packet_id.wrapping_add(1);
                             if self.next_offline_packet_id == 0 {
                                 self.next_offline_packet_id = 1;
                             }
@@ -2020,9 +2073,9 @@ impl Worker {
 
                 // Direct write via handle (works for both local and cross-thread)
                 // Backpressure: drop on slow client (will messages are best-effort for QoS 0)
-                let queue_result = sub
-                    .handle
-                    .queue_publish(&mut factory, out_qos, packet_id, false);
+                let queue_result =
+                    sub.handle
+                        .queue_publish(&mut factory, out_qos, packet_id, false);
 
                 match queue_result {
                     Ok(()) => {
@@ -2123,10 +2176,7 @@ impl Worker {
 
             // Log accumulated will hard limit drops
             if will_hardlimit_count > 0 {
-                if let Some(count) = self
-                    .hardlimit_log
-                    .increment_by(will_hardlimit_count as u64)
-                {
+                if let Some(count) = self.hardlimit_log.increment_by(will_hardlimit_count as u64) {
                     if let Some((worker_id, token)) = last_will_hardlimit_sub {
                         log::error!(
                             "HARD LIMIT: dropped {} will messages (including QoS 1/2) - client buffer exceeded 16MB (worker={}, token={:?})",
@@ -2209,9 +2259,9 @@ impl Worker {
                 let is_local = worker_id == self.id;
 
                 // Direct write via handle
-                let queue_result = sub
-                    .handle
-                    .queue_publish(&mut factory, out_qos, packet_id, false);
+                let queue_result =
+                    sub.handle
+                        .queue_publish(&mut factory, out_qos, packet_id, false);
 
                 match queue_result {
                     Ok(()) => {

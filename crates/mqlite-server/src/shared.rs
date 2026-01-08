@@ -15,10 +15,10 @@ use parking_lot::RwLock;
 
 use mio::Token;
 
-use mqlite_core::packet::{Publish, QoS, SubscriptionOptions};
 use crate::publish_encoder::PublishEncoder;
 use crate::subscription::{Subscriber, SubscriptionStore};
 use crate::sys_tree::BrokerMetrics;
+use mqlite_core::packet::{Publish, QoS, SubscriptionOptions};
 
 /// A retained message with timestamp for expiry countdown.
 #[derive(Debug, Clone)]

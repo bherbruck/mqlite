@@ -10,9 +10,9 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use mqlite_core::packet::{Publish, QoS};
 use crate::shared::SharedStateHandle;
 use crate::subscription::Subscriber;
+use mqlite_core::packet::{Publish, QoS};
 
 /// Static topic string constants - zero allocation via Bytes::from_static().
 pub mod topics {
@@ -809,7 +809,12 @@ impl SysTreePublisher {
 
     /// Publish as retained and fan out to $SYS/# subscribers.
     /// Uses internal_publish for proper retain flag handling.
-    fn publish_retained_and_fanout(&mut self, _topic_str: &str, topic_bytes: Bytes, payload: Bytes) {
+    fn publish_retained_and_fanout(
+        &mut self,
+        _topic_str: &str,
+        topic_bytes: Bytes,
+        payload: Bytes,
+    ) {
         let publish = Publish {
             dup: false,
             qos: QoS::AtMostOnce,

@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use mio::Token;
 use parking_lot::Mutex;
 
-use mqlite_core::packet::{self, Packet, QoS};
 use crate::publish_encoder::PublishEncoder;
 use crate::write_buffer::{WriteBuffer, WriteGuaranteed};
+use mqlite_core::packet::{self, Packet, QoS};
 
 // Thread-local buffer for packet encoding (avoids allocation per packet).
 thread_local! {
@@ -392,8 +392,10 @@ mod tests {
         // ready_for_writing still true (threshold not reached)
         // This is by design - we don't clear EPOLLOUT immediately to avoid
         // race conditions under load. Only truly idle clients get cleared.
-        assert!(handle.is_ready_for_writing(),
-            "should still be true - threshold-based clearing");
+        assert!(
+            handle.is_ready_for_writing(),
+            "should still be true - threshold-based clearing"
+        );
     }
 
     #[test]
@@ -411,8 +413,10 @@ mod tests {
         assert!(!result, "flush should return false on WouldBlock");
 
         // ready_for_writing should stay true (data still pending)
-        assert!(handle.is_ready_for_writing(),
-            "should stay true when data pending");
+        assert!(
+            handle.is_ready_for_writing(),
+            "should stay true when data pending"
+        );
     }
 
     #[test]
@@ -435,7 +439,9 @@ mod tests {
         handle.flush(&mut writer).unwrap();
 
         // Still true because idle counter was reset by queue_packet
-        assert!(handle.is_ready_for_writing(),
-            "should still be true - idle counter reset by queue");
+        assert!(
+            handle.is_ready_for_writing(),
+            "should still be true - idle counter reset by queue"
+        );
     }
 }

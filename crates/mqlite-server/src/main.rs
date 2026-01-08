@@ -17,11 +17,17 @@ fn configure_jemalloc() {
     // These are standard jemalloc configuration options.
     unsafe {
         if let Err(e) = raw::write(b"arenas.dirty_decay_ms\0", decay_ms) {
-            eprintln!("Warning: failed to configure jemalloc dirty_decay_ms: {}", e);
+            eprintln!(
+                "Warning: failed to configure jemalloc dirty_decay_ms: {}",
+                e
+            );
         }
         // Also set muzzy decay (purged but still mapped pages)
         if let Err(e) = raw::write(b"arenas.muzzy_decay_ms\0", decay_ms) {
-            eprintln!("Warning: failed to configure jemalloc muzzy_decay_ms: {}", e);
+            eprintln!(
+                "Warning: failed to configure jemalloc muzzy_decay_ms: {}",
+                e
+            );
         }
     }
 }

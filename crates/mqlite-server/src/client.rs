@@ -474,7 +474,8 @@ impl Client {
 
             // Shift existing data to make room at the front
             if existing_len > 0 {
-                self.read_buf.copy_within(self.read_start..self.read_end, data.len());
+                self.read_buf
+                    .copy_within(self.read_start..self.read_end, data.len());
             }
 
             // Copy new data to the front

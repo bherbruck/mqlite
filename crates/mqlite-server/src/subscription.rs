@@ -422,8 +422,9 @@ pub fn topic_matches_filter(topic: &str, filter: &str) -> bool {
 
     // MQTT-4.7.2-1: Topics starting with $ are not matched by wildcards at root level
     let topic_starts_with_dollar = topic_levels.first().is_some_and(|l| l.starts_with('$'));
-    let filter_starts_with_wildcard =
-        filter_levels.first().is_some_and(|l| *l == "#" || *l == "+");
+    let filter_starts_with_wildcard = filter_levels
+        .first()
+        .is_some_and(|l| *l == "#" || *l == "+");
 
     if topic_starts_with_dollar && filter_starts_with_wildcard {
         return false;

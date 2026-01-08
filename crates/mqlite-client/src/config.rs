@@ -54,7 +54,11 @@ impl ClientConfig {
     }
 
     /// Set username and password.
-    pub fn credentials(mut self, username: impl Into<String>, password: impl Into<Vec<u8>>) -> Self {
+    pub fn credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<Vec<u8>>,
+    ) -> Self {
         self.username = Some(username.into());
         self.password = Some(password.into());
         self

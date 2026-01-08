@@ -159,7 +159,10 @@ impl WriteBuffer {
                 buf.len()
             );
         } else {
-            debug_assert!(self.is_empty(), "invariant violated: len > 0 with no buffer");
+            debug_assert!(
+                self.is_empty(),
+                "invariant violated: len > 0 with no buffer"
+            );
         }
     }
 
@@ -330,9 +333,10 @@ impl WriteBuffer {
 
         // Calculate required size (works for both first write and growth)
         // Use checked arithmetic to avoid panic on adversarial input
-        let required = self.len().checked_add(needed).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::OutOfMemory, "size overflow")
-        })?;
+        let required = self
+            .len()
+            .checked_add(needed)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "size overflow"))?;
         let new_size = required
             .checked_next_power_of_two()
             .unwrap_or(usize::MAX)

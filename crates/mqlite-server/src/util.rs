@@ -26,6 +26,7 @@ impl RateLimitedCounter {
     /// Increment by 1 and return Some(count) if interval has passed.
     /// Resets count and timestamp when returning Some.
     #[inline]
+    #[allow(dead_code)]
     pub fn increment(&mut self) -> Option<u64> {
         self.increment_by(1)
     }

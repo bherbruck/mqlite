@@ -232,6 +232,7 @@ impl Client {
 
     /// Record a backpressure drop and log if interval has passed.
     /// Returns true if a log was emitted (for callers that want to add context).
+    #[allow(dead_code)]
     pub fn record_backpressure_drop(&mut self, context: &str) -> bool {
         if let Some(count) = self.backpressure_log.increment() {
             log::warn!(

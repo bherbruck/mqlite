@@ -216,6 +216,13 @@ impl ClientWriteHandle {
                 // causes race conditions under load), count consecutive empty flushes.
                 // Only clear EPOLLOUT for truly idle clients.
                 let count = self.idle_flush_count.fetch_add(1, Ordering::Relaxed);
+
+                // Periodically try to shrink idle buffers (requires 2 consecutive calls)
+                // Call every ~500 cycles to allow shrink hysteresis to work
+                if count.is_multiple_of(500) {
+                    buf.maybe_shrink();
+                }
+
                 if count >= IDLE_THRESHOLD {
                     // Client has been idle for many cycles, safe to clear EPOLLOUT
                     self.idle_flush_count.store(0, Ordering::Relaxed);

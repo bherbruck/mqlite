@@ -299,6 +299,16 @@ impl Worker {
             client.maybe_shrink_read_buffer();
         }
 
+        // Periodically shrink oversized worker buffers to release memory.
+        // Only shrink if capacity is significantly larger than needed (4x threshold).
+        const SHRINK_THRESHOLD: usize = 4096;
+        if self.subscriber_buf.capacity() > SHRINK_THRESHOLD && self.subscriber_buf.is_empty() {
+            self.subscriber_buf.shrink_to(1024);
+        }
+        if self.dedup_buf.capacity() > SHRINK_THRESHOLD && self.dedup_buf.is_empty() {
+            self.dedup_buf.shrink_to(1024);
+        }
+
         Ok(())
     }
 
@@ -397,6 +407,8 @@ impl Worker {
         // Evict if over limit (simple: just clear all)
         if self.route_cache.len() >= ROUTE_CACHE_LIMIT {
             self.route_cache.clear();
+            // Release memory but keep reasonable capacity for reuse
+            self.route_cache.shrink_to(1024);
         }
 
         // Cache the deduplicated result

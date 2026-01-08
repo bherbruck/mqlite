@@ -159,7 +159,7 @@ impl WriteBuffer {
                 buf.len()
             );
         } else {
-            debug_assert!(self.len() == 0, "invariant violated: len > 0 with no buffer");
+            debug_assert!(self.is_empty(), "invariant violated: len > 0 with no buffer");
         }
     }
 

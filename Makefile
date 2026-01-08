@@ -122,7 +122,9 @@ perf-top:
 	if [ -z "$$PID" ]; then echo "Error: mqlite not running"; exit 1; fi && \
 	sudo perf top -p $$PID
 
-heaptrack: build-profiling
+heaptrack:
+	@echo "Building without jemalloc for heap profiling..."
+	cargo build --profile profiling --no-default-features -p mqlite-server
 	@echo "Starting broker with heaptrack..."
 	heaptrack ./target/profiling/mqlite -c mqlite.toml
 
@@ -130,9 +132,16 @@ heaptrack-report:
 	@FILE=$$(ls -t heaptrack.mqlite.*.zst 2>/dev/null | head -1) && \
 	if [ -z "$$FILE" ]; then echo "No heaptrack files found"; exit 1; fi && \
 	echo "Analyzing $$FILE..." && \
+	echo "" && \
+	echo "=== Peak memory contributors ===" && \
 	heaptrack_print --print-peak 1 "$$FILE" 2>/dev/null | \
 	  perl -0777 -ne 'while (/(\d+) calls with ([\d.]+[KMG]?B?) peak.*?mqlite::(\S+?)(?:::h[a-f0-9]+)?\s/gs) { print "$$2\t$$1 calls\t$$3\n" }' | \
-	  sort -hr | head -20
+	  sort -hr | head -15 && \
+	echo "" && \
+	echo "=== Allocation churn (temporary allocs) ===" && \
+	heaptrack_print --print-temporary 1 "$$FILE" 2>/dev/null | \
+	  perl -0777 -ne 'while (/(\d+) calls with ([\d.]+[KMG]?B?).*?mqlite::(\S+?)(?:::h[a-f0-9]+)?\s/gs) { print "$$2\t$$1 calls\t$$3\n" }' | \
+	  sort -hr | head -15
 
 # Help
 help:

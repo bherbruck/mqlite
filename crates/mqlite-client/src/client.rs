@@ -22,22 +22,19 @@ use crate::packet_id::PacketIdAllocator;
 use crate::session::{PendingPublish, Qos2OutState, Session};
 
 #[cfg(feature = "tls")]
-use {
-    rustls::ClientConnection,
-    rustls::pki_types::ServerName,
-    std::sync::Arc,
-};
+use {rustls::pki_types::ServerName, rustls::ClientConnection, std::sync::Arc};
 
 const CLIENT: Token = Token(0);
 const DEFAULT_BUFFER_SIZE: usize = 8192;
 
 /// Stream wrapper for plain or TLS connections.
+#[allow(clippy::large_enum_variant)] // TLS variant is larger but used at runtime
 enum ClientStream {
     Plain(TcpStream),
     #[cfg(feature = "tls")]
     Tls {
         tcp: TcpStream,
-        tls: ClientConnection,
+        tls: Box<ClientConnection>,
     },
 }
 
@@ -50,7 +47,6 @@ impl ClientStream {
             ClientStream::Tls { tcp, .. } => tcp,
         }
     }
-
 }
 
 impl Read for ClientStream {
@@ -218,12 +214,14 @@ impl Client {
         // Create the client stream (plain or TLS)
         #[cfg(feature = "tls")]
         let mut client_stream = if self.config.tls.enabled {
-            let tls_config = self.tls_config.as_ref()
+            let tls_config = self
+                .tls_config
+                .as_ref()
                 .ok_or_else(|| ClientError::Tls("TLS config not initialized".to_string()))?;
 
             // Extract hostname for SNI
-            let hostname = self.config.tls.server_name.as_deref()
-                .unwrap_or_else(|| {
+            let hostname =
+                self.config.tls.server_name.as_deref().unwrap_or_else(|| {
                     self.config.address.split(':').next().unwrap_or("localhost")
                 });
 
@@ -240,7 +238,10 @@ impl Client {
             std_stream.set_nonblocking(true)?;
             let mio_stream = TcpStream::from_std(std_stream);
 
-            ClientStream::Tls { tcp: mio_stream, tls: tls_conn }
+            ClientStream::Tls {
+                tcp: mio_stream,
+                tls: Box::new(tls_conn),
+            }
         } else {
             std_stream.set_nonblocking(true)?;
             ClientStream::Plain(TcpStream::from_std(std_stream))
@@ -602,7 +603,11 @@ impl Client {
                             // Connected event will be emitted by handle_connack
                         }
                         Err(e) => {
-                            log::warn!("Reconnect attempt {} failed: {}", self.reconnect_attempt, e);
+                            log::warn!(
+                                "Reconnect attempt {} failed: {}",
+                                self.reconnect_attempt,
+                                e
+                            );
                             // Schedule next attempt with increased backoff
                             self.schedule_reconnect();
                         }
@@ -674,9 +679,8 @@ impl Client {
         self.state = ConnectionState::Reconnecting;
 
         // Calculate next delay with exponential backoff
-        let next_delay = Duration::from_secs_f64(
-            delay.as_secs_f64() * self.config.reconnect_backoff.multiplier
-        );
+        let next_delay =
+            Duration::from_secs_f64(delay.as_secs_f64() * self.config.reconnect_backoff.multiplier);
         self.reconnect_delay = next_delay.min(self.config.reconnect_backoff.max_delay);
     }
 
@@ -715,9 +719,9 @@ impl Client {
     // === Internal methods ===
 
     fn allocate_packet_id(&mut self) -> Result<u16> {
-        self.packet_ids.allocate().ok_or_else(|| {
-            ClientError::InvalidState("All packet IDs in use".to_string())
-        })
+        self.packet_ids
+            .allocate()
+            .ok_or_else(|| ClientError::InvalidState("All packet IDs in use".to_string()))
     }
 
     fn handle_read(&mut self) -> Result<()> {
@@ -975,7 +979,12 @@ impl Client {
                     }
                     Qos2OutState::AwaitingPubcomp => {
                         // Re-send PUBREL
-                        encode_packet(&Packet::Pubrel { packet_id: pending.publish.packet_id }, &mut self.write_buf);
+                        encode_packet(
+                            &Packet::Pubrel {
+                                packet_id: pending.publish.packet_id,
+                            },
+                            &mut self.write_buf,
+                        );
                         pending.pubrel_sent = Some(now);
                     }
                 }
@@ -1082,10 +1091,7 @@ impl Drop for Client {
 
 /// Complete TLS handshake using blocking I/O.
 #[cfg(feature = "tls")]
-fn complete_tls_handshake(
-    tls: &mut ClientConnection,
-    tcp: &StdTcpStream,
-) -> Result<()> {
+fn complete_tls_handshake(tls: &mut ClientConnection, tcp: &StdTcpStream) -> Result<()> {
     // We need mutable access to tcp for read/write, but it's shared
     // Use a mutable reference pattern
     let mut tcp = tcp;
@@ -1099,10 +1105,14 @@ fn complete_tls_handshake(
 
         // Read TLS data if connection wants it
         if tls.wants_read() {
-            if tls.read_tls(&mut tcp)
-                .map_err(|e| ClientError::Tls(format!("TLS read failed: {}", e)))? == 0
+            if tls
+                .read_tls(&mut tcp)
+                .map_err(|e| ClientError::Tls(format!("TLS read failed: {}", e)))?
+                == 0
             {
-                return Err(ClientError::Tls("Connection closed during handshake".to_string()));
+                return Err(ClientError::Tls(
+                    "Connection closed during handshake".to_string(),
+                ));
             }
 
             // Process the received data
@@ -1113,4 +1123,3 @@ fn complete_tls_handshake(
 
     Ok(())
 }
-

@@ -2063,7 +2063,10 @@ mod tests {
         if let Packet::Auth(decoded) = packet {
             assert_eq!(decoded.reason_code, 0x00);
             assert_eq!(decoded.auth_method, Some("PLAIN".to_string()));
-            assert_eq!(decoded.reason_string, Some("Authentication successful".to_string()));
+            assert_eq!(
+                decoded.reason_string,
+                Some("Authentication successful".to_string())
+            );
         } else {
             panic!("Expected Auth packet");
         }
@@ -2131,15 +2134,25 @@ mod tests {
     #[test]
     fn test_publish_properties_user_properties() {
         let mut props = PublishProperties::default();
-        props.user_properties.push(("key1".to_string(), "value1".to_string()));
-        props.user_properties.push(("key2".to_string(), "value2".to_string()));
+        props
+            .user_properties
+            .push(("key1".to_string(), "value1".to_string()));
+        props
+            .user_properties
+            .push(("key2".to_string(), "value2".to_string()));
 
         let bytes = props.to_bytes();
         let decoded = PublishProperties::from_bytes(&bytes).unwrap();
 
         assert_eq!(decoded.user_properties.len(), 2);
-        assert_eq!(decoded.user_properties[0], ("key1".to_string(), "value1".to_string()));
-        assert_eq!(decoded.user_properties[1], ("key2".to_string(), "value2".to_string()));
+        assert_eq!(
+            decoded.user_properties[0],
+            ("key1".to_string(), "value1".to_string())
+        );
+        assert_eq!(
+            decoded.user_properties[1],
+            ("key2".to_string(), "value2".to_string())
+        );
     }
 
     #[test]
@@ -2152,7 +2165,9 @@ mod tests {
         props.correlation_data = Some(vec![1, 2, 3]);
         props.subscription_identifier = Some(100);
         props.topic_alias = Some(5);
-        props.user_properties.push(("custom".to_string(), "data".to_string()));
+        props
+            .user_properties
+            .push(("custom".to_string(), "data".to_string()));
 
         let bytes = props.to_bytes();
         let decoded = PublishProperties::from_bytes(&bytes).unwrap();
@@ -2165,6 +2180,9 @@ mod tests {
         assert_eq!(decoded.subscription_identifier, Some(100));
         assert_eq!(decoded.topic_alias, Some(5));
         assert_eq!(decoded.user_properties.len(), 1);
-        assert_eq!(decoded.user_properties[0], ("custom".to_string(), "data".to_string()));
+        assert_eq!(
+            decoded.user_properties[0],
+            ("custom".to_string(), "data".to_string())
+        );
     }
 }

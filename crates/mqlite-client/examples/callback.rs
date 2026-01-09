@@ -29,9 +29,7 @@ impl MqttHandler for MyHandler {
         println!("Connected! Session present: {}", session_present);
 
         // Subscribe to topics
-        if let Err(e) = client.subscribe(&[
-            ("example/callback/#", QoS::AtLeastOnce),
-        ]) {
+        if let Err(e) = client.subscribe(&[("example/callback/#", QoS::AtLeastOnce)]) {
             eprintln!("Subscribe error: {}", e);
         }
 

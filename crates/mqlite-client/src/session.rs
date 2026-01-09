@@ -448,9 +448,23 @@ mod tests {
         assert_eq!(resend.len(), 3);
 
         // First should be QoS 1 PUBLISH
-        assert!(matches!(&resend[0], ResendMessage::Publish { packet_id: 1, dup: true, .. }));
+        assert!(matches!(
+            &resend[0],
+            ResendMessage::Publish {
+                packet_id: 1,
+                dup: true,
+                ..
+            }
+        ));
         // Second should be QoS 2 PUBLISH (awaiting PUBREC)
-        assert!(matches!(&resend[1], ResendMessage::Publish { packet_id: 2, dup: true, .. }));
+        assert!(matches!(
+            &resend[1],
+            ResendMessage::Publish {
+                packet_id: 2,
+                dup: true,
+                ..
+            }
+        ));
         // Third should be PUBREL (awaiting PUBCOMP)
         assert!(matches!(&resend[2], ResendMessage::Pubrel { packet_id: 3 }));
     }

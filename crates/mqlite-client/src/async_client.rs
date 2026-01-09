@@ -42,13 +42,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
-use rustls::pki_types::ServerName;
 
 use crate::config::TlsConfig;
 
@@ -355,10 +355,7 @@ impl AsyncClient {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::Subscribe {
-                topics: topics
-                    .iter()
-                    .map(|(t, q)| (t.to_string(), *q))
-                    .collect(),
+                topics: topics.iter().map(|(t, q)| (t.to_string(), *q)).collect(),
                 resp: resp_tx,
             })
             .await
@@ -513,7 +510,7 @@ impl EventLoop {
 
             // Calculate next delay with exponential backoff
             let next_delay = Duration::from_secs_f64(
-                delay.as_secs_f64() * self.config.reconnect_backoff.multiplier
+                delay.as_secs_f64() * self.config.reconnect_backoff.multiplier,
             );
             self.reconnect_delay = next_delay.min(self.config.reconnect_backoff.max_delay);
 
@@ -648,8 +645,8 @@ impl EventLoop {
             };
 
             // Extract hostname for SNI
-            let hostname = self.config.tls.server_name.as_deref()
-                .unwrap_or_else(|| {
+            let hostname =
+                self.config.tls.server_name.as_deref().unwrap_or_else(|| {
                     self.config.address.split(':').next().unwrap_or("localhost")
                 });
 
@@ -729,13 +726,11 @@ impl EventLoop {
                 self.read_buf.extend_from_slice(&buf[..n]);
 
                 if let Some((packet, consumed)) =
-                    decode_packet(&self.read_buf, self.config.protocol_version, 0).map_err(
-                        |e| {
-                            ClientError::Protocol(mqlite_core::ProtocolError::MalformedPacket(
-                                e.to_string(),
-                            ))
-                        },
-                    )?
+                    decode_packet(&self.read_buf, self.config.protocol_version, 0).map_err(|e| {
+                        ClientError::Protocol(mqlite_core::ProtocolError::MalformedPacket(
+                            e.to_string(),
+                        ))
+                    })?
                 {
                     let _ = self.read_buf.split_to(consumed);
 
@@ -773,7 +768,12 @@ impl EventLoop {
                 let result = self.do_subscribe(&topics);
                 let _ = resp.send(result);
             }
-            Command::SubscribeStream { filter, qos, tx, resp } => {
+            Command::SubscribeStream {
+                filter,
+                qos,
+                tx,
+                resp,
+            } => {
                 let result = self.do_subscribe_stream(filter, qos, tx);
                 let _ = resp.send(result);
             }
@@ -809,13 +809,14 @@ impl EventLoop {
             return Err(ClientError::NotConnected);
         }
 
-        let packet_id = if qos != QoS::AtMostOnce {
-            Some(self.packet_ids.allocate().ok_or_else(|| {
-                ClientError::InvalidState("All packet IDs in use".to_string())
-            })?)
-        } else {
-            None
-        };
+        let packet_id =
+            if qos != QoS::AtMostOnce {
+                Some(self.packet_ids.allocate().ok_or_else(|| {
+                    ClientError::InvalidState("All packet IDs in use".to_string())
+                })?)
+            } else {
+                None
+            };
 
         let topic_bytes = Bytes::from(topic.to_string());
 
@@ -857,9 +858,10 @@ impl EventLoop {
             return Err(ClientError::NotConnected);
         }
 
-        let packet_id = self.packet_ids.allocate().ok_or_else(|| {
-            ClientError::InvalidState("All packet IDs in use".to_string())
-        })?;
+        let packet_id = self
+            .packet_ids
+            .allocate()
+            .ok_or_else(|| ClientError::InvalidState("All packet IDs in use".to_string()))?;
 
         let subscribe = Subscribe {
             packet_id,
@@ -908,9 +910,10 @@ impl EventLoop {
             return Err(ClientError::NotConnected);
         }
 
-        let packet_id = self.packet_ids.allocate().ok_or_else(|| {
-            ClientError::InvalidState("All packet IDs in use".to_string())
-        })?;
+        let packet_id = self
+            .packet_ids
+            .allocate()
+            .ok_or_else(|| ClientError::InvalidState("All packet IDs in use".to_string()))?;
 
         let unsubscribe = Unsubscribe {
             packet_id,
@@ -1207,7 +1210,8 @@ fn build_tls_config(config: &TlsConfig) -> Result<rustls::ClientConfig> {
             .map_err(|e| ClientError::Tls(format!("Failed to parse CA cert: {}", e)))?;
 
         for cert in certs {
-            root_store.add(cert)
+            root_store
+                .add(cert)
                 .map_err(|e| ClientError::Tls(format!("Failed to add CA cert: {}", e)))?;
         }
     } else if !config.accept_invalid_certs {
@@ -1224,30 +1228,31 @@ fn build_tls_config(config: &TlsConfig) -> Result<rustls::ClientConfig> {
         return Ok(tls_config);
     }
 
-    let builder = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store);
+    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
 
     // Load client certificate for mutual TLS if provided
-    let tls_config = if let (Some(cert_path), Some(key_path)) = (&config.client_cert, &config.client_key) {
-        let cert_file = File::open(cert_path)
-            .map_err(|e| ClientError::Tls(format!("Failed to open client cert: {}", e)))?;
-        let mut cert_reader = BufReader::new(cert_file);
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| ClientError::Tls(format!("Failed to parse client cert: {}", e)))?;
+    let tls_config =
+        if let (Some(cert_path), Some(key_path)) = (&config.client_cert, &config.client_key) {
+            let cert_file = File::open(cert_path)
+                .map_err(|e| ClientError::Tls(format!("Failed to open client cert: {}", e)))?;
+            let mut cert_reader = BufReader::new(cert_file);
+            let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| ClientError::Tls(format!("Failed to parse client cert: {}", e)))?;
 
-        let key_file = File::open(key_path)
-            .map_err(|e| ClientError::Tls(format!("Failed to open client key: {}", e)))?;
-        let mut key_reader = BufReader::new(key_file);
-        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|e| ClientError::Tls(format!("Failed to parse client key: {}", e)))?
-            .ok_or_else(|| ClientError::Tls("No private key found in file".to_string()))?;
+            let key_file = File::open(key_path)
+                .map_err(|e| ClientError::Tls(format!("Failed to open client key: {}", e)))?;
+            let mut key_reader = BufReader::new(key_file);
+            let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
+                .map_err(|e| ClientError::Tls(format!("Failed to parse client key: {}", e)))?
+                .ok_or_else(|| ClientError::Tls("No private key found in file".to_string()))?;
 
-        builder.with_client_auth_cert(certs, key)
-            .map_err(|e| ClientError::Tls(format!("Failed to configure client auth: {}", e)))?
-    } else {
-        builder.with_no_client_auth()
-    };
+            builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| ClientError::Tls(format!("Failed to configure client auth: {}", e)))?
+        } else {
+            builder.with_no_client_auth()
+        };
 
     Ok(tls_config)
 }
@@ -1326,10 +1331,16 @@ mod tests {
         // Combined
         assert!(topic_matches_filter("sensors/room1/temp", "sensors/+/temp"));
         assert!(topic_matches_filter("sensors/room2/temp", "sensors/+/temp"));
-        assert!(!topic_matches_filter("sensors/room1/humidity", "sensors/+/temp"));
+        assert!(!topic_matches_filter(
+            "sensors/room1/humidity",
+            "sensors/+/temp"
+        ));
 
         // $ topics not matched by wildcards at root
-        assert!(!topic_matches_filter("$SYS/broker/clients", "+/broker/clients"));
+        assert!(!topic_matches_filter(
+            "$SYS/broker/clients",
+            "+/broker/clients"
+        ));
         assert!(!topic_matches_filter("$SYS/broker/clients", "#"));
         assert!(topic_matches_filter("$SYS/broker/clients", "$SYS/#"));
     }

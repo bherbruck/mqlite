@@ -35,16 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(event) = client.next_event() {
             match event {
                 ClientEvent::Connected { session_present } => {
-                    println!(
-                        "Connected! Session present: {}",
-                        session_present
-                    );
+                    println!("Connected! Session present: {}", session_present);
                     connected = true;
 
                     // Subscribe to topics
-                    client.subscribe(&[
-                        ("example/polling/#", QoS::AtLeastOnce),
-                    ])?;
+                    client.subscribe(&[("example/polling/#", QoS::AtLeastOnce)])?;
 
                     // Publish a test message
                     client.publish(
@@ -55,14 +50,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                 }
 
-                ClientEvent::SubAck { packet_id, return_codes } => {
-                    println!(
-                        "Subscribed (packet_id={}): {:?}",
-                        packet_id, return_codes
-                    );
+                ClientEvent::SubAck {
+                    packet_id,
+                    return_codes,
+                } => {
+                    println!("Subscribed (packet_id={}): {:?}", packet_id, return_codes);
                 }
 
-                ClientEvent::Message { topic, payload, qos, retain, .. } => {
+                ClientEvent::Message {
+                    topic,
+                    payload,
+                    qos,
+                    retain,
+                    ..
+                } => {
                     let topic_str = String::from_utf8_lossy(&topic);
                     let payload_str = String::from_utf8_lossy(&payload);
                     println!(

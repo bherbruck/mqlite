@@ -2085,8 +2085,10 @@ mod tests {
 
     #[test]
     fn test_publish_properties_message_expiry() {
-        let mut props = PublishProperties::default();
-        props.message_expiry_interval = Some(3600);
+        let props = PublishProperties {
+            message_expiry_interval: Some(3600),
+            ..Default::default()
+        };
 
         assert!(!props.is_empty());
 
@@ -2098,8 +2100,10 @@ mod tests {
 
     #[test]
     fn test_publish_properties_content_type() {
-        let mut props = PublishProperties::default();
-        props.content_type = Some("application/json".to_string());
+        let props = PublishProperties {
+            content_type: Some("application/json".to_string()),
+            ..Default::default()
+        };
 
         let bytes = props.to_bytes();
         let decoded = PublishProperties::from_bytes(&bytes).unwrap();
@@ -2109,9 +2113,11 @@ mod tests {
 
     #[test]
     fn test_publish_properties_response_topic() {
-        let mut props = PublishProperties::default();
-        props.response_topic = Some("response/topic".to_string());
-        props.correlation_data = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let props = PublishProperties {
+            response_topic: Some("response/topic".to_string()),
+            correlation_data: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            ..Default::default()
+        };
 
         let bytes = props.to_bytes();
         let decoded = PublishProperties::from_bytes(&bytes).unwrap();
@@ -2122,8 +2128,10 @@ mod tests {
 
     #[test]
     fn test_publish_properties_topic_alias() {
-        let mut props = PublishProperties::default();
-        props.topic_alias = Some(42);
+        let props = PublishProperties {
+            topic_alias: Some(42),
+            ..Default::default()
+        };
 
         let bytes = props.to_bytes();
         let decoded = PublishProperties::from_bytes(&bytes).unwrap();
@@ -2133,13 +2141,13 @@ mod tests {
 
     #[test]
     fn test_publish_properties_user_properties() {
-        let mut props = PublishProperties::default();
-        props
-            .user_properties
-            .push(("key1".to_string(), "value1".to_string()));
-        props
-            .user_properties
-            .push(("key2".to_string(), "value2".to_string()));
+        let props = PublishProperties {
+            user_properties: vec![
+                ("key1".to_string(), "value1".to_string()),
+                ("key2".to_string(), "value2".to_string()),
+            ],
+            ..Default::default()
+        };
 
         let bytes = props.to_bytes();
         let decoded = PublishProperties::from_bytes(&bytes).unwrap();
@@ -2157,17 +2165,16 @@ mod tests {
 
     #[test]
     fn test_publish_properties_all_fields() {
-        let mut props = PublishProperties::default();
-        props.payload_format_indicator = Some(1);
-        props.message_expiry_interval = Some(7200);
-        props.content_type = Some("text/plain".to_string());
-        props.response_topic = Some("reply/here".to_string());
-        props.correlation_data = Some(vec![1, 2, 3]);
-        props.subscription_identifier = Some(100);
-        props.topic_alias = Some(5);
-        props
-            .user_properties
-            .push(("custom".to_string(), "data".to_string()));
+        let props = PublishProperties {
+            payload_format_indicator: Some(1),
+            message_expiry_interval: Some(7200),
+            content_type: Some("text/plain".to_string()),
+            response_topic: Some("reply/here".to_string()),
+            correlation_data: Some(vec![1, 2, 3]),
+            subscription_identifier: Some(100),
+            topic_alias: Some(5),
+            user_properties: vec![("custom".to_string(), "data".to_string())],
+        };
 
         let bytes = props.to_bytes();
         let decoded = PublishProperties::from_bytes(&bytes).unwrap();

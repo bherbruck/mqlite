@@ -60,7 +60,7 @@ use mqlite_core::packet::{
 /// Wrapper enum for async streams (plain TCP or TLS).
 enum AsyncStream {
     Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 impl AsyncRead for AsyncStream {
@@ -71,7 +71,7 @@ impl AsyncRead for AsyncStream {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             AsyncStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            AsyncStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            AsyncStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -84,21 +84,21 @@ impl AsyncWrite for AsyncStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             AsyncStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            AsyncStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            AsyncStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             AsyncStream::Plain(s) => Pin::new(s).poll_flush(cx),
-            AsyncStream::Tls(s) => Pin::new(s).poll_flush(cx),
+            AsyncStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             AsyncStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            AsyncStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            AsyncStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -661,7 +661,7 @@ impl EventLoop {
             .map_err(|_| ClientError::ConnectionTimeout)?
             .map_err(|e| ClientError::Tls(e.to_string()))?;
 
-            AsyncStream::Tls(tls_stream)
+            AsyncStream::Tls(Box::new(tls_stream))
         } else {
             AsyncStream::Plain(tcp_stream)
         };

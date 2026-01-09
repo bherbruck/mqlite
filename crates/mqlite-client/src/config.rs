@@ -2,6 +2,29 @@
 
 use std::time::Duration;
 
+use crate::will::Will;
+
+/// Reconnection backoff configuration.
+#[derive(Debug, Clone)]
+pub struct BackoffConfig {
+    /// Initial delay before first reconnect attempt.
+    pub initial_delay: Duration,
+    /// Maximum delay between reconnect attempts.
+    pub max_delay: Duration,
+    /// Multiplier applied to delay after each failed attempt.
+    pub multiplier: f64,
+}
+
+impl Default for BackoffConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+            multiplier: 2.0,
+        }
+    }
+}
+
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -21,6 +44,16 @@ pub struct ClientConfig {
     pub protocol_version: u8,
     /// Connection timeout.
     pub connect_timeout: Duration,
+    /// Last Will and Testament message.
+    pub will: Option<Will>,
+    /// Retry interval for unacknowledged QoS 1/2 messages.
+    pub retry_interval: Duration,
+    /// Maximum number of in-flight messages (0 = unlimited).
+    pub max_inflight: usize,
+    /// Enable automatic reconnection.
+    pub auto_reconnect: bool,
+    /// Reconnection backoff configuration.
+    pub reconnect_backoff: BackoffConfig,
 }
 
 impl Default for ClientConfig {
@@ -34,6 +67,11 @@ impl Default for ClientConfig {
             clean_session: true,
             protocol_version: 4, // MQTT 3.1.1
             connect_timeout: Duration::from_secs(10),
+            will: None,
+            retry_interval: Duration::from_secs(20),
+            max_inflight: 65535,
+            auto_reconnect: false,
+            reconnect_backoff: BackoffConfig::default(),
         }
     }
 }
@@ -85,6 +123,36 @@ impl ClientConfig {
     /// Set connection timeout.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
+        self
+    }
+
+    /// Set the Last Will and Testament message.
+    pub fn will(mut self, will: Will) -> Self {
+        self.will = Some(will);
+        self
+    }
+
+    /// Set retry interval for unacknowledged messages.
+    pub fn retry_interval(mut self, interval: Duration) -> Self {
+        self.retry_interval = interval;
+        self
+    }
+
+    /// Set maximum number of in-flight messages.
+    pub fn max_inflight(mut self, max: usize) -> Self {
+        self.max_inflight = max;
+        self
+    }
+
+    /// Enable automatic reconnection.
+    pub fn auto_reconnect(mut self, enabled: bool) -> Self {
+        self.auto_reconnect = enabled;
+        self
+    }
+
+    /// Set reconnection backoff configuration.
+    pub fn reconnect_backoff(mut self, backoff: BackoffConfig) -> Self {
+        self.reconnect_backoff = backoff;
         self
     }
 }

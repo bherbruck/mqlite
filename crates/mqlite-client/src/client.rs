@@ -10,14 +10,15 @@ use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 
 use mqlite_core::packet::{
-    decode_packet, encode_connect, encode_disconnect, encode_pingreq, encode_publish,
-    encode_subscribe, encode_unsubscribe, Connack, ConnackCode, Connect, Packet, Publish, QoS,
-    Suback, Subscribe, SubscriptionOptions, Unsuback, Unsubscribe,
+    decode_packet, encode_packet, Connack, ConnackCode, Connect, Packet, Publish, QoS, Suback,
+    Subscribe, SubscriptionOptions, Unsuback, Unsubscribe, Will as CoreWill,
 };
 
 use crate::config::{ClientConfig, ConnectOptions};
 use crate::error::{ClientError, Result};
 use crate::events::{ClientEvent, ConnectionState};
+use crate::packet_id::PacketIdAllocator;
+use crate::session::{PendingPublish, Qos2OutState, Session};
 
 const CLIENT: Token = Token(0);
 const DEFAULT_BUFFER_SIZE: usize = 8192;
@@ -31,15 +32,19 @@ pub struct Client {
     read_buf: BytesMut,
     write_buf: Vec<u8>,
     events: VecDeque<ClientEvent>,
-    next_packet_id: u16,
     last_packet_time: Instant,
     pending_pings: u8,
+    /// Session state tracking
+    session: Session,
+    /// Packet ID allocator
+    packet_ids: PacketIdAllocator,
 }
 
 impl Client {
     /// Create a new MQTT client with the given configuration.
     pub fn new(config: ClientConfig) -> Result<Self> {
         let poll = Poll::new()?;
+        let session = Session::new(config.client_id.clone(), config.clean_session);
 
         Ok(Self {
             config,
@@ -49,9 +54,10 @@ impl Client {
             read_buf: BytesMut::with_capacity(DEFAULT_BUFFER_SIZE),
             write_buf: Vec::with_capacity(DEFAULT_BUFFER_SIZE),
             events: VecDeque::new(),
-            next_packet_id: 1,
             last_packet_time: Instant::now(),
             pending_pings: 0,
+            session,
+            packet_ids: PacketIdAllocator::new(),
         })
     }
 
@@ -100,7 +106,26 @@ impl Client {
             .unwrap_or_else(|| self.config.client_id.clone());
         let clean_session = opts.clean_session.unwrap_or(self.config.clean_session);
 
+        // Update session
+        self.session.client_id = client_id.clone();
+        self.session.clean_session = clean_session;
+
+        // Clear session state if clean session
+        if clean_session {
+            self.session.clear();
+            self.packet_ids.clear();
+        }
+
         let protocol_name = "MQTT".to_string();
+
+        // Build will config if present
+        let will = self.config.will.as_ref().map(|w| CoreWill {
+            topic: w.topic.clone(),
+            message: w.payload.to_vec(),
+            qos: w.qos,
+            retain: w.retain,
+            properties: None,
+        });
 
         let connect = Connect {
             protocol_name,
@@ -110,15 +135,31 @@ impl Client {
             client_id,
             username: self.config.username.clone(),
             password: self.config.password.clone(),
-            will: None,
+            will,
             properties: None,
         };
 
         // Encode and queue CONNECT
-        encode_connect(&connect, &mut self.write_buf);
+        encode_packet(&Packet::Connect(connect), &mut self.write_buf);
         self.last_packet_time = Instant::now();
 
         Ok(())
+    }
+
+    /// Reconnect to the broker.
+    ///
+    /// If the session is not clean, this will re-send any pending QoS 1/2 messages
+    /// per [MQTT-4.4.0-1].
+    pub fn reconnect(&mut self) -> Result<()> {
+        if self.state != ConnectionState::Disconnected {
+            self.cleanup();
+        }
+
+        // Connect with current session settings
+        self.connect(Some(ConnectOptions {
+            client_id: Some(self.session.client_id.clone()),
+            clean_session: Some(self.session.clean_session),
+        }))
     }
 
     /// Disconnect from the broker.
@@ -128,7 +169,7 @@ impl Client {
         }
 
         // Send DISCONNECT packet
-        encode_disconnect(0, &mut self.write_buf);
+        encode_packet(&Packet::Disconnect { reason_code: 0 }, &mut self.write_buf);
 
         // Try to flush
         let _ = self.flush_write_buffer();
@@ -168,21 +209,6 @@ impl Client {
     /// - `no_local`: Don't receive messages published by this client (loop prevention)
     /// - `retain_as_published`: Keep original retain flag on forwarded messages
     /// - `retain_handling`: 0=send retained on subscribe, 1=send if new sub, 2=don't send
-    ///
-    /// # Example
-    /// ```ignore
-    /// use mqlite_client::{Client, SubscriptionOptions, QoS};
-    ///
-    /// // Subscribe with NoLocal to prevent message reflection (useful for bridges)
-    /// client.subscribe_with_options(&[
-    ///     ("sensors/#", SubscriptionOptions {
-    ///         qos: QoS::AtLeastOnce,
-    ///         no_local: true,
-    ///         retain_as_published: false,
-    ///         retain_handling: 0,
-    ///     }),
-    /// ])?;
-    /// ```
     pub fn subscribe_with_options(
         &mut self,
         topics: &[(&str, SubscriptionOptions)],
@@ -191,7 +217,7 @@ impl Client {
             return Err(ClientError::NotConnected);
         }
 
-        let packet_id = self.next_packet_id();
+        let packet_id = self.allocate_packet_id()?;
         let subscribe = Subscribe {
             packet_id,
             topics: topics
@@ -201,7 +227,12 @@ impl Client {
             subscription_id: None,
         };
 
-        encode_subscribe(&subscribe, &mut self.write_buf);
+        // Track subscription in session
+        for (topic, opts) in topics {
+            self.session.add_subscription(topic.to_string(), opts.qos);
+        }
+
+        encode_packet(&Packet::Subscribe(subscribe), &mut self.write_buf);
         self.last_packet_time = Instant::now();
 
         Ok(packet_id)
@@ -213,13 +244,18 @@ impl Client {
             return Err(ClientError::NotConnected);
         }
 
-        let packet_id = self.next_packet_id();
+        let packet_id = self.allocate_packet_id()?;
         let unsubscribe = Unsubscribe {
             packet_id,
             topics: topics.iter().map(|t| t.to_string()).collect(),
         };
 
-        encode_unsubscribe(&unsubscribe, &mut self.write_buf);
+        // Remove from session
+        for topic in topics {
+            self.session.remove_subscription(topic);
+        }
+
+        encode_packet(&Packet::Unsubscribe(unsubscribe), &mut self.write_buf);
         self.last_packet_time = Instant::now();
 
         Ok(packet_id)
@@ -237,24 +273,45 @@ impl Client {
             return Err(ClientError::NotConnected);
         }
 
+        // Check inflight limit
+        if self.config.max_inflight > 0 && self.session.pending_count() >= self.config.max_inflight
+        {
+            return Err(ClientError::InvalidState(
+                "Max inflight messages reached".to_string(),
+            ));
+        }
+
         let packet_id = if qos != QoS::AtMostOnce {
-            Some(self.next_packet_id())
+            Some(self.allocate_packet_id()?)
         } else {
             None
         };
+
+        let topic_bytes = Bytes::from(topic.to_string());
+        let payload_bytes = Bytes::copy_from_slice(payload);
 
         let publish = Publish {
             dup: false,
             qos,
             retain,
-            topic: Bytes::from(topic.to_string()),
+            topic: topic_bytes.clone(),
             packet_id,
-            payload: Bytes::copy_from_slice(payload),
+            payload: payload_bytes.clone(),
             properties: None,
         };
 
-        encode_publish(&publish, &mut self.write_buf);
+        encode_packet(&Packet::Publish(publish), &mut self.write_buf);
         self.last_packet_time = Instant::now();
+
+        // Track pending messages for QoS > 0
+        if let Some(id) = packet_id {
+            let pending = PendingPublish::new(id, topic_bytes, payload_bytes, qos, retain);
+            match qos {
+                QoS::AtLeastOnce => self.session.add_qos1_pending(pending),
+                QoS::ExactlyOnce => self.session.add_qos2_pending(pending),
+                QoS::AtMostOnce => {}
+            }
+        }
 
         Ok(packet_id)
     }
@@ -266,6 +323,9 @@ impl Client {
         if !self.write_buf.is_empty() {
             self.flush_write_buffer()?;
         }
+
+        // Check for message retries
+        self.check_retries()?;
 
         // Check keep-alive
         if self.state == ConnectionState::Connected && self.config.keep_alive > 0 {
@@ -283,7 +343,7 @@ impl Client {
                 }
 
                 // Send PINGREQ
-                encode_pingreq(&mut self.write_buf);
+                encode_packet(&Packet::Pingreq, &mut self.write_buf);
                 self.pending_pings += 1;
                 self.last_packet_time = Instant::now();
             }
@@ -317,15 +377,22 @@ impl Client {
         self.state == ConnectionState::Connected
     }
 
+    /// Get the number of pending outbound messages.
+    pub fn pending_count(&self) -> usize {
+        self.session.pending_count()
+    }
+
+    /// Get a reference to the session state.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
     // === Internal methods ===
 
-    fn next_packet_id(&mut self) -> u16 {
-        let id = self.next_packet_id;
-        self.next_packet_id = self.next_packet_id.wrapping_add(1);
-        if self.next_packet_id == 0 {
-            self.next_packet_id = 1;
-        }
-        id
+    fn allocate_packet_id(&mut self) -> Result<u16> {
+        self.packet_ids.allocate().ok_or_else(|| {
+            ClientError::InvalidState("All packet IDs in use".to_string())
+        })
     }
 
     fn handle_read(&mut self) -> Result<()> {
@@ -386,21 +453,10 @@ impl Client {
         match packet {
             Packet::Connack(connack) => self.handle_connack(connack),
             Packet::Publish(publish) => self.handle_publish(publish),
-            Packet::Puback { packet_id } => {
-                self.events.push_back(ClientEvent::PubAck { packet_id });
-                Ok(())
-            }
-            Packet::Pubrec { packet_id } => {
-                // QoS 2: respond with PUBREL
-                let pubrel = Packet::Pubrel { packet_id };
-                encode_pubrel_packet(&pubrel, &mut self.write_buf);
-                self.events.push_back(ClientEvent::PubRec { packet_id });
-                Ok(())
-            }
-            Packet::Pubcomp { packet_id } => {
-                self.events.push_back(ClientEvent::PubComp { packet_id });
-                Ok(())
-            }
+            Packet::Puback { packet_id } => self.handle_puback(packet_id),
+            Packet::Pubrec { packet_id } => self.handle_pubrec(packet_id),
+            Packet::Pubrel { packet_id } => self.handle_pubrel(packet_id),
+            Packet::Pubcomp { packet_id } => self.handle_pubcomp(packet_id),
             Packet::Suback(suback) => self.handle_suback(suback),
             Packet::Unsuback(unsuback) => self.handle_unsuback(unsuback),
             Packet::Pingresp => {
@@ -425,6 +481,19 @@ impl Client {
         }
 
         self.state = ConnectionState::Connected;
+
+        // If session not present and we expected one, clear local state
+        if !connack.session_present && !self.session.clean_session {
+            self.session.clear();
+            self.packet_ids.clear();
+        }
+
+        // Re-send pending messages if session was restored
+        // Per [MQTT-4.4.0-1]
+        if connack.session_present {
+            self.resend_pending_messages()?;
+        }
+
         self.events.push_back(ClientEvent::Connected {
             session_present: connack.session_present,
         });
@@ -432,16 +501,29 @@ impl Client {
     }
 
     fn handle_publish(&mut self, publish: Publish) -> Result<()> {
+        // For QoS 2, check if this is a duplicate we've already processed
+        if publish.qos == QoS::ExactlyOnce {
+            if let Some(packet_id) = publish.packet_id {
+                if self.session.has_qos2_inbound(packet_id) {
+                    // Duplicate, just resend PUBREC
+                    encode_packet(&Packet::Pubrec { packet_id }, &mut self.write_buf);
+                    return Ok(());
+                }
+            }
+        }
+
         // Send acknowledgments for QoS > 0
         match publish.qos {
             QoS::AtLeastOnce => {
                 if let Some(packet_id) = publish.packet_id {
-                    encode_puback_packet(packet_id, &mut self.write_buf);
+                    encode_packet(&Packet::Puback { packet_id }, &mut self.write_buf);
                 }
             }
             QoS::ExactlyOnce => {
                 if let Some(packet_id) = publish.packet_id {
-                    encode_pubrec_packet(packet_id, &mut self.write_buf);
+                    // Track that we received this message
+                    self.session.add_qos2_inbound(packet_id);
+                    encode_packet(&Packet::Pubrec { packet_id }, &mut self.write_buf);
                 }
             }
             QoS::AtMostOnce => {}
@@ -457,7 +539,43 @@ impl Client {
         Ok(())
     }
 
+    fn handle_puback(&mut self, packet_id: u16) -> Result<()> {
+        // Complete QoS 1 flow
+        if self.session.complete_qos1(packet_id).is_some() {
+            self.packet_ids.release(packet_id);
+            self.events.push_back(ClientEvent::PubAck { packet_id });
+        }
+        Ok(())
+    }
+
+    fn handle_pubrec(&mut self, packet_id: u16) -> Result<()> {
+        // Transition QoS 2 flow: received PUBREC, send PUBREL
+        if self.session.qos2_received_pubrec(packet_id) {
+            encode_packet(&Packet::Pubrel { packet_id }, &mut self.write_buf);
+            self.events.push_back(ClientEvent::PubRec { packet_id });
+        }
+        Ok(())
+    }
+
+    fn handle_pubrel(&mut self, packet_id: u16) -> Result<()> {
+        // QoS 2 receiver flow: received PUBREL, send PUBCOMP
+        if self.session.complete_qos2_in(packet_id) {
+            encode_packet(&Packet::Pubcomp { packet_id }, &mut self.write_buf);
+        }
+        Ok(())
+    }
+
+    fn handle_pubcomp(&mut self, packet_id: u16) -> Result<()> {
+        // Complete QoS 2 flow
+        if self.session.complete_qos2_out(packet_id).is_some() {
+            self.packet_ids.release(packet_id);
+            self.events.push_back(ClientEvent::PubComp { packet_id });
+        }
+        Ok(())
+    }
+
     fn handle_suback(&mut self, suback: Suback) -> Result<()> {
+        self.packet_ids.release(suback.packet_id);
         self.events.push_back(ClientEvent::SubAck {
             packet_id: suback.packet_id,
             return_codes: suback.return_codes,
@@ -466,9 +584,121 @@ impl Client {
     }
 
     fn handle_unsuback(&mut self, unsuback: Unsuback) -> Result<()> {
+        self.packet_ids.release(unsuback.packet_id);
         self.events.push_back(ClientEvent::UnsubAck {
             packet_id: unsuback.packet_id,
         });
+        Ok(())
+    }
+
+    /// Check for messages that need to be retried.
+    fn check_retries(&mut self) -> Result<()> {
+        if self.state != ConnectionState::Connected {
+            return Ok(());
+        }
+
+        let retry_interval = self.config.retry_interval;
+        let now = Instant::now();
+
+        // Check QoS 1 messages
+        for pending in &mut self.session.pending_qos1 {
+            if now.duration_since(pending.last_sent) >= retry_interval {
+                // Re-send with DUP=1 per [MQTT-3.3.1-1]
+                let publish = Publish {
+                    dup: true,
+                    qos: pending.qos,
+                    retain: pending.retain,
+                    topic: pending.topic.clone(),
+                    packet_id: Some(pending.packet_id),
+                    payload: pending.payload.clone(),
+                    properties: None,
+                };
+                encode_packet(&Packet::Publish(publish), &mut self.write_buf);
+                pending.mark_resent();
+            }
+        }
+
+        // Check QoS 2 messages
+        for pending in &mut self.session.pending_qos2_out {
+            let last_sent = match pending.state {
+                Qos2OutState::AwaitingPubrec => pending.publish.last_sent,
+                Qos2OutState::AwaitingPubcomp => {
+                    pending.pubrel_sent.unwrap_or(pending.publish.last_sent)
+                }
+            };
+
+            if now.duration_since(last_sent) >= retry_interval {
+                match pending.state {
+                    Qos2OutState::AwaitingPubrec => {
+                        // Re-send PUBLISH with DUP=1
+                        let publish = Publish {
+                            dup: true,
+                            qos: pending.publish.qos,
+                            retain: pending.publish.retain,
+                            topic: pending.publish.topic.clone(),
+                            packet_id: Some(pending.publish.packet_id),
+                            payload: pending.publish.payload.clone(),
+                            properties: None,
+                        };
+                        encode_packet(&Packet::Publish(publish), &mut self.write_buf);
+                        pending.publish.mark_resent();
+                    }
+                    Qos2OutState::AwaitingPubcomp => {
+                        // Re-send PUBREL
+                        encode_packet(&Packet::Pubrel { packet_id: pending.publish.packet_id }, &mut self.write_buf);
+                        pending.pubrel_sent = Some(now);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Re-send all pending messages after reconnect.
+    /// Per [MQTT-4.4.0-1] and [MQTT-4.6.0-1].
+    fn resend_pending_messages(&mut self) -> Result<()> {
+        // Collect messages to resend (to avoid borrow issues)
+        let messages: Vec<_> = self.session.messages_to_resend().collect();
+
+        for msg in messages {
+            match msg {
+                crate::session::ResendMessage::Publish {
+                    packet_id,
+                    topic,
+                    payload,
+                    qos,
+                    retain,
+                    dup,
+                } => {
+                    let publish = Publish {
+                        dup,
+                        qos,
+                        retain,
+                        topic,
+                        packet_id: Some(packet_id),
+                        payload,
+                        properties: None,
+                    };
+                    encode_packet(&Packet::Publish(publish), &mut self.write_buf);
+
+                    // Update last_sent time
+                    if let Some(p) = self.session.get_qos1_pending_mut(packet_id) {
+                        p.mark_resent();
+                    }
+                    if let Some(p) = self.session.get_qos2_out_mut(packet_id) {
+                        p.publish.mark_resent();
+                    }
+                }
+                crate::session::ResendMessage::Pubrel { packet_id } => {
+                    encode_packet(&Packet::Pubrel { packet_id }, &mut self.write_buf);
+                    if let Some(p) = self.session.get_qos2_out_mut(packet_id) {
+                        p.pubrel_sent = Some(Instant::now());
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -520,23 +750,3 @@ impl Drop for Client {
     }
 }
 
-// Helper functions for encoding simple ACK packets
-fn encode_puback_packet(packet_id: u16, buf: &mut Vec<u8>) {
-    buf.push(0x40); // PUBACK fixed header
-    buf.push(2); // Remaining length
-    buf.extend_from_slice(&packet_id.to_be_bytes());
-}
-
-fn encode_pubrec_packet(packet_id: u16, buf: &mut Vec<u8>) {
-    buf.push(0x50); // PUBREC fixed header
-    buf.push(2); // Remaining length
-    buf.extend_from_slice(&packet_id.to_be_bytes());
-}
-
-fn encode_pubrel_packet(_packet: &Packet, buf: &mut Vec<u8>) {
-    if let Packet::Pubrel { packet_id } = _packet {
-        buf.push(0x62); // PUBREL fixed header (flags = 0x02)
-        buf.push(2); // Remaining length
-        buf.extend_from_slice(&packet_id.to_be_bytes());
-    }
-}

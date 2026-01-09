@@ -26,6 +26,20 @@ log = { workspace = true }
 rustls = { version = "0.23", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
+# Async runtime (optional)
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"], optional = true }
+
 [features]
 default = ["tls"]
 tls = ["dep:rustls", "dep:rustls-pemfile"]
+async-tokio = ["dep:tokio"]
+
+[[example]]
+name = "polling"
+
+[[example]]
+name = "callback"
+
+[[example]]
+name = "async_client"
+required-features = ["async-tokio"]

@@ -361,6 +361,10 @@ impl<'a> Decoder<'a> {
         self.buf.len() - self.pos
     }
 
+    fn skip(&mut self, n: usize) {
+        self.pos = (self.pos + n).min(self.buf.len());
+    }
+
     fn read_u8(&mut self) -> Result<u8> {
         if self.pos >= self.buf.len() {
             return Err(ProtocolError::IncompletePacket { needed: 1, have: 0 }.into());
@@ -634,20 +638,23 @@ pub fn decode_packet(
 
     let packet = match packet_type {
         PacketType::Connect => decode_connect(payload)?,
+        PacketType::Connack => decode_connack(payload, is_v5)?,
         PacketType::Publish => decode_publish(flags, payload, is_v5)?,
         PacketType::Puback => decode_puback(payload)?,
         PacketType::Pubrec => decode_pubrec(payload)?,
         PacketType::Pubrel => decode_pubrel(payload)?,
         PacketType::Pubcomp => decode_pubcomp(payload)?,
         PacketType::Subscribe => decode_subscribe(payload, is_v5)?,
+        PacketType::Suback => decode_suback(payload, is_v5)?,
         PacketType::Unsubscribe => decode_unsubscribe(payload, is_v5)?,
+        PacketType::Unsuback => decode_unsuback(payload, is_v5)?,
         PacketType::Pingreq => Packet::Pingreq,
+        PacketType::Pingresp => Packet::Pingresp,
         PacketType::Disconnect => decode_disconnect(payload, is_v5)?,
-        _ => {
-            return Err(ProtocolError::MalformedPacket(format!(
-                "Unexpected packet type from client: {:?}",
-                packet_type
-            ))
+        PacketType::Auth => {
+            return Err(ProtocolError::MalformedPacket(
+                "AUTH packet not supported".to_string(),
+            )
             .into())
         }
     };
@@ -837,6 +844,92 @@ fn decode_pubcomp(payload: &[u8]) -> Result<Packet> {
     Ok(Packet::Pubcomp { packet_id })
 }
 
+fn decode_connack(payload: &[u8], is_v5: bool) -> Result<Packet> {
+    let mut dec = Decoder::new(payload);
+
+    // Session Present flag (bit 0 of Connect Acknowledge Flags)
+    let ack_flags = dec.read_u8()?;
+    let session_present = (ack_flags & 0x01) != 0;
+
+    // Connect Return Code (MQTT 3.1.1) or Reason Code (MQTT 5.0)
+    let code_byte = dec.read_u8()?;
+    let code = match code_byte {
+        0 => ConnackCode::Accepted,
+        1 => ConnackCode::UnacceptableProtocolVersion,
+        2 => ConnackCode::IdentifierRejected,
+        3 => ConnackCode::ServerUnavailable,
+        4 => ConnackCode::BadUsernamePassword,
+        5 => ConnackCode::NotAuthorized,
+        _ => ConnackCode::ServerUnavailable, // Unknown codes map to server unavailable
+    };
+
+    // MQTT 5.0 properties (skip for now)
+    let properties = if is_v5 && dec.remaining() > 0 {
+        // Skip properties for now - just read the length and skip
+        let prop_len = dec.read_variable_byte_integer()? as usize;
+        if dec.remaining() >= prop_len {
+            dec.skip(prop_len);
+        }
+        None
+    } else {
+        None
+    };
+
+    Ok(Packet::Connack(Connack {
+        session_present,
+        code,
+        reason_code: None,
+        properties,
+    }))
+}
+
+fn decode_suback(payload: &[u8], is_v5: bool) -> Result<Packet> {
+    let mut dec = Decoder::new(payload);
+    let packet_id = dec.read_u16()?;
+
+    // MQTT 5.0 properties
+    if is_v5 {
+        let prop_len = dec.read_variable_byte_integer()? as usize;
+        dec.skip(prop_len);
+    }
+
+    // Return codes
+    let mut return_codes = Vec::new();
+    while dec.remaining() > 0 {
+        return_codes.push(dec.read_u8()?);
+    }
+
+    Ok(Packet::Suback(Suback {
+        packet_id,
+        return_codes,
+        is_v5,
+    }))
+}
+
+fn decode_unsuback(payload: &[u8], is_v5: bool) -> Result<Packet> {
+    let mut dec = Decoder::new(payload);
+    let packet_id = dec.read_u16()?;
+
+    // MQTT 5.0 has properties and reason codes, v3.1.1 has no payload
+    let reason_codes = if is_v5 {
+        let prop_len = dec.read_variable_byte_integer()? as usize;
+        dec.skip(prop_len);
+        let mut codes = Vec::new();
+        while dec.remaining() > 0 {
+            codes.push(dec.read_u8()?);
+        }
+        codes
+    } else {
+        Vec::new()
+    };
+
+    Ok(Packet::Unsuback(Unsuback {
+        packet_id,
+        reason_codes,
+        is_v5,
+    }))
+}
+
 fn decode_subscribe(payload: &[u8], is_v5: bool) -> Result<Packet> {
     let mut dec = Decoder::new(payload);
     let packet_id = dec.read_u16()?;
@@ -979,19 +1072,22 @@ fn decode_disconnect(payload: &[u8], is_v5: bool) -> Result<Packet> {
 }
 
 /// Encode a packet into the provided buffer.
-/// Returns the number of bytes written.
 pub fn encode_packet(packet: &Packet, buf: &mut Vec<u8>) {
     match packet {
+        Packet::Connect(connect) => encode_connect(connect, buf),
         Packet::Connack(connack) => encode_connack(connack, buf),
         Packet::Publish(publish) => encode_publish(publish, buf),
         Packet::Puback { packet_id } => encode_simple_ack(PacketType::Puback, *packet_id, buf),
         Packet::Pubrec { packet_id } => encode_simple_ack(PacketType::Pubrec, *packet_id, buf),
         Packet::Pubrel { packet_id } => encode_pubrel(*packet_id, buf),
         Packet::Pubcomp { packet_id } => encode_simple_ack(PacketType::Pubcomp, *packet_id, buf),
+        Packet::Subscribe(subscribe) => encode_subscribe(subscribe, buf),
         Packet::Suback(suback) => encode_suback(suback, buf),
+        Packet::Unsubscribe(unsubscribe) => encode_unsubscribe(unsubscribe, buf),
         Packet::Unsuback(unsuback) => encode_unsuback(unsuback, buf),
+        Packet::Pingreq => encode_pingreq(buf),
         Packet::Pingresp => encode_pingresp(buf),
-        _ => {} // Client-only packets, don't encode
+        Packet::Disconnect { reason_code } => encode_disconnect(*reason_code, buf),
     }
 }
 

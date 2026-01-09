@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/mqlite-core", "crates/mqlite-server", "crates/mqlite-client"]
+exclude = ["examples"]
 resolver = "2"
 
 [workspace.package]

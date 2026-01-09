@@ -181,6 +181,13 @@ pub enum Event {
     UnsubAck { packet_id: u16 },
     /// Disconnected from broker.
     Disconnected,
+    /// Attempting to reconnect (only when auto_reconnect is enabled).
+    Reconnecting {
+        /// Current reconnection attempt number (1-based).
+        attempt: u32,
+        /// Delay before this attempt.
+        delay: Duration,
+    },
 }
 
 /// Commands sent from AsyncClient to EventLoop.
@@ -354,6 +361,12 @@ pub struct EventLoop {
     streams: Vec<StreamSubscription>,
     /// Cached TLS config for reconnection.
     tls_connector: Option<Arc<TlsConnector>>,
+    /// Reconnection state for auto-reconnect.
+    reconnect_attempt: u32,
+    /// Current backoff delay for reconnection.
+    reconnect_delay: Duration,
+    /// Whether we should attempt to reconnect.
+    should_reconnect: bool,
 }
 
 impl EventLoop {
@@ -373,6 +386,8 @@ impl EventLoop {
             None
         };
 
+        let initial_delay = config.reconnect_backoff.initial_delay;
+
         Self {
             config,
             rx,
@@ -386,6 +401,9 @@ impl EventLoop {
             connected: false,
             streams: Vec::new(),
             tls_connector,
+            reconnect_attempt: 0,
+            reconnect_delay: initial_delay,
+            should_reconnect: false,
         }
     }
 
@@ -396,10 +414,56 @@ impl EventLoop {
     /// If you're using `subscribe_stream()`, messages are automatically routed
     /// to their streams and won't appear as `Event::Message`. Only unmatched
     /// messages (from raw `subscribe()` calls) appear as events.
+    ///
+    /// When `auto_reconnect` is enabled, this will automatically attempt to
+    /// reconnect on disconnection with exponential backoff. The `Reconnecting`
+    /// event is emitted before each attempt.
     pub async fn poll(&mut self) -> Result<Event> {
-        // Connect if not connected
+        // Handle reconnection with backoff
+        if self.stream.is_none() && self.should_reconnect {
+            self.reconnect_attempt += 1;
+            let delay = self.reconnect_delay;
+
+            // Emit reconnecting event before delay
+            let event = Event::Reconnecting {
+                attempt: self.reconnect_attempt,
+                delay,
+            };
+
+            // Wait for backoff delay
+            tokio::time::sleep(delay).await;
+
+            // Calculate next delay with exponential backoff
+            let next_delay = Duration::from_secs_f64(
+                delay.as_secs_f64() * self.config.reconnect_backoff.multiplier
+            );
+            self.reconnect_delay = next_delay.min(self.config.reconnect_backoff.max_delay);
+
+            // Try to reconnect
+            match self.connect().await {
+                Ok(()) => {
+                    // Reset backoff on success
+                    self.reconnect_attempt = 0;
+                    self.reconnect_delay = self.config.reconnect_backoff.initial_delay;
+                    self.should_reconnect = false;
+                    return Ok(Event::Connected {
+                        session_present: !self.session.clean_session,
+                    });
+                }
+                Err(e) => {
+                    log::warn!("Reconnect attempt {} failed: {}", self.reconnect_attempt, e);
+                    // Will retry on next poll
+                    return Ok(event);
+                }
+            }
+        }
+
+        // Initial connection
         if self.stream.is_none() {
             self.connect().await?;
+            // Reset reconnect state on successful initial connection
+            self.reconnect_attempt = 0;
+            self.reconnect_delay = self.config.reconnect_backoff.initial_delay;
             return Ok(Event::Connected {
                 session_present: false,
             });
@@ -450,8 +514,8 @@ impl EventLoop {
                 Action::Read(result) => {
                     let n = result.map_err(ClientError::Io)?;
                     if n == 0 {
-                        self.connected = false;
-                        self.stream = None;
+                        // Connection closed by peer
+                        self.handle_unexpected_disconnect();
                         return Ok(Event::Disconnected);
                     }
                     self.read_buf.extend_from_slice(&buf[..n]);
@@ -460,14 +524,18 @@ impl EventLoop {
                 Action::Command(cmd) => match cmd {
                     Some(cmd) => self.handle_command(cmd)?,
                     None => {
+                        // Client handle dropped - clean disconnect
                         self.disconnect_internal();
                         return Ok(Event::Disconnected);
                     }
                 },
                 Action::Timeout => {
                     if self.pending_pings >= 2 {
-                        self.connected = false;
-                        self.stream = None;
+                        // Keep-alive timeout - unexpected disconnect
+                        self.handle_unexpected_disconnect();
+                        if self.config.auto_reconnect {
+                            return Ok(Event::Disconnected);
+                        }
                         return Err(ClientError::ConnectionClosed);
                     }
                     encode_packet(&Packet::Pingreq, &mut self.write_buf);
@@ -766,6 +834,19 @@ impl EventLoop {
             encode_packet(&Packet::Disconnect { reason_code: 0 }, &mut self.write_buf);
         }
         self.connected = false;
+        // Don't trigger auto-reconnect for clean disconnects
+    }
+
+    /// Handle an unexpected disconnection, triggering auto-reconnect if enabled.
+    fn handle_unexpected_disconnect(&mut self) {
+        self.connected = false;
+        self.stream = None;
+        self.read_buf.clear();
+        self.pending_pings = 0;
+
+        if self.config.auto_reconnect {
+            self.should_reconnect = true;
+        }
     }
 
     async fn try_parse_event(&mut self) -> Result<Option<Event>> {
@@ -846,8 +927,8 @@ impl EventLoop {
                         Ok(None)
                     }
                     Packet::Disconnect { .. } => {
-                        self.connected = false;
-                        self.stream = None;
+                        // Server-initiated disconnect - trigger reconnect if enabled
+                        self.handle_unexpected_disconnect();
                         Ok(Some(Event::Disconnected))
                     }
                     _ => Ok(None),

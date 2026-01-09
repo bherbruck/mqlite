@@ -1,5 +1,7 @@
 //! Client events and state types.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use mqlite_core::packet::QoS;
 
@@ -15,6 +17,13 @@ pub enum ClientEvent {
     Disconnected {
         /// Reason for disconnection, if known.
         reason: Option<String>,
+    },
+    /// Attempting to reconnect (only when auto_reconnect is enabled).
+    Reconnecting {
+        /// Current reconnection attempt number (1-based).
+        attempt: u32,
+        /// Delay before this attempt.
+        delay: Duration,
     },
     /// Received a publish message.
     Message {
@@ -64,4 +73,6 @@ pub(crate) enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
+    /// Waiting for backoff before reconnecting.
+    Reconnecting,
 }

@@ -145,6 +145,12 @@ pub struct Client {
     /// Cached TLS config for reconnection.
     #[cfg(feature = "tls")]
     tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// Current reconnection attempt number.
+    reconnect_attempt: u32,
+    /// Current backoff delay for reconnection.
+    reconnect_delay: Duration,
+    /// Time when we should attempt to reconnect.
+    reconnect_at: Option<Instant>,
 }
 
 impl Client {
@@ -161,6 +167,8 @@ impl Client {
             None
         };
 
+        let initial_delay = config.reconnect_backoff.initial_delay;
+
         Ok(Self {
             config,
             state: ConnectionState::Disconnected,
@@ -175,6 +183,9 @@ impl Client {
             packet_ids: PacketIdAllocator::new(),
             #[cfg(feature = "tls")]
             tls_config,
+            reconnect_attempt: 0,
+            reconnect_delay: initial_delay,
+            reconnect_at: None,
         })
     }
 
@@ -468,8 +479,39 @@ impl Client {
     }
 
     /// Poll for events with timeout.
+    ///
     /// Returns true if there are events to process.
+    ///
+    /// When `auto_reconnect` is enabled, this will automatically attempt to
+    /// reconnect on disconnection with exponential backoff. The `Reconnecting`
+    /// event is emitted before each attempt.
     pub fn poll(&mut self, timeout: Option<Duration>) -> Result<bool> {
+        // Handle reconnection with backoff
+        if self.state == ConnectionState::Reconnecting {
+            if let Some(reconnect_at) = self.reconnect_at {
+                if Instant::now() >= reconnect_at {
+                    // Time to attempt reconnection
+                    self.reconnect_at = None;
+
+                    match self.reconnect() {
+                        Ok(()) => {
+                            // Reconnected successfully - reset backoff
+                            self.reconnect_attempt = 0;
+                            self.reconnect_delay = self.config.reconnect_backoff.initial_delay;
+                            // Connected event will be emitted by handle_connack
+                        }
+                        Err(e) => {
+                            log::warn!("Reconnect attempt {} failed: {}", self.reconnect_attempt, e);
+                            // Schedule next attempt with increased backoff
+                            self.schedule_reconnect();
+                        }
+                    }
+                }
+            }
+            // If we're reconnecting, return early - no I/O to do
+            return Ok(!self.events.is_empty());
+        }
+
         // First, try to flush any pending writes
         if !self.write_buf.is_empty() {
             self.flush_write_buffer()?;
@@ -486,10 +528,7 @@ impl Client {
             if elapsed >= keep_alive_duration {
                 if self.pending_pings >= 2 {
                     // No response to pings, connection dead
-                    self.cleanup();
-                    self.events.push_back(ClientEvent::Disconnected {
-                        reason: Some("Keep-alive timeout".to_string()),
-                    });
+                    self.handle_unexpected_disconnect("Keep-alive timeout");
                     return Ok(!self.events.is_empty());
                 }
 
@@ -516,6 +555,40 @@ impl Client {
         }
 
         Ok(!self.events.is_empty())
+    }
+
+    /// Schedule a reconnection attempt with backoff.
+    fn schedule_reconnect(&mut self) {
+        self.reconnect_attempt += 1;
+        let delay = self.reconnect_delay;
+
+        // Emit event
+        self.events.push_back(ClientEvent::Reconnecting {
+            attempt: self.reconnect_attempt,
+            delay,
+        });
+
+        // Schedule next attempt
+        self.reconnect_at = Some(Instant::now() + delay);
+        self.state = ConnectionState::Reconnecting;
+
+        // Calculate next delay with exponential backoff
+        let next_delay = Duration::from_secs_f64(
+            delay.as_secs_f64() * self.config.reconnect_backoff.multiplier
+        );
+        self.reconnect_delay = next_delay.min(self.config.reconnect_backoff.max_delay);
+    }
+
+    /// Handle an unexpected disconnection, triggering auto-reconnect if enabled.
+    fn handle_unexpected_disconnect(&mut self, reason: &str) {
+        self.cleanup();
+        self.events.push_back(ClientEvent::Disconnected {
+            reason: Some(reason.to_string()),
+        });
+
+        if self.config.auto_reconnect {
+            self.schedule_reconnect();
+        }
     }
 
     /// Get the next event, if any.
@@ -557,11 +630,8 @@ impl Client {
         loop {
             match stream.read(&mut buf) {
                 Ok(0) => {
-                    // Connection closed
-                    self.cleanup();
-                    self.events.push_back(ClientEvent::Disconnected {
-                        reason: Some("Connection closed by peer".to_string()),
-                    });
+                    // Connection closed by peer - trigger reconnect if enabled
+                    self.handle_unexpected_disconnect("Connection closed by peer");
                     return Ok(());
                 }
                 Ok(n) => {
@@ -615,9 +685,8 @@ impl Client {
                 Ok(())
             }
             Packet::Disconnect { reason_code } => {
-                let reason = Some(format!("Disconnect reason: {}", reason_code));
-                self.cleanup();
-                self.events.push_back(ClientEvent::Disconnected { reason });
+                // Server-initiated disconnect - trigger reconnect if enabled
+                self.handle_unexpected_disconnect(&format!("Disconnect reason: {}", reason_code));
                 Ok(())
             }
             _ => Ok(()), // Ignore unexpected packets

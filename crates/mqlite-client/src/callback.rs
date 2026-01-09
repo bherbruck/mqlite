@@ -63,6 +63,14 @@ pub trait MqttHandler {
     #[allow(unused_variables)]
     fn on_disconnect(&mut self, reason: Option<&str>) {}
 
+    /// Called when attempting to reconnect (only when auto_reconnect is enabled).
+    ///
+    /// # Arguments
+    /// * `attempt` - Current reconnection attempt number (1-based)
+    /// * `delay` - Delay before this attempt
+    #[allow(unused_variables)]
+    fn on_reconnecting(&mut self, attempt: u32, delay: Duration) {}
+
     /// Called when an error occurs.
     ///
     /// # Arguments
@@ -231,6 +239,9 @@ impl<H: MqttHandler> CallbackClient<H> {
             }
             ClientEvent::PubRec { .. } => {
                 // Internal QoS 2 flow, don't notify handler
+            }
+            ClientEvent::Reconnecting { attempt, delay } => {
+                self.handler.on_reconnecting(attempt, delay);
             }
         }
     }

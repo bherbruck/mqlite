@@ -20,15 +20,119 @@ use crate::events::{ClientEvent, ConnectionState};
 use crate::packet_id::PacketIdAllocator;
 use crate::session::{PendingPublish, Qos2OutState, Session};
 
+#[cfg(feature = "tls")]
+use {
+    rustls::ClientConnection,
+    rustls::pki_types::ServerName,
+    std::sync::Arc,
+};
+
 const CLIENT: Token = Token(0);
 const DEFAULT_BUFFER_SIZE: usize = 8192;
+
+/// Stream wrapper for plain or TLS connections.
+enum ClientStream {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls {
+        tcp: TcpStream,
+        tls: ClientConnection,
+    },
+}
+
+impl ClientStream {
+    /// Get mutable reference to the underlying TCP stream for mio registration.
+    fn tcp_mut(&mut self) -> &mut TcpStream {
+        match self {
+            ClientStream::Plain(tcp) => tcp,
+            #[cfg(feature = "tls")]
+            ClientStream::Tls { tcp, .. } => tcp,
+        }
+    }
+
+}
+
+impl Read for ClientStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ClientStream::Plain(tcp) => tcp.read(buf),
+            #[cfg(feature = "tls")]
+            ClientStream::Tls { tcp, tls } => {
+                // Read encrypted data from socket into TLS
+                loop {
+                    match tls.read_tls(tcp) {
+                        Ok(0) => return Ok(0), // EOF
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                // Process TLS state machine
+                if let Err(e) = tls.process_new_packets() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                }
+
+                // Read decrypted data
+                match tls.reader().read(buf) {
+                    Ok(n) => Ok(n),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+}
+
+impl Write for ClientStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            ClientStream::Plain(tcp) => tcp.write(buf),
+            #[cfg(feature = "tls")]
+            ClientStream::Tls { tcp, tls } => {
+                // Write plaintext to TLS (gets encrypted)
+                let n = tls.writer().write(buf)?;
+
+                // Flush encrypted data to socket
+                while tls.wants_write() {
+                    match tls.write_tls(tcp) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                Ok(n)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            ClientStream::Plain(tcp) => tcp.flush(),
+            #[cfg(feature = "tls")]
+            ClientStream::Tls { tcp, tls } => {
+                while tls.wants_write() {
+                    match tls.write_tls(tcp) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                tcp.flush()
+            }
+        }
+    }
+}
 
 /// MQTT client.
 pub struct Client {
     config: ClientConfig,
     state: ConnectionState,
     poll: Poll,
-    stream: Option<TcpStream>,
+    stream: Option<ClientStream>,
     read_buf: BytesMut,
     write_buf: Vec<u8>,
     events: VecDeque<ClientEvent>,
@@ -38,6 +142,9 @@ pub struct Client {
     session: Session,
     /// Packet ID allocator
     packet_ids: PacketIdAllocator,
+    /// Cached TLS config for reconnection.
+    #[cfg(feature = "tls")]
+    tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl Client {
@@ -45,6 +152,14 @@ impl Client {
     pub fn new(config: ClientConfig) -> Result<Self> {
         let poll = Poll::new()?;
         let session = Session::new(config.client_id.clone(), config.clean_session);
+
+        // Build TLS config if enabled
+        #[cfg(feature = "tls")]
+        let tls_config = if config.tls.enabled {
+            Some(Arc::new(crate::tls::build_client_config(&config.tls)?))
+        } else {
+            None
+        };
 
         Ok(Self {
             config,
@@ -58,6 +173,8 @@ impl Client {
             pending_pings: 0,
             session,
             packet_ids: PacketIdAllocator::new(),
+            #[cfg(feature = "tls")]
+            tls_config,
         })
     }
 
@@ -82,21 +199,55 @@ impl Client {
                 ))
             })?;
 
-        // Create non-blocking TCP connection
+        // Create blocking TCP connection (for timeout support)
         let std_stream = StdTcpStream::connect_timeout(&addr, self.config.connect_timeout)?;
-        std_stream.set_nonblocking(true)?;
         std_stream.set_nodelay(true)?;
 
-        let mut stream = TcpStream::from_std(std_stream);
+        // Create the client stream (plain or TLS)
+        #[cfg(feature = "tls")]
+        let mut client_stream = if self.config.tls.enabled {
+            let tls_config = self.tls_config.as_ref()
+                .ok_or_else(|| ClientError::Tls("TLS config not initialized".to_string()))?;
+
+            // Extract hostname for SNI
+            let hostname = self.config.tls.server_name.as_deref()
+                .unwrap_or_else(|| {
+                    self.config.address.split(':').next().unwrap_or("localhost")
+                });
+
+            let server_name = ServerName::try_from(hostname.to_string())
+                .map_err(|_| ClientError::Tls(format!("Invalid server name: {}", hostname)))?;
+
+            let mut tls_conn = ClientConnection::new(tls_config.clone(), server_name)
+                .map_err(|e| ClientError::Tls(e.to_string()))?;
+
+            // Perform TLS handshake while socket is blocking
+            complete_tls_handshake(&mut tls_conn, &std_stream)?;
+
+            // Now switch to non-blocking
+            std_stream.set_nonblocking(true)?;
+            let mio_stream = TcpStream::from_std(std_stream);
+
+            ClientStream::Tls { tcp: mio_stream, tls: tls_conn }
+        } else {
+            std_stream.set_nonblocking(true)?;
+            ClientStream::Plain(TcpStream::from_std(std_stream))
+        };
+
+        #[cfg(not(feature = "tls"))]
+        let mut client_stream = {
+            std_stream.set_nonblocking(true)?;
+            ClientStream::Plain(TcpStream::from_std(std_stream))
+        };
 
         // Register with poll
         self.poll.registry().register(
-            &mut stream,
+            client_stream.tcp_mut(),
             CLIENT,
             Interest::READABLE | Interest::WRITABLE,
         )?;
 
-        self.stream = Some(stream);
+        self.stream = Some(client_stream);
         self.state = ConnectionState::Connecting;
 
         // Build CONNECT packet
@@ -735,7 +886,7 @@ impl Client {
 
     fn cleanup(&mut self) {
         if let Some(mut stream) = self.stream.take() {
-            let _ = self.poll.registry().deregister(&mut stream);
+            let _ = self.poll.registry().deregister(stream.tcp_mut());
         }
         self.state = ConnectionState::Disconnected;
         self.read_buf.clear();
@@ -748,5 +899,39 @@ impl Drop for Client {
     fn drop(&mut self) {
         let _ = self.disconnect();
     }
+}
+
+/// Complete TLS handshake using blocking I/O.
+#[cfg(feature = "tls")]
+fn complete_tls_handshake(
+    tls: &mut ClientConnection,
+    tcp: &StdTcpStream,
+) -> Result<()> {
+    // We need mutable access to tcp for read/write, but it's shared
+    // Use a mutable reference pattern
+    let mut tcp = tcp;
+
+    while tls.is_handshaking() {
+        // Write any pending TLS data
+        while tls.wants_write() {
+            tls.write_tls(&mut tcp)
+                .map_err(|e| ClientError::Tls(format!("TLS write failed: {}", e)))?;
+        }
+
+        // Read TLS data if connection wants it
+        if tls.wants_read() {
+            if tls.read_tls(&mut tcp)
+                .map_err(|e| ClientError::Tls(format!("TLS read failed: {}", e)))? == 0
+            {
+                return Err(ClientError::Tls("Connection closed during handshake".to_string()));
+            }
+
+            // Process the received data
+            tls.process_new_packets()
+                .map_err(|e| ClientError::Tls(format!("TLS handshake error: {}", e)))?;
+        }
+    }
+
+    Ok(())
 }
 

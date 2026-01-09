@@ -105,12 +105,15 @@ mod packet_id;
 mod session;
 mod will;
 
+#[cfg(feature = "tls")]
+mod tls;
+
 #[cfg(feature = "async-tokio")]
 mod async_client;
 
 pub use callback::{CallbackClient, MqttHandler};
 pub use client::Client;
-pub use config::{BackoffConfig, ClientConfig, ConnectOptions};
+pub use config::{BackoffConfig, ClientConfig, ConnectOptions, TlsConfig};
 pub use error::{ClientError, Result};
 pub use events::ClientEvent;
 pub use packet_id::PacketIdAllocator;

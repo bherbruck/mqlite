@@ -35,18 +35,73 @@
 //! while let Ok(_) = eventloop.poll().await {}
 //! ```
 
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsConnector;
+use rustls::pki_types::ServerName;
+
+use crate::config::TlsConfig;
 
 use mqlite_core::packet::{
     decode_packet, encode_packet, ConnackCode, Connect, Packet, Publish, QoS, Subscribe,
     SubscriptionOptions, Unsubscribe, Will as CoreWill,
 };
+
+/// Wrapper enum for async streams (plain TCP or TLS).
+enum AsyncStream {
+    Plain(TcpStream),
+    Tls(TlsStream<TcpStream>),
+}
+
+impl AsyncRead for AsyncStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            AsyncStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            AsyncStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for AsyncStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            AsyncStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            AsyncStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            AsyncStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            AsyncStream::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            AsyncStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            AsyncStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 use crate::config::ClientConfig;
 use crate::error::{ClientError, Result};
@@ -287,7 +342,7 @@ struct StreamSubscription {
 pub struct EventLoop {
     config: ClientConfig,
     rx: mpsc::Receiver<Command>,
-    stream: Option<TcpStream>,
+    stream: Option<AsyncStream>,
     read_buf: BytesMut,
     write_buf: Vec<u8>,
     session: Session,
@@ -297,11 +352,27 @@ pub struct EventLoop {
     connected: bool,
     /// Registered subscription streams for message routing.
     streams: Vec<StreamSubscription>,
+    /// Cached TLS config for reconnection.
+    tls_connector: Option<Arc<TlsConnector>>,
 }
 
 impl EventLoop {
     fn new(config: ClientConfig, rx: mpsc::Receiver<Command>) -> Self {
         let session = Session::new(config.client_id.clone(), config.clean_session);
+
+        // Pre-build TLS connector if TLS is enabled
+        let tls_connector = if config.tls.enabled {
+            match build_tls_config(&config.tls) {
+                Ok(tls_config) => Some(Arc::new(TlsConnector::from(Arc::new(tls_config)))),
+                Err(e) => {
+                    log::warn!("Failed to build TLS config: {}, will retry on connect", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             config,
             rx,
@@ -314,6 +385,7 @@ impl EventLoop {
             pending_pings: 0,
             connected: false,
             streams: Vec::new(),
+            tls_connector,
         }
     }
 
@@ -406,7 +478,7 @@ impl EventLoop {
     }
 
     async fn connect(&mut self) -> Result<()> {
-        let stream = tokio::time::timeout(
+        let tcp_stream = tokio::time::timeout(
             self.config.connect_timeout,
             TcpStream::connect(&self.config.address),
         )
@@ -414,7 +486,43 @@ impl EventLoop {
         .map_err(|_| ClientError::ConnectionTimeout)?
         .map_err(ClientError::Io)?;
 
-        stream.set_nodelay(true).map_err(ClientError::Io)?;
+        tcp_stream.set_nodelay(true).map_err(ClientError::Io)?;
+
+        // Wrap in TLS if enabled
+        let stream = if self.config.tls.enabled {
+            // Build TLS connector if not cached
+            let connector = match &self.tls_connector {
+                Some(c) => c.clone(),
+                None => {
+                    let tls_config = build_tls_config(&self.config.tls)?;
+                    let connector = Arc::new(TlsConnector::from(Arc::new(tls_config)));
+                    self.tls_connector = Some(connector.clone());
+                    connector
+                }
+            };
+
+            // Extract hostname for SNI
+            let hostname = self.config.tls.server_name.as_deref()
+                .unwrap_or_else(|| {
+                    self.config.address.split(':').next().unwrap_or("localhost")
+                });
+
+            let server_name = ServerName::try_from(hostname.to_string())
+                .map_err(|_| ClientError::Tls(format!("Invalid server name: {}", hostname)))?;
+
+            let tls_stream = tokio::time::timeout(
+                self.config.connect_timeout,
+                connector.connect(server_name, tcp_stream),
+            )
+            .await
+            .map_err(|_| ClientError::ConnectionTimeout)?
+            .map_err(|e| ClientError::Tls(e.to_string()))?;
+
+            AsyncStream::Tls(tls_stream)
+        } else {
+            AsyncStream::Plain(tcp_stream)
+        };
+
         self.stream = Some(stream);
 
         // Send CONNECT
@@ -871,6 +979,122 @@ fn topic_matches_filter(topic: &str, filter: &str) -> bool {
 
     // Both must be fully consumed
     ti == topic_levels.len() && fi == filter_levels.len()
+}
+
+/// Build a rustls ClientConfig from TlsConfig.
+fn build_tls_config(config: &TlsConfig) -> Result<rustls::ClientConfig> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::RootCertStore;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let mut root_store = RootCertStore::empty();
+
+    // Load custom CA certificate if provided
+    if let Some(ca_path) = &config.ca_cert {
+        let file = File::open(ca_path)
+            .map_err(|e| ClientError::Tls(format!("Failed to open CA cert: {}", e)))?;
+        let mut reader = BufReader::new(file);
+
+        let certs = rustls_pemfile::certs(&mut reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| ClientError::Tls(format!("Failed to parse CA cert: {}", e)))?;
+
+        for cert in certs {
+            root_store.add(cert)
+                .map_err(|e| ClientError::Tls(format!("Failed to add CA cert: {}", e)))?;
+        }
+    } else if !config.accept_invalid_certs {
+        // Use system root certificates (unless we're accepting invalid certs)
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    // Handle insecure mode (accept any certificate)
+    if config.accept_invalid_certs {
+        let tls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth();
+        return Ok(tls_config);
+    }
+
+    let builder = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store);
+
+    // Load client certificate for mutual TLS if provided
+    let tls_config = if let (Some(cert_path), Some(key_path)) = (&config.client_cert, &config.client_key) {
+        let cert_file = File::open(cert_path)
+            .map_err(|e| ClientError::Tls(format!("Failed to open client cert: {}", e)))?;
+        let mut cert_reader = BufReader::new(cert_file);
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| ClientError::Tls(format!("Failed to parse client cert: {}", e)))?;
+
+        let key_file = File::open(key_path)
+            .map_err(|e| ClientError::Tls(format!("Failed to open client key: {}", e)))?;
+        let mut key_reader = BufReader::new(key_file);
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|e| ClientError::Tls(format!("Failed to parse client key: {}", e)))?
+            .ok_or_else(|| ClientError::Tls("No private key found in file".to_string()))?;
+
+        builder.with_client_auth_cert(certs, key)
+            .map_err(|e| ClientError::Tls(format!("Failed to configure client auth: {}", e)))?
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    Ok(tls_config)
+}
+
+/// Danger: A certificate verifier that accepts any certificate.
+/// Only use for testing with self-signed certificates.
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
 }
 
 #[cfg(test)]

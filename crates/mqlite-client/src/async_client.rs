@@ -53,8 +53,8 @@ use rustls::pki_types::ServerName;
 use crate::config::TlsConfig;
 
 use mqlite_core::packet::{
-    decode_packet, encode_packet, ConnackCode, Connect, Packet, Publish, QoS, Subscribe,
-    SubscriptionOptions, Unsubscribe, Will as CoreWill,
+    decode_packet, encode_packet, Auth, ConnackCode, Connect, Packet, Publish, PublishProperties,
+    QoS, Subscribe, SubscriptionOptions, Unsubscribe, Will as CoreWill,
 };
 
 /// Wrapper enum for async streams (plain TCP or TLS).
@@ -188,6 +188,17 @@ pub enum Event {
         /// Delay before this attempt.
         delay: Duration,
     },
+    /// AUTH packet received (MQTT 5.0 enhanced authentication).
+    Auth {
+        /// Reason code (0x00=Success, 0x18=ContinueAuth, 0x19=ReAuthenticate).
+        reason_code: u8,
+        /// Authentication method name.
+        auth_method: Option<String>,
+        /// Authentication data.
+        auth_data: Option<Vec<u8>>,
+        /// Human-readable reason string.
+        reason_string: Option<String>,
+    },
 }
 
 /// Commands sent from AsyncClient to EventLoop.
@@ -197,6 +208,7 @@ enum Command {
         payload: Bytes,
         qos: QoS,
         retain: bool,
+        properties: Option<PublishProperties>,
         resp: oneshot::Sender<Result<Option<u16>>>,
     },
     Subscribe {
@@ -212,6 +224,12 @@ enum Command {
     Unsubscribe {
         topics: Vec<String>,
         resp: oneshot::Sender<Result<u16>>,
+    },
+    Auth {
+        reason_code: u8,
+        auth_method: Option<String>,
+        auth_data: Option<Vec<u8>>,
+        resp: oneshot::Sender<Result<()>>,
     },
     Disconnect,
 }
@@ -288,6 +306,39 @@ impl AsyncClient {
                 payload: Bytes::copy_from_slice(payload),
                 qos,
                 retain,
+                properties: None,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| ClientError::ConnectionClosed)?;
+
+        resp_rx.await.map_err(|_| ClientError::ConnectionClosed)?
+    }
+
+    /// Publish a message with MQTT 5.0 properties.
+    ///
+    /// # Arguments
+    /// * `topic` - The topic to publish to
+    /// * `payload` - Message payload
+    /// * `qos` - Quality of Service level
+    /// * `retain` - Whether to retain the message
+    /// * `properties` - MQTT 5.0 publish properties
+    pub async fn publish_with_properties(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+        properties: PublishProperties,
+    ) -> Result<Option<u16>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::Publish {
+                topic: topic.to_string(),
+                payload: Bytes::copy_from_slice(payload),
+                qos,
+                retain,
+                properties: Some(properties),
                 resp: resp_tx,
             })
             .await
@@ -334,6 +385,33 @@ impl AsyncClient {
     pub async fn disconnect(&self) -> Result<()> {
         let _ = self.tx.send(Command::Disconnect).await;
         Ok(())
+    }
+
+    /// Send an AUTH packet (MQTT 5.0 enhanced authentication).
+    ///
+    /// Used for SASL-style authentication mechanisms like SCRAM.
+    ///
+    /// # Arguments
+    /// * `reason_code` - 0x00 (Success), 0x18 (Continue Authentication), 0x19 (Re-authenticate)
+    /// * `auth_method` - The authentication method name (e.g., "SCRAM-SHA-256")
+    /// * `auth_data` - Authentication data for the mechanism
+    pub async fn auth(
+        &self,
+        reason_code: u8,
+        auth_method: Option<&str>,
+        auth_data: Option<&[u8]>,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::Auth {
+                reason_code,
+                auth_method: auth_method.map(String::from),
+                auth_data: auth_data.map(|d| d.to_vec()),
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| ClientError::ChannelClosed)?;
+        resp_rx.await.map_err(|_| ClientError::ChannelClosed)?
     }
 }
 
@@ -685,9 +763,10 @@ impl EventLoop {
                 payload,
                 qos,
                 retain,
+                properties,
                 resp,
             } => {
-                let result = self.do_publish(&topic, payload, qos, retain);
+                let result = self.do_publish(&topic, payload, qos, retain, properties);
                 let _ = resp.send(result);
             }
             Command::Subscribe { topics, resp } => {
@@ -700,6 +779,15 @@ impl EventLoop {
             }
             Command::Unsubscribe { topics, resp } => {
                 let result = self.do_unsubscribe(&topics);
+                let _ = resp.send(result);
+            }
+            Command::Auth {
+                reason_code,
+                auth_method,
+                auth_data,
+                resp,
+            } => {
+                let result = self.do_auth(reason_code, auth_method, auth_data);
                 let _ = resp.send(result);
             }
             Command::Disconnect => {
@@ -715,6 +803,7 @@ impl EventLoop {
         payload: Bytes,
         qos: QoS,
         retain: bool,
+        properties: Option<PublishProperties>,
     ) -> Result<Option<u16>> {
         if !self.connected {
             return Err(ClientError::NotConnected);
@@ -730,6 +819,15 @@ impl EventLoop {
 
         let topic_bytes = Bytes::from(topic.to_string());
 
+        // Convert properties to bytes if provided
+        let props_bytes = properties.and_then(|p| {
+            if p.is_empty() {
+                None
+            } else {
+                Some(Bytes::from(p.to_bytes()))
+            }
+        });
+
         let publish = Publish {
             dup: false,
             qos,
@@ -737,7 +835,7 @@ impl EventLoop {
             topic: topic_bytes.clone(),
             packet_id,
             payload: payload.clone(),
-            properties: None,
+            properties: props_bytes,
         };
 
         encode_packet(&Packet::Publish(publish), &mut self.write_buf);
@@ -827,6 +925,27 @@ impl EventLoop {
 
         encode_packet(&Packet::Unsubscribe(unsubscribe), &mut self.write_buf);
         Ok(packet_id)
+    }
+
+    fn do_auth(
+        &mut self,
+        reason_code: u8,
+        auth_method: Option<String>,
+        auth_data: Option<Vec<u8>>,
+    ) -> Result<()> {
+        if !self.connected && self.stream.is_none() {
+            return Err(ClientError::NotConnected);
+        }
+
+        let auth = Auth {
+            reason_code,
+            auth_method,
+            auth_data,
+            reason_string: None,
+        };
+
+        encode_packet(&Packet::Auth(auth), &mut self.write_buf);
+        Ok(())
     }
 
     fn disconnect_internal(&mut self) {
@@ -931,6 +1050,12 @@ impl EventLoop {
                         self.handle_unexpected_disconnect();
                         Ok(Some(Event::Disconnected))
                     }
+                    Packet::Auth(auth) => Ok(Some(Event::Auth {
+                        reason_code: auth.reason_code,
+                        auth_method: auth.auth_method,
+                        auth_data: auth.auth_data,
+                        reason_string: auth.reason_string,
+                    })),
                     _ => Ok(None),
                 }
             }

@@ -71,6 +71,25 @@ pub trait MqttHandler {
     #[allow(unused_variables)]
     fn on_reconnecting(&mut self, attempt: u32, delay: Duration) {}
 
+    /// Called when an AUTH packet is received (MQTT 5.0 enhanced authentication).
+    ///
+    /// # Arguments
+    /// * `client` - Reference to the client for sending AUTH response
+    /// * `reason_code` - The reason code (0x00=Success, 0x18=ContinueAuth, 0x19=ReAuthenticate)
+    /// * `auth_method` - Authentication method name
+    /// * `auth_data` - Authentication data
+    /// * `reason_string` - Human-readable reason string
+    #[allow(unused_variables)]
+    fn on_auth(
+        &mut self,
+        client: &mut Client,
+        reason_code: u8,
+        auth_method: Option<&str>,
+        auth_data: Option<&[u8]>,
+        reason_string: Option<&str>,
+    ) {
+    }
+
     /// Called when an error occurs.
     ///
     /// # Arguments
@@ -242,6 +261,20 @@ impl<H: MqttHandler> CallbackClient<H> {
             }
             ClientEvent::Reconnecting { attempt, delay } => {
                 self.handler.on_reconnecting(attempt, delay);
+            }
+            ClientEvent::Auth {
+                reason_code,
+                auth_method,
+                auth_data,
+                reason_string,
+            } => {
+                self.handler.on_auth(
+                    &mut self.client,
+                    reason_code,
+                    auth_method.as_deref(),
+                    auth_data.as_deref(),
+                    reason_string.as_deref(),
+                );
             }
         }
     }

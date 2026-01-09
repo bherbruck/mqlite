@@ -10,8 +10,9 @@ use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 
 use mqlite_core::packet::{
-    decode_packet, encode_packet, Connack, ConnackCode, Connect, Packet, Publish, QoS, Suback,
-    Subscribe, SubscriptionOptions, Unsuback, Unsubscribe, Will as CoreWill,
+    decode_packet, encode_packet, Auth, Connack, ConnackCode, Connect, Packet, Publish,
+    PublishProperties, QoS, Suback, Subscribe, SubscriptionOptions, Unsuback, Unsubscribe,
+    Will as CoreWill,
 };
 
 use crate::config::{ClientConfig, ConnectOptions};
@@ -343,6 +344,36 @@ impl Client {
         Ok(())
     }
 
+    /// Send an AUTH packet (MQTT 5.0 enhanced authentication).
+    ///
+    /// Used for SASL-style authentication mechanisms like SCRAM.
+    ///
+    /// # Arguments
+    /// * `reason_code` - 0x00 (Success), 0x18 (Continue Authentication), 0x19 (Re-authenticate)
+    /// * `auth_method` - The authentication method name (e.g., "SCRAM-SHA-256")
+    /// * `auth_data` - Authentication data for the mechanism
+    pub fn send_auth(
+        &mut self,
+        reason_code: u8,
+        auth_method: Option<&str>,
+        auth_data: Option<&[u8]>,
+    ) -> Result<()> {
+        if self.state != ConnectionState::Connected && self.state != ConnectionState::Connecting {
+            return Err(ClientError::NotConnected);
+        }
+
+        let auth = Auth {
+            reason_code,
+            auth_method: auth_method.map(String::from),
+            auth_data: auth_data.map(|d| d.to_vec()),
+            reason_string: None,
+        };
+
+        encode_packet(&Packet::Auth(auth), &mut self.write_buf);
+
+        Ok(())
+    }
+
     /// Subscribe to topics with default options.
     ///
     /// For MQTT 5.0 subscription options (NoLocal, RetainAsPublished, etc.),
@@ -460,6 +491,76 @@ impl Client {
             packet_id,
             payload: payload_bytes.clone(),
             properties: None,
+        };
+
+        encode_packet(&Packet::Publish(publish), &mut self.write_buf);
+        self.last_packet_time = Instant::now();
+
+        // Track pending messages for QoS > 0
+        if let Some(id) = packet_id {
+            let pending = PendingPublish::new(id, topic_bytes, payload_bytes, qos, retain);
+            match qos {
+                QoS::AtLeastOnce => self.session.add_qos1_pending(pending),
+                QoS::ExactlyOnce => self.session.add_qos2_pending(pending),
+                QoS::AtMostOnce => {}
+            }
+        }
+
+        Ok(packet_id)
+    }
+
+    /// Publish a message with MQTT 5.0 properties.
+    ///
+    /// # Arguments
+    /// * `topic` - The topic to publish to
+    /// * `payload` - Message payload
+    /// * `qos` - Quality of Service level
+    /// * `retain` - Whether to retain the message
+    /// * `properties` - MQTT 5.0 publish properties
+    pub fn publish_with_properties(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+        properties: &PublishProperties,
+    ) -> Result<Option<u16>> {
+        if self.state != ConnectionState::Connected {
+            return Err(ClientError::NotConnected);
+        }
+
+        // Check inflight limit
+        if self.config.max_inflight > 0 && self.session.pending_count() >= self.config.max_inflight
+        {
+            return Err(ClientError::InvalidState(
+                "Max inflight messages reached".to_string(),
+            ));
+        }
+
+        let packet_id = if qos != QoS::AtMostOnce {
+            Some(self.allocate_packet_id()?)
+        } else {
+            None
+        };
+
+        let topic_bytes = Bytes::from(topic.to_string());
+        let payload_bytes = Bytes::copy_from_slice(payload);
+
+        // Encode properties to bytes
+        let props_bytes = if properties.is_empty() {
+            None
+        } else {
+            Some(Bytes::from(properties.to_bytes()))
+        };
+
+        let publish = Publish {
+            dup: false,
+            qos,
+            retain,
+            topic: topic_bytes.clone(),
+            packet_id,
+            payload: payload_bytes.clone(),
+            properties: props_bytes,
         };
 
         encode_packet(&Packet::Publish(publish), &mut self.write_buf);
@@ -687,6 +788,15 @@ impl Client {
             Packet::Disconnect { reason_code } => {
                 // Server-initiated disconnect - trigger reconnect if enabled
                 self.handle_unexpected_disconnect(&format!("Disconnect reason: {}", reason_code));
+                Ok(())
+            }
+            Packet::Auth(auth) => {
+                self.events.push_back(ClientEvent::Auth {
+                    reason_code: auth.reason_code,
+                    auth_method: auth.auth_method,
+                    auth_data: auth.auth_data,
+                    reason_string: auth.reason_string,
+                });
                 Ok(())
             }
             _ => Ok(()), // Ignore unexpected packets

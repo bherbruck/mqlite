@@ -65,6 +65,17 @@ pub enum ClientEvent {
         /// Packet ID.
         packet_id: u16,
     },
+    /// AUTH packet received (MQTT 5.0 enhanced authentication).
+    Auth {
+        /// Reason code (0x00=Success, 0x18=ContinueAuth, 0x19=ReAuthenticate).
+        reason_code: u8,
+        /// Authentication method name.
+        auth_method: Option<String>,
+        /// Authentication data.
+        auth_data: Option<Vec<u8>>,
+        /// Human-readable reason string.
+        reason_string: Option<String>,
+    },
 }
 
 /// Connection state.

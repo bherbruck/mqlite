@@ -124,4 +124,4 @@ pub use will::Will;
 pub use async_client::{AsyncClient, Event, EventLoop, Message, MessageStream};
 
 // Re-export useful types from core
-pub use mqlite_core::packet::{Publish, QoS, SubscriptionOptions};
+pub use mqlite_core::packet::{Publish, PublishProperties, QoS, SubscriptionOptions};

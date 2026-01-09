@@ -1,5 +1,7 @@
 //! Client events and state types.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use mqlite_core::packet::QoS;
 
@@ -15,6 +17,13 @@ pub enum ClientEvent {
     Disconnected {
         /// Reason for disconnection, if known.
         reason: Option<String>,
+    },
+    /// Attempting to reconnect (only when auto_reconnect is enabled).
+    Reconnecting {
+        /// Current reconnection attempt number (1-based).
+        attempt: u32,
+        /// Delay before this attempt.
+        delay: Duration,
     },
     /// Received a publish message.
     Message {
@@ -56,6 +65,17 @@ pub enum ClientEvent {
         /// Packet ID.
         packet_id: u16,
     },
+    /// AUTH packet received (MQTT 5.0 enhanced authentication).
+    Auth {
+        /// Reason code (0x00=Success, 0x18=ContinueAuth, 0x19=ReAuthenticate).
+        reason_code: u8,
+        /// Authentication method name.
+        auth_method: Option<String>,
+        /// Authentication data.
+        auth_data: Option<Vec<u8>>,
+        /// Human-readable reason string.
+        reason_string: Option<String>,
+    },
 }
 
 /// Connection state.
@@ -64,4 +84,6 @@ pub(crate) enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
+    /// Waiting for backoff before reconnecting.
+    Reconnecting,
 }

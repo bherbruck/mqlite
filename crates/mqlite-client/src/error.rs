@@ -25,6 +25,9 @@ pub enum ClientError {
     #[error("Not connected")]
     NotConnected,
 
+    #[error("Channel closed")]
+    ChannelClosed,
+
     #[error("Invalid state: {0}")]
     InvalidState(String),
 

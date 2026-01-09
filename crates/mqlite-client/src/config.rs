@@ -1,6 +1,47 @@
 //! Client configuration types.
 
+use std::path::PathBuf;
 use std::time::Duration;
+
+use crate::will::Will;
+
+/// TLS configuration options.
+#[derive(Debug, Clone, Default)]
+pub struct TlsConfig {
+    /// Enable TLS (default: false, auto-enabled if ca_cert is set).
+    pub enabled: bool,
+    /// Path to CA certificate file (PEM format).
+    pub ca_cert: Option<PathBuf>,
+    /// Path to client certificate file (PEM format) for mutual TLS.
+    pub client_cert: Option<PathBuf>,
+    /// Path to client private key file (PEM format) for mutual TLS.
+    pub client_key: Option<PathBuf>,
+    /// Skip server certificate verification (INSECURE - for testing only).
+    pub accept_invalid_certs: bool,
+    /// Server name for SNI (defaults to hostname from address).
+    pub server_name: Option<String>,
+}
+
+/// Reconnection backoff configuration.
+#[derive(Debug, Clone)]
+pub struct BackoffConfig {
+    /// Initial delay before first reconnect attempt.
+    pub initial_delay: Duration,
+    /// Maximum delay between reconnect attempts.
+    pub max_delay: Duration,
+    /// Multiplier applied to delay after each failed attempt.
+    pub multiplier: f64,
+}
+
+impl Default for BackoffConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+            multiplier: 2.0,
+        }
+    }
+}
 
 /// Client configuration.
 #[derive(Debug, Clone)]
@@ -21,6 +62,18 @@ pub struct ClientConfig {
     pub protocol_version: u8,
     /// Connection timeout.
     pub connect_timeout: Duration,
+    /// Last Will and Testament message.
+    pub will: Option<Will>,
+    /// Retry interval for unacknowledged QoS 1/2 messages.
+    pub retry_interval: Duration,
+    /// Maximum number of in-flight messages (0 = unlimited).
+    pub max_inflight: usize,
+    /// Enable automatic reconnection.
+    pub auto_reconnect: bool,
+    /// Reconnection backoff configuration.
+    pub reconnect_backoff: BackoffConfig,
+    /// TLS configuration.
+    pub tls: TlsConfig,
 }
 
 impl Default for ClientConfig {
@@ -34,7 +87,51 @@ impl Default for ClientConfig {
             clean_session: true,
             protocol_version: 4, // MQTT 3.1.1
             connect_timeout: Duration::from_secs(10),
+            will: None,
+            retry_interval: Duration::from_secs(20),
+            max_inflight: 65535,
+            auto_reconnect: false,
+            reconnect_backoff: BackoffConfig::default(),
+            tls: TlsConfig::default(),
         }
+    }
+}
+
+impl TlsConfig {
+    /// Enable TLS with system root certificates.
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    /// Enable TLS with a custom CA certificate.
+    pub fn with_ca_cert(ca_cert: impl Into<PathBuf>) -> Self {
+        Self {
+            enabled: true,
+            ca_cert: Some(ca_cert.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Set client certificate and key for mutual TLS.
+    pub fn client_auth(mut self, cert: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
+        self.client_cert = Some(cert.into());
+        self.client_key = Some(key.into());
+        self
+    }
+
+    /// Skip server certificate verification (INSECURE).
+    pub fn accept_invalid_certs(mut self) -> Self {
+        self.accept_invalid_certs = true;
+        self
+    }
+
+    /// Set server name for SNI.
+    pub fn server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name = Some(name.into());
+        self
     }
 }
 
@@ -85,6 +182,48 @@ impl ClientConfig {
     /// Set connection timeout.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
+        self
+    }
+
+    /// Set the Last Will and Testament message.
+    pub fn will(mut self, will: Will) -> Self {
+        self.will = Some(will);
+        self
+    }
+
+    /// Set retry interval for unacknowledged messages.
+    pub fn retry_interval(mut self, interval: Duration) -> Self {
+        self.retry_interval = interval;
+        self
+    }
+
+    /// Set maximum number of in-flight messages.
+    pub fn max_inflight(mut self, max: usize) -> Self {
+        self.max_inflight = max;
+        self
+    }
+
+    /// Enable automatic reconnection.
+    pub fn auto_reconnect(mut self, enabled: bool) -> Self {
+        self.auto_reconnect = enabled;
+        self
+    }
+
+    /// Set reconnection backoff configuration.
+    pub fn reconnect_backoff(mut self, backoff: BackoffConfig) -> Self {
+        self.reconnect_backoff = backoff;
+        self
+    }
+
+    /// Enable TLS with default settings (system root certificates).
+    pub fn tls(mut self) -> Self {
+        self.tls = TlsConfig::enabled();
+        self
+    }
+
+    /// Configure TLS with custom settings.
+    pub fn tls_config(mut self, tls: TlsConfig) -> Self {
+        self.tls = tls;
         self
     }
 }

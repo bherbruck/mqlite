@@ -192,7 +192,6 @@ pub struct ConnackProperties {
 
 /// MQTT v5 PUBLISH properties.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // Reserved for future PUBLISH properties support
 pub struct PublishProperties {
     pub payload_format_indicator: Option<u8>,
     pub message_expiry_interval: Option<u32>,
@@ -202,6 +201,108 @@ pub struct PublishProperties {
     pub user_properties: Vec<(String, String)>,
     pub subscription_identifier: Option<u32>,
     pub content_type: Option<String>,
+}
+
+impl PublishProperties {
+    /// Parse publish properties from raw bytes.
+    ///
+    /// This is useful when you have a Publish with raw properties bytes
+    /// and want to access them in a structured way.
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut dec = Decoder::new(data);
+        let mut props = Self::default();
+
+        while dec.remaining() > 0 {
+            let prop_id = dec.read_u8()?;
+            match prop_id {
+                0x01 => props.payload_format_indicator = Some(dec.read_u8()?),
+                0x02 => props.message_expiry_interval = Some(dec.read_u32()?),
+                0x03 => props.content_type = Some(dec.read_string()?),
+                0x08 => props.response_topic = Some(dec.read_string()?),
+                0x09 => {
+                    let len = dec.read_u16()? as usize;
+                    props.correlation_data = Some(dec.read_bytes(len)?.to_vec());
+                }
+                0x0B => props.subscription_identifier = Some(dec.read_variable_byte_integer()?),
+                0x23 => props.topic_alias = Some(dec.read_u16()?),
+                0x26 => {
+                    let key = dec.read_string()?;
+                    let value = dec.read_string()?;
+                    props.user_properties.push((key, value));
+                }
+                _ => {
+                    // Unknown property, skip based on type
+                    // For safety, break on unknown properties
+                    break;
+                }
+            }
+        }
+
+        Ok(props)
+    }
+
+    /// Encode publish properties to bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        if let Some(pfi) = self.payload_format_indicator {
+            buf.push(0x01);
+            buf.push(pfi);
+        }
+        if let Some(mei) = self.message_expiry_interval {
+            buf.push(0x02);
+            buf.extend_from_slice(&mei.to_be_bytes());
+        }
+        if let Some(ref ct) = self.content_type {
+            buf.push(0x03);
+            buf.push((ct.len() >> 8) as u8);
+            buf.push(ct.len() as u8);
+            buf.extend_from_slice(ct.as_bytes());
+        }
+        if let Some(ref rt) = self.response_topic {
+            buf.push(0x08);
+            buf.push((rt.len() >> 8) as u8);
+            buf.push(rt.len() as u8);
+            buf.extend_from_slice(rt.as_bytes());
+        }
+        if let Some(ref cd) = self.correlation_data {
+            buf.push(0x09);
+            buf.push((cd.len() >> 8) as u8);
+            buf.push(cd.len() as u8);
+            buf.extend_from_slice(cd);
+        }
+        if let Some(si) = self.subscription_identifier {
+            buf.push(0x0B);
+            encode_variable_byte_integer(si, &mut buf);
+        }
+        if let Some(ta) = self.topic_alias {
+            buf.push(0x23);
+            buf.extend_from_slice(&ta.to_be_bytes());
+        }
+        for (key, value) in &self.user_properties {
+            buf.push(0x26);
+            buf.push((key.len() >> 8) as u8);
+            buf.push(key.len() as u8);
+            buf.extend_from_slice(key.as_bytes());
+            buf.push((value.len() >> 8) as u8);
+            buf.push(value.len() as u8);
+            buf.extend_from_slice(value.as_bytes());
+        }
+
+        buf
+    }
+
+    /// Check if properties are empty.
+    pub fn is_empty(&self) -> bool {
+        self.payload_format_indicator.is_none()
+            && self.message_expiry_interval.is_none()
+            && self.topic_alias.is_none()
+            && self.response_topic.is_none()
+            && self.correlation_data.is_none()
+            && self.user_properties.is_empty()
+            && self.subscription_identifier.is_none()
+            && self.content_type.is_none()
+    }
 }
 
 /// MQTT v5 subscription options.
@@ -257,6 +358,8 @@ pub enum Packet {
     Disconnect {
         reason_code: u8,
     },
+    /// AUTH packet (MQTT 5.0 only) for enhanced authentication.
+    Auth(Auth),
 }
 
 /// CONNECT packet data.
@@ -346,6 +449,21 @@ pub struct Unsubscribe {
     pub topics: Vec<String>,
 }
 
+/// AUTH packet data (MQTT 5.0 only).
+///
+/// Used for enhanced authentication, including SASL-based mechanisms.
+#[derive(Debug, Clone)]
+pub struct Auth {
+    /// Reason code (0x00=Success, 0x18=ContinueAuth, 0x19=ReAuthenticate).
+    pub reason_code: u8,
+    /// Authentication method name (e.g., "SCRAM-SHA-256").
+    pub auth_method: Option<String>,
+    /// Authentication data (opaque binary data for the auth mechanism).
+    pub auth_data: Option<Vec<u8>>,
+    /// Human-readable reason string.
+    pub reason_string: Option<String>,
+}
+
 /// Decoder for MQTT packets.
 pub struct Decoder<'a> {
     buf: &'a [u8],
@@ -359,6 +477,10 @@ impl<'a> Decoder<'a> {
 
     fn remaining(&self) -> usize {
         self.buf.len() - self.pos
+    }
+
+    fn skip(&mut self, n: usize) {
+        self.pos = (self.pos + n).min(self.buf.len());
     }
 
     fn read_u8(&mut self) -> Result<u8> {
@@ -634,21 +756,27 @@ pub fn decode_packet(
 
     let packet = match packet_type {
         PacketType::Connect => decode_connect(payload)?,
+        PacketType::Connack => decode_connack(payload, is_v5)?,
         PacketType::Publish => decode_publish(flags, payload, is_v5)?,
         PacketType::Puback => decode_puback(payload)?,
         PacketType::Pubrec => decode_pubrec(payload)?,
         PacketType::Pubrel => decode_pubrel(payload)?,
         PacketType::Pubcomp => decode_pubcomp(payload)?,
         PacketType::Subscribe => decode_subscribe(payload, is_v5)?,
+        PacketType::Suback => decode_suback(payload, is_v5)?,
         PacketType::Unsubscribe => decode_unsubscribe(payload, is_v5)?,
+        PacketType::Unsuback => decode_unsuback(payload, is_v5)?,
         PacketType::Pingreq => Packet::Pingreq,
+        PacketType::Pingresp => Packet::Pingresp,
         PacketType::Disconnect => decode_disconnect(payload, is_v5)?,
-        _ => {
-            return Err(ProtocolError::MalformedPacket(format!(
-                "Unexpected packet type from client: {:?}",
-                packet_type
-            ))
-            .into())
+        PacketType::Auth => {
+            if !is_v5 {
+                return Err(ProtocolError::MalformedPacket(
+                    "AUTH packet only valid for MQTT 5.0".to_string(),
+                )
+                .into());
+            }
+            decode_auth(payload)?
         }
     };
 
@@ -837,6 +965,92 @@ fn decode_pubcomp(payload: &[u8]) -> Result<Packet> {
     Ok(Packet::Pubcomp { packet_id })
 }
 
+fn decode_connack(payload: &[u8], is_v5: bool) -> Result<Packet> {
+    let mut dec = Decoder::new(payload);
+
+    // Session Present flag (bit 0 of Connect Acknowledge Flags)
+    let ack_flags = dec.read_u8()?;
+    let session_present = (ack_flags & 0x01) != 0;
+
+    // Connect Return Code (MQTT 3.1.1) or Reason Code (MQTT 5.0)
+    let code_byte = dec.read_u8()?;
+    let code = match code_byte {
+        0 => ConnackCode::Accepted,
+        1 => ConnackCode::UnacceptableProtocolVersion,
+        2 => ConnackCode::IdentifierRejected,
+        3 => ConnackCode::ServerUnavailable,
+        4 => ConnackCode::BadUsernamePassword,
+        5 => ConnackCode::NotAuthorized,
+        _ => ConnackCode::ServerUnavailable, // Unknown codes map to server unavailable
+    };
+
+    // MQTT 5.0 properties (skip for now)
+    let properties = if is_v5 && dec.remaining() > 0 {
+        // Skip properties for now - just read the length and skip
+        let prop_len = dec.read_variable_byte_integer()? as usize;
+        if dec.remaining() >= prop_len {
+            dec.skip(prop_len);
+        }
+        None
+    } else {
+        None
+    };
+
+    Ok(Packet::Connack(Connack {
+        session_present,
+        code,
+        reason_code: None,
+        properties,
+    }))
+}
+
+fn decode_suback(payload: &[u8], is_v5: bool) -> Result<Packet> {
+    let mut dec = Decoder::new(payload);
+    let packet_id = dec.read_u16()?;
+
+    // MQTT 5.0 properties
+    if is_v5 {
+        let prop_len = dec.read_variable_byte_integer()? as usize;
+        dec.skip(prop_len);
+    }
+
+    // Return codes
+    let mut return_codes = Vec::new();
+    while dec.remaining() > 0 {
+        return_codes.push(dec.read_u8()?);
+    }
+
+    Ok(Packet::Suback(Suback {
+        packet_id,
+        return_codes,
+        is_v5,
+    }))
+}
+
+fn decode_unsuback(payload: &[u8], is_v5: bool) -> Result<Packet> {
+    let mut dec = Decoder::new(payload);
+    let packet_id = dec.read_u16()?;
+
+    // MQTT 5.0 has properties and reason codes, v3.1.1 has no payload
+    let reason_codes = if is_v5 {
+        let prop_len = dec.read_variable_byte_integer()? as usize;
+        dec.skip(prop_len);
+        let mut codes = Vec::new();
+        while dec.remaining() > 0 {
+            codes.push(dec.read_u8()?);
+        }
+        codes
+    } else {
+        Vec::new()
+    };
+
+    Ok(Packet::Unsuback(Unsuback {
+        packet_id,
+        reason_codes,
+        is_v5,
+    }))
+}
+
 fn decode_subscribe(payload: &[u8], is_v5: bool) -> Result<Packet> {
     let mut dec = Decoder::new(payload);
     let packet_id = dec.read_u16()?;
@@ -978,20 +1192,151 @@ fn decode_disconnect(payload: &[u8], is_v5: bool) -> Result<Packet> {
     Ok(Packet::Disconnect { reason_code })
 }
 
+/// Decode MQTT 5.0 AUTH packet.
+fn decode_auth(payload: &[u8]) -> Result<Packet> {
+    if payload.is_empty() {
+        // Empty payload means success with no properties
+        return Ok(Packet::Auth(Auth {
+            reason_code: 0x00,
+            auth_method: None,
+            auth_data: None,
+            reason_string: None,
+        }));
+    }
+
+    let mut dec = Decoder::new(payload);
+
+    // Reason code (first byte)
+    let reason_code = dec.read_u8()?;
+
+    // Properties
+    let mut auth_method = None;
+    let mut auth_data = None;
+    let mut reason_string = None;
+
+    if dec.remaining() > 0 {
+        let prop_len = dec.read_variable_byte_integer()? as usize;
+        let prop_end = dec.pos + prop_len;
+
+        while dec.pos < prop_end && dec.remaining() > 0 {
+            let prop_id = dec.read_u8()?;
+            match prop_id {
+                0x15 => {
+                    // Authentication Method (UTF-8 string)
+                    auth_method = Some(dec.read_string()?);
+                }
+                0x16 => {
+                    // Authentication Data (binary)
+                    let len = dec.read_u16()? as usize;
+                    let data = dec.read_bytes(len)?;
+                    auth_data = Some(data.to_vec());
+                }
+                0x1F => {
+                    // Reason String (UTF-8 string)
+                    reason_string = Some(dec.read_string()?);
+                }
+                0x26 => {
+                    // User Property (skip - key and value are both UTF-8 strings)
+                    let _ = dec.read_string()?; // key
+                    let _ = dec.read_string()?; // value
+                }
+                _ => {
+                    // Unknown property - skip based on type
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(Packet::Auth(Auth {
+        reason_code,
+        auth_method,
+        auth_data,
+        reason_string,
+    }))
+}
+
+/// Encode MQTT 5.0 AUTH packet.
+fn encode_auth(auth: &Auth, buf: &mut Vec<u8>) {
+    // Calculate properties length
+    let mut props_len = 0;
+
+    if let Some(ref method) = auth.auth_method {
+        props_len += 1 + 2 + method.len(); // prop_id + len + string
+    }
+    if let Some(ref data) = auth.auth_data {
+        props_len += 1 + 2 + data.len(); // prop_id + len + data
+    }
+    if let Some(ref reason) = auth.reason_string {
+        props_len += 1 + 2 + reason.len(); // prop_id + len + string
+    }
+
+    // Calculate remaining length
+    let props_len_bytes = variable_byte_integer_len(props_len as u32);
+    let remaining_len = 1 + props_len_bytes + props_len; // reason_code + props_len + props
+
+    // Fixed header
+    buf.push((PacketType::Auth as u8) << 4);
+    encode_remaining_length_vec(remaining_len, buf);
+
+    // Reason code
+    buf.push(auth.reason_code);
+
+    // Properties length
+    encode_variable_byte_integer(props_len as u32, buf);
+
+    // Properties
+    if let Some(ref method) = auth.auth_method {
+        buf.push(0x15); // Authentication Method
+        buf.push((method.len() >> 8) as u8);
+        buf.push(method.len() as u8);
+        buf.extend_from_slice(method.as_bytes());
+    }
+    if let Some(ref data) = auth.auth_data {
+        buf.push(0x16); // Authentication Data
+        buf.push((data.len() >> 8) as u8);
+        buf.push(data.len() as u8);
+        buf.extend_from_slice(data);
+    }
+    if let Some(ref reason) = auth.reason_string {
+        buf.push(0x1F); // Reason String
+        buf.push((reason.len() >> 8) as u8);
+        buf.push(reason.len() as u8);
+        buf.extend_from_slice(reason.as_bytes());
+    }
+}
+
+/// Calculate the number of bytes needed for a variable byte integer.
+fn variable_byte_integer_len(mut val: u32) -> usize {
+    let mut len = 0;
+    loop {
+        len += 1;
+        val /= 128;
+        if val == 0 {
+            break;
+        }
+    }
+    len
+}
+
 /// Encode a packet into the provided buffer.
-/// Returns the number of bytes written.
 pub fn encode_packet(packet: &Packet, buf: &mut Vec<u8>) {
     match packet {
+        Packet::Connect(connect) => encode_connect(connect, buf),
         Packet::Connack(connack) => encode_connack(connack, buf),
         Packet::Publish(publish) => encode_publish(publish, buf),
         Packet::Puback { packet_id } => encode_simple_ack(PacketType::Puback, *packet_id, buf),
         Packet::Pubrec { packet_id } => encode_simple_ack(PacketType::Pubrec, *packet_id, buf),
         Packet::Pubrel { packet_id } => encode_pubrel(*packet_id, buf),
         Packet::Pubcomp { packet_id } => encode_simple_ack(PacketType::Pubcomp, *packet_id, buf),
+        Packet::Subscribe(subscribe) => encode_subscribe(subscribe, buf),
         Packet::Suback(suback) => encode_suback(suback, buf),
+        Packet::Unsubscribe(unsubscribe) => encode_unsubscribe(unsubscribe, buf),
         Packet::Unsuback(unsuback) => encode_unsuback(unsuback, buf),
+        Packet::Pingreq => encode_pingreq(buf),
         Packet::Pingresp => encode_pingresp(buf),
-        _ => {} // Client-only packets, don't encode
+        Packet::Disconnect { reason_code } => encode_disconnect(*reason_code, buf),
+        Packet::Auth(auth) => encode_auth(auth, buf),
     }
 }
 
@@ -1639,4 +1984,212 @@ pub fn validate_topic(topic: &[u8], max_length: usize, max_levels: usize) -> Res
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========== AUTH packet tests ==========
+
+    // Helper to decode a packet for tests (MQTT 5.0, large max size)
+    fn decode_test_packet(buf: &[u8]) -> Packet {
+        decode_packet(buf, 5, 1024 * 1024)
+            .unwrap()
+            .expect("Expected packet")
+            .0
+    }
+
+    #[test]
+    fn test_auth_encode_decode_empty() {
+        // Empty AUTH packet (success with no properties)
+        let auth = Auth {
+            reason_code: 0x00,
+            auth_method: None,
+            auth_data: None,
+            reason_string: None,
+        };
+
+        let mut buf = Vec::new();
+        encode_packet(&Packet::Auth(auth), &mut buf);
+
+        // Decode it back
+        let packet = decode_test_packet(&buf);
+        if let Packet::Auth(decoded) = packet {
+            assert_eq!(decoded.reason_code, 0x00);
+            assert!(decoded.auth_method.is_none());
+            assert!(decoded.auth_data.is_none());
+            assert!(decoded.reason_string.is_none());
+        } else {
+            panic!("Expected Auth packet");
+        }
+    }
+
+    #[test]
+    fn test_auth_encode_decode_with_method() {
+        let auth = Auth {
+            reason_code: 0x18, // Continue Authentication
+            auth_method: Some("SCRAM-SHA-256".to_string()),
+            auth_data: Some(vec![0x01, 0x02, 0x03, 0x04]),
+            reason_string: None,
+        };
+
+        let mut buf = Vec::new();
+        encode_packet(&Packet::Auth(auth), &mut buf);
+
+        let packet = decode_test_packet(&buf);
+        if let Packet::Auth(decoded) = packet {
+            assert_eq!(decoded.reason_code, 0x18);
+            assert_eq!(decoded.auth_method, Some("SCRAM-SHA-256".to_string()));
+            assert_eq!(decoded.auth_data, Some(vec![0x01, 0x02, 0x03, 0x04]));
+        } else {
+            panic!("Expected Auth packet");
+        }
+    }
+
+    #[test]
+    fn test_auth_encode_decode_with_reason_string() {
+        let auth = Auth {
+            reason_code: 0x00,
+            auth_method: Some("PLAIN".to_string()),
+            auth_data: None,
+            reason_string: Some("Authentication successful".to_string()),
+        };
+
+        let mut buf = Vec::new();
+        encode_packet(&Packet::Auth(auth), &mut buf);
+
+        let packet = decode_test_packet(&buf);
+        if let Packet::Auth(decoded) = packet {
+            assert_eq!(decoded.reason_code, 0x00);
+            assert_eq!(decoded.auth_method, Some("PLAIN".to_string()));
+            assert_eq!(
+                decoded.reason_string,
+                Some("Authentication successful".to_string())
+            );
+        } else {
+            panic!("Expected Auth packet");
+        }
+    }
+
+    // ========== PublishProperties tests ==========
+
+    #[test]
+    fn test_publish_properties_empty() {
+        let props = PublishProperties::default();
+        assert!(props.is_empty());
+
+        let bytes = props.to_bytes();
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn test_publish_properties_message_expiry() {
+        let props = PublishProperties {
+            message_expiry_interval: Some(3600),
+            ..Default::default()
+        };
+
+        assert!(!props.is_empty());
+
+        let bytes = props.to_bytes();
+        let decoded = PublishProperties::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.message_expiry_interval, Some(3600));
+    }
+
+    #[test]
+    fn test_publish_properties_content_type() {
+        let props = PublishProperties {
+            content_type: Some("application/json".to_string()),
+            ..Default::default()
+        };
+
+        let bytes = props.to_bytes();
+        let decoded = PublishProperties::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.content_type, Some("application/json".to_string()));
+    }
+
+    #[test]
+    fn test_publish_properties_response_topic() {
+        let props = PublishProperties {
+            response_topic: Some("response/topic".to_string()),
+            correlation_data: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            ..Default::default()
+        };
+
+        let bytes = props.to_bytes();
+        let decoded = PublishProperties::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.response_topic, Some("response/topic".to_string()));
+        assert_eq!(decoded.correlation_data, Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+    }
+
+    #[test]
+    fn test_publish_properties_topic_alias() {
+        let props = PublishProperties {
+            topic_alias: Some(42),
+            ..Default::default()
+        };
+
+        let bytes = props.to_bytes();
+        let decoded = PublishProperties::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.topic_alias, Some(42));
+    }
+
+    #[test]
+    fn test_publish_properties_user_properties() {
+        let props = PublishProperties {
+            user_properties: vec![
+                ("key1".to_string(), "value1".to_string()),
+                ("key2".to_string(), "value2".to_string()),
+            ],
+            ..Default::default()
+        };
+
+        let bytes = props.to_bytes();
+        let decoded = PublishProperties::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.user_properties.len(), 2);
+        assert_eq!(
+            decoded.user_properties[0],
+            ("key1".to_string(), "value1".to_string())
+        );
+        assert_eq!(
+            decoded.user_properties[1],
+            ("key2".to_string(), "value2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_publish_properties_all_fields() {
+        let props = PublishProperties {
+            payload_format_indicator: Some(1),
+            message_expiry_interval: Some(7200),
+            content_type: Some("text/plain".to_string()),
+            response_topic: Some("reply/here".to_string()),
+            correlation_data: Some(vec![1, 2, 3]),
+            subscription_identifier: Some(100),
+            topic_alias: Some(5),
+            user_properties: vec![("custom".to_string(), "data".to_string())],
+        };
+
+        let bytes = props.to_bytes();
+        let decoded = PublishProperties::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.payload_format_indicator, Some(1));
+        assert_eq!(decoded.message_expiry_interval, Some(7200));
+        assert_eq!(decoded.content_type, Some("text/plain".to_string()));
+        assert_eq!(decoded.response_topic, Some("reply/here".to_string()));
+        assert_eq!(decoded.correlation_data, Some(vec![1, 2, 3]));
+        assert_eq!(decoded.subscription_identifier, Some(100));
+        assert_eq!(decoded.topic_alias, Some(5));
+        assert_eq!(decoded.user_properties.len(), 1);
+        assert_eq!(
+            decoded.user_properties[0],
+            ("custom".to_string(), "data".to_string())
+        );
+    }
 }

@@ -10,36 +10,161 @@ use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 
 use mqlite_core::packet::{
-    decode_packet, encode_connect, encode_disconnect, encode_pingreq, encode_publish,
-    encode_subscribe, encode_unsubscribe, Connack, ConnackCode, Connect, Packet, Publish, QoS,
-    Suback, Subscribe, SubscriptionOptions, Unsuback, Unsubscribe,
+    decode_packet, encode_packet, Auth, Connack, ConnackCode, Connect, Packet, Publish,
+    PublishProperties, QoS, Suback, Subscribe, SubscriptionOptions, Unsuback, Unsubscribe,
+    Will as CoreWill,
 };
 
 use crate::config::{ClientConfig, ConnectOptions};
 use crate::error::{ClientError, Result};
 use crate::events::{ClientEvent, ConnectionState};
+use crate::packet_id::PacketIdAllocator;
+use crate::session::{PendingPublish, Qos2OutState, Session};
+
+#[cfg(feature = "tls")]
+use {rustls::pki_types::ServerName, rustls::ClientConnection, std::sync::Arc};
 
 const CLIENT: Token = Token(0);
 const DEFAULT_BUFFER_SIZE: usize = 8192;
+
+/// Stream wrapper for plain or TLS connections.
+#[allow(clippy::large_enum_variant)] // TLS variant is larger but used at runtime
+enum ClientStream {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls {
+        tcp: TcpStream,
+        tls: Box<ClientConnection>,
+    },
+}
+
+impl ClientStream {
+    /// Get mutable reference to the underlying TCP stream for mio registration.
+    fn tcp_mut(&mut self) -> &mut TcpStream {
+        match self {
+            ClientStream::Plain(tcp) => tcp,
+            #[cfg(feature = "tls")]
+            ClientStream::Tls { tcp, .. } => tcp,
+        }
+    }
+}
+
+impl Read for ClientStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ClientStream::Plain(tcp) => tcp.read(buf),
+            #[cfg(feature = "tls")]
+            ClientStream::Tls { tcp, tls } => {
+                // Read encrypted data from socket into TLS
+                loop {
+                    match tls.read_tls(tcp) {
+                        Ok(0) => return Ok(0), // EOF
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                // Process TLS state machine
+                if let Err(e) = tls.process_new_packets() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                }
+
+                // Read decrypted data
+                match tls.reader().read(buf) {
+                    Ok(n) => Ok(n),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+}
+
+impl Write for ClientStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            ClientStream::Plain(tcp) => tcp.write(buf),
+            #[cfg(feature = "tls")]
+            ClientStream::Tls { tcp, tls } => {
+                // Write plaintext to TLS (gets encrypted)
+                let n = tls.writer().write(buf)?;
+
+                // Flush encrypted data to socket
+                while tls.wants_write() {
+                    match tls.write_tls(tcp) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                Ok(n)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            ClientStream::Plain(tcp) => tcp.flush(),
+            #[cfg(feature = "tls")]
+            ClientStream::Tls { tcp, tls } => {
+                while tls.wants_write() {
+                    match tls.write_tls(tcp) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                tcp.flush()
+            }
+        }
+    }
+}
 
 /// MQTT client.
 pub struct Client {
     config: ClientConfig,
     state: ConnectionState,
     poll: Poll,
-    stream: Option<TcpStream>,
+    stream: Option<ClientStream>,
     read_buf: BytesMut,
     write_buf: Vec<u8>,
     events: VecDeque<ClientEvent>,
-    next_packet_id: u16,
     last_packet_time: Instant,
     pending_pings: u8,
+    /// Session state tracking
+    session: Session,
+    /// Packet ID allocator
+    packet_ids: PacketIdAllocator,
+    /// Cached TLS config for reconnection.
+    #[cfg(feature = "tls")]
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// Current reconnection attempt number.
+    reconnect_attempt: u32,
+    /// Current backoff delay for reconnection.
+    reconnect_delay: Duration,
+    /// Time when we should attempt to reconnect.
+    reconnect_at: Option<Instant>,
 }
 
 impl Client {
     /// Create a new MQTT client with the given configuration.
     pub fn new(config: ClientConfig) -> Result<Self> {
         let poll = Poll::new()?;
+        let session = Session::new(config.client_id.clone(), config.clean_session);
+
+        // Build TLS config if enabled
+        #[cfg(feature = "tls")]
+        let tls_config = if config.tls.enabled {
+            Some(Arc::new(crate::tls::build_client_config(&config.tls)?))
+        } else {
+            None
+        };
+
+        let initial_delay = config.reconnect_backoff.initial_delay;
 
         Ok(Self {
             config,
@@ -49,9 +174,15 @@ impl Client {
             read_buf: BytesMut::with_capacity(DEFAULT_BUFFER_SIZE),
             write_buf: Vec::with_capacity(DEFAULT_BUFFER_SIZE),
             events: VecDeque::new(),
-            next_packet_id: 1,
             last_packet_time: Instant::now(),
             pending_pings: 0,
+            session,
+            packet_ids: PacketIdAllocator::new(),
+            #[cfg(feature = "tls")]
+            tls_config,
+            reconnect_attempt: 0,
+            reconnect_delay: initial_delay,
+            reconnect_at: None,
         })
     }
 
@@ -76,21 +207,60 @@ impl Client {
                 ))
             })?;
 
-        // Create non-blocking TCP connection
+        // Create blocking TCP connection (for timeout support)
         let std_stream = StdTcpStream::connect_timeout(&addr, self.config.connect_timeout)?;
-        std_stream.set_nonblocking(true)?;
         std_stream.set_nodelay(true)?;
 
-        let mut stream = TcpStream::from_std(std_stream);
+        // Create the client stream (plain or TLS)
+        #[cfg(feature = "tls")]
+        let mut client_stream = if self.config.tls.enabled {
+            let tls_config = self
+                .tls_config
+                .as_ref()
+                .ok_or_else(|| ClientError::Tls("TLS config not initialized".to_string()))?;
+
+            // Extract hostname for SNI
+            let hostname =
+                self.config.tls.server_name.as_deref().unwrap_or_else(|| {
+                    self.config.address.split(':').next().unwrap_or("localhost")
+                });
+
+            let server_name = ServerName::try_from(hostname.to_string())
+                .map_err(|_| ClientError::Tls(format!("Invalid server name: {}", hostname)))?;
+
+            let mut tls_conn = ClientConnection::new(tls_config.clone(), server_name)
+                .map_err(|e| ClientError::Tls(e.to_string()))?;
+
+            // Perform TLS handshake while socket is blocking
+            complete_tls_handshake(&mut tls_conn, &std_stream)?;
+
+            // Now switch to non-blocking
+            std_stream.set_nonblocking(true)?;
+            let mio_stream = TcpStream::from_std(std_stream);
+
+            ClientStream::Tls {
+                tcp: mio_stream,
+                tls: Box::new(tls_conn),
+            }
+        } else {
+            std_stream.set_nonblocking(true)?;
+            ClientStream::Plain(TcpStream::from_std(std_stream))
+        };
+
+        #[cfg(not(feature = "tls"))]
+        let mut client_stream = {
+            std_stream.set_nonblocking(true)?;
+            ClientStream::Plain(TcpStream::from_std(std_stream))
+        };
 
         // Register with poll
         self.poll.registry().register(
-            &mut stream,
+            client_stream.tcp_mut(),
             CLIENT,
             Interest::READABLE | Interest::WRITABLE,
         )?;
 
-        self.stream = Some(stream);
+        self.stream = Some(client_stream);
         self.state = ConnectionState::Connecting;
 
         // Build CONNECT packet
@@ -100,7 +270,26 @@ impl Client {
             .unwrap_or_else(|| self.config.client_id.clone());
         let clean_session = opts.clean_session.unwrap_or(self.config.clean_session);
 
+        // Update session
+        self.session.client_id = client_id.clone();
+        self.session.clean_session = clean_session;
+
+        // Clear session state if clean session
+        if clean_session {
+            self.session.clear();
+            self.packet_ids.clear();
+        }
+
         let protocol_name = "MQTT".to_string();
+
+        // Build will config if present
+        let will = self.config.will.as_ref().map(|w| CoreWill {
+            topic: w.topic.clone(),
+            message: w.payload.to_vec(),
+            qos: w.qos,
+            retain: w.retain,
+            properties: None,
+        });
 
         let connect = Connect {
             protocol_name,
@@ -110,15 +299,31 @@ impl Client {
             client_id,
             username: self.config.username.clone(),
             password: self.config.password.clone(),
-            will: None,
+            will,
             properties: None,
         };
 
         // Encode and queue CONNECT
-        encode_connect(&connect, &mut self.write_buf);
+        encode_packet(&Packet::Connect(connect), &mut self.write_buf);
         self.last_packet_time = Instant::now();
 
         Ok(())
+    }
+
+    /// Reconnect to the broker.
+    ///
+    /// If the session is not clean, this will re-send any pending QoS 1/2 messages
+    /// per [MQTT-4.4.0-1].
+    pub fn reconnect(&mut self) -> Result<()> {
+        if self.state != ConnectionState::Disconnected {
+            self.cleanup();
+        }
+
+        // Connect with current session settings
+        self.connect(Some(ConnectOptions {
+            client_id: Some(self.session.client_id.clone()),
+            clean_session: Some(self.session.clean_session),
+        }))
     }
 
     /// Disconnect from the broker.
@@ -128,7 +333,7 @@ impl Client {
         }
 
         // Send DISCONNECT packet
-        encode_disconnect(0, &mut self.write_buf);
+        encode_packet(&Packet::Disconnect { reason_code: 0 }, &mut self.write_buf);
 
         // Try to flush
         let _ = self.flush_write_buffer();
@@ -136,6 +341,36 @@ impl Client {
         self.cleanup();
         self.events
             .push_back(ClientEvent::Disconnected { reason: None });
+
+        Ok(())
+    }
+
+    /// Send an AUTH packet (MQTT 5.0 enhanced authentication).
+    ///
+    /// Used for SASL-style authentication mechanisms like SCRAM.
+    ///
+    /// # Arguments
+    /// * `reason_code` - 0x00 (Success), 0x18 (Continue Authentication), 0x19 (Re-authenticate)
+    /// * `auth_method` - The authentication method name (e.g., "SCRAM-SHA-256")
+    /// * `auth_data` - Authentication data for the mechanism
+    pub fn send_auth(
+        &mut self,
+        reason_code: u8,
+        auth_method: Option<&str>,
+        auth_data: Option<&[u8]>,
+    ) -> Result<()> {
+        if self.state != ConnectionState::Connected && self.state != ConnectionState::Connecting {
+            return Err(ClientError::NotConnected);
+        }
+
+        let auth = Auth {
+            reason_code,
+            auth_method: auth_method.map(String::from),
+            auth_data: auth_data.map(|d| d.to_vec()),
+            reason_string: None,
+        };
+
+        encode_packet(&Packet::Auth(auth), &mut self.write_buf);
 
         Ok(())
     }
@@ -168,21 +403,6 @@ impl Client {
     /// - `no_local`: Don't receive messages published by this client (loop prevention)
     /// - `retain_as_published`: Keep original retain flag on forwarded messages
     /// - `retain_handling`: 0=send retained on subscribe, 1=send if new sub, 2=don't send
-    ///
-    /// # Example
-    /// ```ignore
-    /// use mqlite_client::{Client, SubscriptionOptions, QoS};
-    ///
-    /// // Subscribe with NoLocal to prevent message reflection (useful for bridges)
-    /// client.subscribe_with_options(&[
-    ///     ("sensors/#", SubscriptionOptions {
-    ///         qos: QoS::AtLeastOnce,
-    ///         no_local: true,
-    ///         retain_as_published: false,
-    ///         retain_handling: 0,
-    ///     }),
-    /// ])?;
-    /// ```
     pub fn subscribe_with_options(
         &mut self,
         topics: &[(&str, SubscriptionOptions)],
@@ -191,7 +411,7 @@ impl Client {
             return Err(ClientError::NotConnected);
         }
 
-        let packet_id = self.next_packet_id();
+        let packet_id = self.allocate_packet_id()?;
         let subscribe = Subscribe {
             packet_id,
             topics: topics
@@ -201,7 +421,12 @@ impl Client {
             subscription_id: None,
         };
 
-        encode_subscribe(&subscribe, &mut self.write_buf);
+        // Track subscription in session
+        for (topic, opts) in topics {
+            self.session.add_subscription(topic.to_string(), opts.qos);
+        }
+
+        encode_packet(&Packet::Subscribe(subscribe), &mut self.write_buf);
         self.last_packet_time = Instant::now();
 
         Ok(packet_id)
@@ -213,13 +438,18 @@ impl Client {
             return Err(ClientError::NotConnected);
         }
 
-        let packet_id = self.next_packet_id();
+        let packet_id = self.allocate_packet_id()?;
         let unsubscribe = Unsubscribe {
             packet_id,
             topics: topics.iter().map(|t| t.to_string()).collect(),
         };
 
-        encode_unsubscribe(&unsubscribe, &mut self.write_buf);
+        // Remove from session
+        for topic in topics {
+            self.session.remove_subscription(topic);
+        }
+
+        encode_packet(&Packet::Unsubscribe(unsubscribe), &mut self.write_buf);
         self.last_packet_time = Instant::now();
 
         Ok(packet_id)
@@ -237,35 +467,164 @@ impl Client {
             return Err(ClientError::NotConnected);
         }
 
+        // Check inflight limit
+        if self.config.max_inflight > 0 && self.session.pending_count() >= self.config.max_inflight
+        {
+            return Err(ClientError::InvalidState(
+                "Max inflight messages reached".to_string(),
+            ));
+        }
+
         let packet_id = if qos != QoS::AtMostOnce {
-            Some(self.next_packet_id())
+            Some(self.allocate_packet_id()?)
         } else {
             None
+        };
+
+        let topic_bytes = Bytes::from(topic.to_string());
+        let payload_bytes = Bytes::copy_from_slice(payload);
+
+        let publish = Publish {
+            dup: false,
+            qos,
+            retain,
+            topic: topic_bytes.clone(),
+            packet_id,
+            payload: payload_bytes.clone(),
+            properties: None,
+        };
+
+        encode_packet(&Packet::Publish(publish), &mut self.write_buf);
+        self.last_packet_time = Instant::now();
+
+        // Track pending messages for QoS > 0
+        if let Some(id) = packet_id {
+            let pending = PendingPublish::new(id, topic_bytes, payload_bytes, qos, retain);
+            match qos {
+                QoS::AtLeastOnce => self.session.add_qos1_pending(pending),
+                QoS::ExactlyOnce => self.session.add_qos2_pending(pending),
+                QoS::AtMostOnce => {}
+            }
+        }
+
+        Ok(packet_id)
+    }
+
+    /// Publish a message with MQTT 5.0 properties.
+    ///
+    /// # Arguments
+    /// * `topic` - The topic to publish to
+    /// * `payload` - Message payload
+    /// * `qos` - Quality of Service level
+    /// * `retain` - Whether to retain the message
+    /// * `properties` - MQTT 5.0 publish properties
+    pub fn publish_with_properties(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+        properties: &PublishProperties,
+    ) -> Result<Option<u16>> {
+        if self.state != ConnectionState::Connected {
+            return Err(ClientError::NotConnected);
+        }
+
+        // Check inflight limit
+        if self.config.max_inflight > 0 && self.session.pending_count() >= self.config.max_inflight
+        {
+            return Err(ClientError::InvalidState(
+                "Max inflight messages reached".to_string(),
+            ));
+        }
+
+        let packet_id = if qos != QoS::AtMostOnce {
+            Some(self.allocate_packet_id()?)
+        } else {
+            None
+        };
+
+        let topic_bytes = Bytes::from(topic.to_string());
+        let payload_bytes = Bytes::copy_from_slice(payload);
+
+        // Encode properties to bytes
+        let props_bytes = if properties.is_empty() {
+            None
+        } else {
+            Some(Bytes::from(properties.to_bytes()))
         };
 
         let publish = Publish {
             dup: false,
             qos,
             retain,
-            topic: Bytes::from(topic.to_string()),
+            topic: topic_bytes.clone(),
             packet_id,
-            payload: Bytes::copy_from_slice(payload),
-            properties: None,
+            payload: payload_bytes.clone(),
+            properties: props_bytes,
         };
 
-        encode_publish(&publish, &mut self.write_buf);
+        encode_packet(&Packet::Publish(publish), &mut self.write_buf);
         self.last_packet_time = Instant::now();
+
+        // Track pending messages for QoS > 0
+        if let Some(id) = packet_id {
+            let pending = PendingPublish::new(id, topic_bytes, payload_bytes, qos, retain);
+            match qos {
+                QoS::AtLeastOnce => self.session.add_qos1_pending(pending),
+                QoS::ExactlyOnce => self.session.add_qos2_pending(pending),
+                QoS::AtMostOnce => {}
+            }
+        }
 
         Ok(packet_id)
     }
 
     /// Poll for events with timeout.
+    ///
     /// Returns true if there are events to process.
+    ///
+    /// When `auto_reconnect` is enabled, this will automatically attempt to
+    /// reconnect on disconnection with exponential backoff. The `Reconnecting`
+    /// event is emitted before each attempt.
     pub fn poll(&mut self, timeout: Option<Duration>) -> Result<bool> {
+        // Handle reconnection with backoff
+        if self.state == ConnectionState::Reconnecting {
+            if let Some(reconnect_at) = self.reconnect_at {
+                if Instant::now() >= reconnect_at {
+                    // Time to attempt reconnection
+                    self.reconnect_at = None;
+
+                    match self.reconnect() {
+                        Ok(()) => {
+                            // Reconnected successfully - reset backoff
+                            self.reconnect_attempt = 0;
+                            self.reconnect_delay = self.config.reconnect_backoff.initial_delay;
+                            // Connected event will be emitted by handle_connack
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Reconnect attempt {} failed: {}",
+                                self.reconnect_attempt,
+                                e
+                            );
+                            // Schedule next attempt with increased backoff
+                            self.schedule_reconnect();
+                        }
+                    }
+                }
+            }
+            // If we're reconnecting, return early - no I/O to do
+            return Ok(!self.events.is_empty());
+        }
+
         // First, try to flush any pending writes
         if !self.write_buf.is_empty() {
             self.flush_write_buffer()?;
         }
+
+        // Check for message retries
+        self.check_retries()?;
 
         // Check keep-alive
         if self.state == ConnectionState::Connected && self.config.keep_alive > 0 {
@@ -275,15 +634,12 @@ impl Client {
             if elapsed >= keep_alive_duration {
                 if self.pending_pings >= 2 {
                     // No response to pings, connection dead
-                    self.cleanup();
-                    self.events.push_back(ClientEvent::Disconnected {
-                        reason: Some("Keep-alive timeout".to_string()),
-                    });
+                    self.handle_unexpected_disconnect("Keep-alive timeout");
                     return Ok(!self.events.is_empty());
                 }
 
                 // Send PINGREQ
-                encode_pingreq(&mut self.write_buf);
+                encode_packet(&Packet::Pingreq, &mut self.write_buf);
                 self.pending_pings += 1;
                 self.last_packet_time = Instant::now();
             }
@@ -307,6 +663,39 @@ impl Client {
         Ok(!self.events.is_empty())
     }
 
+    /// Schedule a reconnection attempt with backoff.
+    fn schedule_reconnect(&mut self) {
+        self.reconnect_attempt += 1;
+        let delay = self.reconnect_delay;
+
+        // Emit event
+        self.events.push_back(ClientEvent::Reconnecting {
+            attempt: self.reconnect_attempt,
+            delay,
+        });
+
+        // Schedule next attempt
+        self.reconnect_at = Some(Instant::now() + delay);
+        self.state = ConnectionState::Reconnecting;
+
+        // Calculate next delay with exponential backoff
+        let next_delay =
+            Duration::from_secs_f64(delay.as_secs_f64() * self.config.reconnect_backoff.multiplier);
+        self.reconnect_delay = next_delay.min(self.config.reconnect_backoff.max_delay);
+    }
+
+    /// Handle an unexpected disconnection, triggering auto-reconnect if enabled.
+    fn handle_unexpected_disconnect(&mut self, reason: &str) {
+        self.cleanup();
+        self.events.push_back(ClientEvent::Disconnected {
+            reason: Some(reason.to_string()),
+        });
+
+        if self.config.auto_reconnect {
+            self.schedule_reconnect();
+        }
+    }
+
     /// Get the next event, if any.
     pub fn next_event(&mut self) -> Option<ClientEvent> {
         self.events.pop_front()
@@ -317,15 +706,22 @@ impl Client {
         self.state == ConnectionState::Connected
     }
 
+    /// Get the number of pending outbound messages.
+    pub fn pending_count(&self) -> usize {
+        self.session.pending_count()
+    }
+
+    /// Get a reference to the session state.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
     // === Internal methods ===
 
-    fn next_packet_id(&mut self) -> u16 {
-        let id = self.next_packet_id;
-        self.next_packet_id = self.next_packet_id.wrapping_add(1);
-        if self.next_packet_id == 0 {
-            self.next_packet_id = 1;
-        }
-        id
+    fn allocate_packet_id(&mut self) -> Result<u16> {
+        self.packet_ids
+            .allocate()
+            .ok_or_else(|| ClientError::InvalidState("All packet IDs in use".to_string()))
     }
 
     fn handle_read(&mut self) -> Result<()> {
@@ -339,11 +735,8 @@ impl Client {
         loop {
             match stream.read(&mut buf) {
                 Ok(0) => {
-                    // Connection closed
-                    self.cleanup();
-                    self.events.push_back(ClientEvent::Disconnected {
-                        reason: Some("Connection closed by peer".to_string()),
-                    });
+                    // Connection closed by peer - trigger reconnect if enabled
+                    self.handle_unexpected_disconnect("Connection closed by peer");
                     return Ok(());
                 }
                 Ok(n) => {
@@ -386,21 +779,10 @@ impl Client {
         match packet {
             Packet::Connack(connack) => self.handle_connack(connack),
             Packet::Publish(publish) => self.handle_publish(publish),
-            Packet::Puback { packet_id } => {
-                self.events.push_back(ClientEvent::PubAck { packet_id });
-                Ok(())
-            }
-            Packet::Pubrec { packet_id } => {
-                // QoS 2: respond with PUBREL
-                let pubrel = Packet::Pubrel { packet_id };
-                encode_pubrel_packet(&pubrel, &mut self.write_buf);
-                self.events.push_back(ClientEvent::PubRec { packet_id });
-                Ok(())
-            }
-            Packet::Pubcomp { packet_id } => {
-                self.events.push_back(ClientEvent::PubComp { packet_id });
-                Ok(())
-            }
+            Packet::Puback { packet_id } => self.handle_puback(packet_id),
+            Packet::Pubrec { packet_id } => self.handle_pubrec(packet_id),
+            Packet::Pubrel { packet_id } => self.handle_pubrel(packet_id),
+            Packet::Pubcomp { packet_id } => self.handle_pubcomp(packet_id),
             Packet::Suback(suback) => self.handle_suback(suback),
             Packet::Unsuback(unsuback) => self.handle_unsuback(unsuback),
             Packet::Pingresp => {
@@ -408,9 +790,17 @@ impl Client {
                 Ok(())
             }
             Packet::Disconnect { reason_code } => {
-                let reason = Some(format!("Disconnect reason: {}", reason_code));
-                self.cleanup();
-                self.events.push_back(ClientEvent::Disconnected { reason });
+                // Server-initiated disconnect - trigger reconnect if enabled
+                self.handle_unexpected_disconnect(&format!("Disconnect reason: {}", reason_code));
+                Ok(())
+            }
+            Packet::Auth(auth) => {
+                self.events.push_back(ClientEvent::Auth {
+                    reason_code: auth.reason_code,
+                    auth_method: auth.auth_method,
+                    auth_data: auth.auth_data,
+                    reason_string: auth.reason_string,
+                });
                 Ok(())
             }
             _ => Ok(()), // Ignore unexpected packets
@@ -425,6 +815,19 @@ impl Client {
         }
 
         self.state = ConnectionState::Connected;
+
+        // If session not present and we expected one, clear local state
+        if !connack.session_present && !self.session.clean_session {
+            self.session.clear();
+            self.packet_ids.clear();
+        }
+
+        // Re-send pending messages if session was restored
+        // Per [MQTT-4.4.0-1]
+        if connack.session_present {
+            self.resend_pending_messages()?;
+        }
+
         self.events.push_back(ClientEvent::Connected {
             session_present: connack.session_present,
         });
@@ -432,16 +835,29 @@ impl Client {
     }
 
     fn handle_publish(&mut self, publish: Publish) -> Result<()> {
+        // For QoS 2, check if this is a duplicate we've already processed
+        if publish.qos == QoS::ExactlyOnce {
+            if let Some(packet_id) = publish.packet_id {
+                if self.session.has_qos2_inbound(packet_id) {
+                    // Duplicate, just resend PUBREC
+                    encode_packet(&Packet::Pubrec { packet_id }, &mut self.write_buf);
+                    return Ok(());
+                }
+            }
+        }
+
         // Send acknowledgments for QoS > 0
         match publish.qos {
             QoS::AtLeastOnce => {
                 if let Some(packet_id) = publish.packet_id {
-                    encode_puback_packet(packet_id, &mut self.write_buf);
+                    encode_packet(&Packet::Puback { packet_id }, &mut self.write_buf);
                 }
             }
             QoS::ExactlyOnce => {
                 if let Some(packet_id) = publish.packet_id {
-                    encode_pubrec_packet(packet_id, &mut self.write_buf);
+                    // Track that we received this message
+                    self.session.add_qos2_inbound(packet_id);
+                    encode_packet(&Packet::Pubrec { packet_id }, &mut self.write_buf);
                 }
             }
             QoS::AtMostOnce => {}
@@ -457,7 +873,43 @@ impl Client {
         Ok(())
     }
 
+    fn handle_puback(&mut self, packet_id: u16) -> Result<()> {
+        // Complete QoS 1 flow
+        if self.session.complete_qos1(packet_id).is_some() {
+            self.packet_ids.release(packet_id);
+            self.events.push_back(ClientEvent::PubAck { packet_id });
+        }
+        Ok(())
+    }
+
+    fn handle_pubrec(&mut self, packet_id: u16) -> Result<()> {
+        // Transition QoS 2 flow: received PUBREC, send PUBREL
+        if self.session.qos2_received_pubrec(packet_id) {
+            encode_packet(&Packet::Pubrel { packet_id }, &mut self.write_buf);
+            self.events.push_back(ClientEvent::PubRec { packet_id });
+        }
+        Ok(())
+    }
+
+    fn handle_pubrel(&mut self, packet_id: u16) -> Result<()> {
+        // QoS 2 receiver flow: received PUBREL, send PUBCOMP
+        if self.session.complete_qos2_in(packet_id) {
+            encode_packet(&Packet::Pubcomp { packet_id }, &mut self.write_buf);
+        }
+        Ok(())
+    }
+
+    fn handle_pubcomp(&mut self, packet_id: u16) -> Result<()> {
+        // Complete QoS 2 flow
+        if self.session.complete_qos2_out(packet_id).is_some() {
+            self.packet_ids.release(packet_id);
+            self.events.push_back(ClientEvent::PubComp { packet_id });
+        }
+        Ok(())
+    }
+
     fn handle_suback(&mut self, suback: Suback) -> Result<()> {
+        self.packet_ids.release(suback.packet_id);
         self.events.push_back(ClientEvent::SubAck {
             packet_id: suback.packet_id,
             return_codes: suback.return_codes,
@@ -466,9 +918,126 @@ impl Client {
     }
 
     fn handle_unsuback(&mut self, unsuback: Unsuback) -> Result<()> {
+        self.packet_ids.release(unsuback.packet_id);
         self.events.push_back(ClientEvent::UnsubAck {
             packet_id: unsuback.packet_id,
         });
+        Ok(())
+    }
+
+    /// Check for messages that need to be retried.
+    fn check_retries(&mut self) -> Result<()> {
+        if self.state != ConnectionState::Connected {
+            return Ok(());
+        }
+
+        let retry_interval = self.config.retry_interval;
+        let now = Instant::now();
+
+        // Check QoS 1 messages
+        for pending in &mut self.session.pending_qos1 {
+            if now.duration_since(pending.last_sent) >= retry_interval {
+                // Re-send with DUP=1 per [MQTT-3.3.1-1]
+                let publish = Publish {
+                    dup: true,
+                    qos: pending.qos,
+                    retain: pending.retain,
+                    topic: pending.topic.clone(),
+                    packet_id: Some(pending.packet_id),
+                    payload: pending.payload.clone(),
+                    properties: None,
+                };
+                encode_packet(&Packet::Publish(publish), &mut self.write_buf);
+                pending.mark_resent();
+            }
+        }
+
+        // Check QoS 2 messages
+        for pending in &mut self.session.pending_qos2_out {
+            let last_sent = match pending.state {
+                Qos2OutState::AwaitingPubrec => pending.publish.last_sent,
+                Qos2OutState::AwaitingPubcomp => {
+                    pending.pubrel_sent.unwrap_or(pending.publish.last_sent)
+                }
+            };
+
+            if now.duration_since(last_sent) >= retry_interval {
+                match pending.state {
+                    Qos2OutState::AwaitingPubrec => {
+                        // Re-send PUBLISH with DUP=1
+                        let publish = Publish {
+                            dup: true,
+                            qos: pending.publish.qos,
+                            retain: pending.publish.retain,
+                            topic: pending.publish.topic.clone(),
+                            packet_id: Some(pending.publish.packet_id),
+                            payload: pending.publish.payload.clone(),
+                            properties: None,
+                        };
+                        encode_packet(&Packet::Publish(publish), &mut self.write_buf);
+                        pending.publish.mark_resent();
+                    }
+                    Qos2OutState::AwaitingPubcomp => {
+                        // Re-send PUBREL
+                        encode_packet(
+                            &Packet::Pubrel {
+                                packet_id: pending.publish.packet_id,
+                            },
+                            &mut self.write_buf,
+                        );
+                        pending.pubrel_sent = Some(now);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Re-send all pending messages after reconnect.
+    /// Per [MQTT-4.4.0-1] and [MQTT-4.6.0-1].
+    fn resend_pending_messages(&mut self) -> Result<()> {
+        // Collect messages to resend (to avoid borrow issues)
+        let messages: Vec<_> = self.session.messages_to_resend().collect();
+
+        for msg in messages {
+            match msg {
+                crate::session::ResendMessage::Publish {
+                    packet_id,
+                    topic,
+                    payload,
+                    qos,
+                    retain,
+                    dup,
+                } => {
+                    let publish = Publish {
+                        dup,
+                        qos,
+                        retain,
+                        topic,
+                        packet_id: Some(packet_id),
+                        payload,
+                        properties: None,
+                    };
+                    encode_packet(&Packet::Publish(publish), &mut self.write_buf);
+
+                    // Update last_sent time
+                    if let Some(p) = self.session.get_qos1_pending_mut(packet_id) {
+                        p.mark_resent();
+                    }
+                    if let Some(p) = self.session.get_qos2_out_mut(packet_id) {
+                        p.publish.mark_resent();
+                    }
+                }
+                crate::session::ResendMessage::Pubrel { packet_id } => {
+                    encode_packet(&Packet::Pubrel { packet_id }, &mut self.write_buf);
+                    if let Some(p) = self.session.get_qos2_out_mut(packet_id) {
+                        p.pubrel_sent = Some(Instant::now());
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -505,7 +1074,7 @@ impl Client {
 
     fn cleanup(&mut self) {
         if let Some(mut stream) = self.stream.take() {
-            let _ = self.poll.registry().deregister(&mut stream);
+            let _ = self.poll.registry().deregister(stream.tcp_mut());
         }
         self.state = ConnectionState::Disconnected;
         self.read_buf.clear();
@@ -520,23 +1089,37 @@ impl Drop for Client {
     }
 }
 
-// Helper functions for encoding simple ACK packets
-fn encode_puback_packet(packet_id: u16, buf: &mut Vec<u8>) {
-    buf.push(0x40); // PUBACK fixed header
-    buf.push(2); // Remaining length
-    buf.extend_from_slice(&packet_id.to_be_bytes());
-}
+/// Complete TLS handshake using blocking I/O.
+#[cfg(feature = "tls")]
+fn complete_tls_handshake(tls: &mut ClientConnection, tcp: &StdTcpStream) -> Result<()> {
+    // We need mutable access to tcp for read/write, but it's shared
+    // Use a mutable reference pattern
+    let mut tcp = tcp;
 
-fn encode_pubrec_packet(packet_id: u16, buf: &mut Vec<u8>) {
-    buf.push(0x50); // PUBREC fixed header
-    buf.push(2); // Remaining length
-    buf.extend_from_slice(&packet_id.to_be_bytes());
-}
+    while tls.is_handshaking() {
+        // Write any pending TLS data
+        while tls.wants_write() {
+            tls.write_tls(&mut tcp)
+                .map_err(|e| ClientError::Tls(format!("TLS write failed: {}", e)))?;
+        }
 
-fn encode_pubrel_packet(_packet: &Packet, buf: &mut Vec<u8>) {
-    if let Packet::Pubrel { packet_id } = _packet {
-        buf.push(0x62); // PUBREL fixed header (flags = 0x02)
-        buf.push(2); // Remaining length
-        buf.extend_from_slice(&packet_id.to_be_bytes());
+        // Read TLS data if connection wants it
+        if tls.wants_read() {
+            if tls
+                .read_tls(&mut tcp)
+                .map_err(|e| ClientError::Tls(format!("TLS read failed: {}", e)))?
+                == 0
+            {
+                return Err(ClientError::Tls(
+                    "Connection closed during handshake".to_string(),
+                ));
+            }
+
+            // Process the received data
+            tls.process_new_packets()
+                .map_err(|e| ClientError::Tls(format!("TLS handshake error: {}", e)))?;
+        }
     }
+
+    Ok(())
 }

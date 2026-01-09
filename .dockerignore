@@ -1,0 +1,28 @@
+# Examples and docs - not needed for broker image
+examples/
+docs/
+reference/
+
+# Build artifacts
+target/
+bin/
+
+# Development files
+*.md
+!README.md
+.git/
+.github/
+.gitignore
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# Profiling/debug artifacts
+*.zst
+perf.data*
+*.txt
+
+# Certificates (mounted at runtime)
+certs/

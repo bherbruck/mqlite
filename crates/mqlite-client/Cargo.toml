@@ -23,9 +23,25 @@ parking_lot = { workspace = true }
 log = { workspace = true }
 
 # TLS (optional)
-rustls = { version = "0.23", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+# Async runtime (optional)
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"], optional = true }
+tokio-rustls = { version = "0.26", optional = true }
 
 [features]
 default = ["tls"]
-tls = ["dep:rustls", "dep:rustls-pemfile"]
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
+async-tokio = ["dep:tokio", "dep:tokio-rustls", "tls"]
+
+[[example]]
+name = "polling"
+
+[[example]]
+name = "callback"
+
+[[example]]
+name = "async_client"
+required-features = ["async-tokio"]

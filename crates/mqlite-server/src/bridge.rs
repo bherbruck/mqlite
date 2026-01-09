@@ -116,6 +116,7 @@ impl Bridge {
                     crate::config::BridgeProtocolVersion::Mqtt5 => 5,
                 },
                 connect_timeout: Duration::from_secs(10),
+                ..Default::default()
             };
 
             // Try to connect

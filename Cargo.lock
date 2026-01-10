@@ -616,6 +616,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.17",
  "tikv-jemalloc-ctl",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "toml 0.8.23",
 ]

@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod packet;
+pub mod varint;
 
 pub use error::{Error, ProtocolError, Result};
 pub use packet::*;

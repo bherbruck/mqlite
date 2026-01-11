@@ -4,50 +4,34 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// Configure jemalloc to return memory to OS faster during idle periods.
-/// Default dirty_decay_ms is 10000 (10s). We set it to 1000 (1s) for
-/// faster memory release when idle, with negligible performance impact.
+/// Configure jemalloc to return memory to OS.
+/// - retain:false - Actually unmap pages instead of keeping address space
+/// - dirty_decay_ms:0 - Immediately purge dirty pages (keeps active memory low)
+/// - muzzy_decay_ms:0 - Immediately purge muzzy pages
+/// - background_thread:true - Enable background thread for decay
 #[cfg(feature = "jemalloc")]
-fn configure_jemalloc() {
-    use tikv_jemalloc_ctl::raw;
-    // Set dirty page decay time to 1 second (default 10s)
-    // This returns unused memory to OS faster during idle periods
-    let decay_ms: isize = 1000;
-    // SAFETY: We're passing valid null-terminated strings and a valid isize value.
-    // These are standard jemalloc configuration options.
-    unsafe {
-        if let Err(e) = raw::write(b"arenas.dirty_decay_ms\0", decay_ms) {
-            eprintln!(
-                "Warning: failed to configure jemalloc dirty_decay_ms: {}",
-                e
-            );
-        }
-        // Also set muzzy decay (purged but still mapped pages)
-        if let Err(e) = raw::write(b"arenas.muzzy_decay_ms\0", decay_ms) {
-            eprintln!(
-                "Warning: failed to configure jemalloc muzzy_decay_ms: {}",
-                e
-            );
-        }
-    }
-}
-
-#[cfg(not(feature = "jemalloc"))]
-fn configure_jemalloc() {}
+#[used]
+#[export_name = "malloc_conf"]
+static MALLOC_CONF: &[u8] =
+    b"retain:false,dirty_decay_ms:0,muzzy_decay_ms:0,background_thread:true\0";
 
 mod auth;
 mod bridge;
 mod client;
 mod client_handle;
 mod config;
+mod fanout;
+mod handlers;
 mod prometheus;
 mod proxy;
 mod publish_encoder;
+mod route_cache;
 mod server;
 mod shared;
 mod subscription;
 mod sys_tree;
 mod util;
+mod will;
 mod worker;
 mod write_buffer;
 
@@ -57,6 +41,44 @@ use log::{error, info};
 
 use crate::config::Config;
 use crate::server::Server;
+
+/// Force jemalloc to release memory back to the OS.
+#[cfg(feature = "jemalloc")]
+pub fn jemalloc_purge() {
+    use tikv_jemalloc_ctl::epoch;
+
+    // Advance epoch to get current stats
+    if let Err(e) = epoch::advance() {
+        log::debug!("jemalloc epoch advance failed: {}", e);
+        return;
+    }
+
+    // Purge all arenas using raw mallctl API
+    // MALLCTL_ARENAS_ALL = 4096 - purges all arenas
+    // The key is "arena.<i>.purge" where <i> is the arena index
+    // For void operations, call mallctl with null pointers
+    let ret = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"arena.4096.purge".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        log::debug!("jemalloc purge failed: error code {}", ret);
+    }
+}
+
+#[cfg(not(feature = "jemalloc"))]
+pub fn jemalloc_purge() {
+    // Use glibc's malloc_trim to release memory back to OS
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
 
 struct Args {
     config_path: String,
@@ -109,9 +131,6 @@ fn parse_args() -> Args {
 }
 
 fn main() {
-    // Configure jemalloc memory decay (returns memory to OS faster when idle)
-    configure_jemalloc();
-
     // Parse CLI args first (only for config path and help)
     let args = parse_args();
 
@@ -138,7 +157,7 @@ fn main() {
     };
 
     // Build ID to verify Docker builds - change this when making fixes
-    const BUILD_ID: &str = "2026-01-06-read-shrink";
+    const BUILD_ID: &str = "2026-01-09-jemalloc-purge";
 
     info!(
         "Starting mqlite [build={}] with {} worker threads (max_packet_size={}KB, max_inflight={})",

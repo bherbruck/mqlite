@@ -1,6 +1,6 @@
 services:
   mqlite:
-    # image: ghcr.io/vibesrc/mqlite:latest
+    image: ghcr.io/bherbruck/mqlite
     build: .
     ports:
       - 1883:1883

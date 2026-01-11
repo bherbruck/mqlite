@@ -3,6 +3,7 @@
 use bytes::Bytes;
 
 use crate::error::{ProtocolError, Result};
+use crate::varint;
 
 /// MQTT Control Packet Types (4 bits).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,44 +654,15 @@ impl<'a> Decoder<'a> {
 
 /// Decode the remaining length field (variable length encoding).
 /// Returns (length, bytes_consumed) or None if incomplete.
+#[inline]
 pub fn decode_remaining_length(buf: &[u8]) -> Result<Option<(usize, usize)>> {
-    let mut multiplier = 1usize;
-    let mut value = 0usize;
-
-    for (i, &byte) in buf.iter().enumerate() {
-        value += ((byte & 0x7F) as usize) * multiplier;
-
-        if multiplier > 128 * 128 * 128 {
-            return Err(ProtocolError::InvalidRemainingLength.into());
-        }
-
-        if (byte & 0x80) == 0 {
-            return Ok(Some((value, i + 1)));
-        }
-
-        multiplier *= 128;
-    }
-
-    // Need more bytes
-    Ok(None)
+    varint::decode(buf)
 }
 
 /// Encode remaining length into buffer. Returns bytes written.
-pub fn encode_remaining_length(mut len: usize, buf: &mut [u8]) -> usize {
-    let mut i = 0;
-    loop {
-        let mut byte = (len % 128) as u8;
-        len /= 128;
-        if len > 0 {
-            byte |= 0x80;
-        }
-        buf[i] = byte;
-        i += 1;
-        if len == 0 {
-            break;
-        }
-    }
-    i
+#[inline]
+pub fn encode_remaining_length(len: usize, buf: &mut [u8]) -> usize {
+    varint::encode_to_slice(len, buf)
 }
 
 /// Try to decode a complete packet from the buffer.
@@ -1307,16 +1279,9 @@ fn encode_auth(auth: &Auth, buf: &mut Vec<u8>) {
 }
 
 /// Calculate the number of bytes needed for a variable byte integer.
-fn variable_byte_integer_len(mut val: u32) -> usize {
-    let mut len = 0;
-    loop {
-        len += 1;
-        val /= 128;
-        if val == 0 {
-            break;
-        }
-    }
-    len
+#[inline]
+fn variable_byte_integer_len(val: u32) -> usize {
+    varint::encoded_len(val)
 }
 
 /// Encode a packet into the provided buffer.
@@ -1341,20 +1306,9 @@ pub fn encode_packet(packet: &Packet, buf: &mut Vec<u8>) {
 }
 
 /// Encode a Variable Byte Integer into the buffer. Returns bytes written.
-pub fn encode_variable_byte_integer(mut val: u32, buf: &mut Vec<u8>) -> usize {
-    let start = buf.len();
-    loop {
-        let mut byte = (val % 128) as u8;
-        val /= 128;
-        if val > 0 {
-            byte |= 0x80;
-        }
-        buf.push(byte);
-        if val == 0 {
-            break;
-        }
-    }
-    buf.len() - start
+#[inline]
+pub fn encode_variable_byte_integer(val: u32, buf: &mut Vec<u8>) -> usize {
+    varint::encode_to_vec(val, buf)
 }
 
 /// Update Message Expiry Interval in properties for retained message delivery.
@@ -1936,18 +1890,9 @@ pub fn encode_disconnect(reason_code: u8, buf: &mut Vec<u8>) {
 }
 
 /// Helper to encode remaining length into a Vec buffer.
-fn encode_remaining_length_vec(mut len: usize, buf: &mut Vec<u8>) {
-    loop {
-        let mut byte = (len % 128) as u8;
-        len /= 128;
-        if len > 0 {
-            byte |= 0x80;
-        }
-        buf.push(byte);
-        if len == 0 {
-            break;
-        }
-    }
+#[inline]
+fn encode_remaining_length_vec(len: usize, buf: &mut Vec<u8>) {
+    varint::encode_to_vec(len as u32, buf);
 }
 
 // === Topic Validation ===

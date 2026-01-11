@@ -58,7 +58,8 @@ ppp = "2"
 # Memory allocator (disabled with --no-default-features for heap profiling)
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true }
+tikv-jemalloc-sys = { version = "0.6", optional = true }
 
 [features]
 default = ["jemalloc"]
-jemalloc = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
+jemalloc = ["tikv-jemallocator", "tikv-jemalloc-ctl", "tikv-jemalloc-sys"]

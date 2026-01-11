@@ -120,11 +120,23 @@ impl TrieNode {
             "+" => {
                 if let Some(child) = &mut self.single_wildcard {
                     child.remove(remaining, worker_id, token);
+                    if child.is_empty() {
+                        self.single_wildcard = None;
+                    }
                 }
             }
             _ => {
                 if let Some(child) = self.children.get_mut(level) {
                     child.remove(remaining, worker_id, token);
+                }
+                // Prune if now empty
+                if self
+                    .children
+                    .get(level)
+                    .map(|c| c.is_empty())
+                    .unwrap_or(false)
+                {
+                    self.children.remove(level);
                 }
             }
         }
@@ -138,11 +150,24 @@ impl TrieNode {
 
         if let Some(child) = &mut self.single_wildcard {
             child.remove_client(worker_id, token);
+            if child.is_empty() {
+                self.single_wildcard = None;
+            }
         }
 
         for child in self.children.values_mut() {
             child.remove_client(worker_id, token);
         }
+        // Prune empty children to release memory
+        self.children.retain(|_, child| !child.is_empty());
+    }
+
+    /// Check if this node has no subscribers and no children.
+    fn is_empty(&self) -> bool {
+        self.subscribers.is_empty()
+            && self.multi_wildcard.is_empty()
+            && self.single_wildcard.is_none()
+            && self.children.is_empty()
     }
 
     /// Count all subscriptions in this node and children.

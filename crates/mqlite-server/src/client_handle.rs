@@ -203,8 +203,8 @@ impl ClientWriteHandle {
         // Threshold for clearing EPOLLOUT. Only clear after this many consecutive
         // empty flushes to avoid race conditions under active load. Under fan-out,
         // the counter resets every time data is queued, so we never clear.
-        // When truly idle, ~1000 wakeups is acceptable before clearing.
-        const IDLE_THRESHOLD: u16 = 1000;
+        // Low threshold reduces spurious wakeups; race handling below catches edge cases.
+        const IDLE_THRESHOLD: u16 = 2;
 
         loop {
             // Lock and write directly from buffer - no temp copy needed
@@ -217,13 +217,12 @@ impl ClientWriteHandle {
                 // Only clear EPOLLOUT for truly idle clients.
                 let count = self.idle_flush_count.fetch_add(1, Ordering::Relaxed);
 
-                // Periodically try to shrink idle buffers (requires 2 consecutive calls)
-                // Call every ~500 cycles to allow shrink hysteresis to work
-                if count.is_multiple_of(500) {
-                    buf.maybe_shrink();
-                }
-
                 if count >= IDLE_THRESHOLD {
+                    // Shrink idle buffer before disabling EPOLLOUT.
+                    // Call twice because maybe_shrink requires two consecutive
+                    // empty calls (hysteresis to prevent shrink/grow cycles).
+                    buf.maybe_shrink();
+                    buf.maybe_shrink();
                     // Client has been idle for many cycles, safe to clear EPOLLOUT
                     self.idle_flush_count.store(0, Ordering::Relaxed);
                     drop(buf);

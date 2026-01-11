@@ -186,6 +186,10 @@ impl Server {
         };
         let mut last_sys_publish = Instant::now();
 
+        // Memory purge interval (independent of $SYS)
+        const MEMORY_PURGE_INTERVAL_SECS: u64 = 30;
+        let mut last_memory_purge = Instant::now();
+
         // Start bridge connections if configured
         let mut _bridge_manager = BridgeManager::new();
         if !self.config.bridge.is_empty() {
@@ -235,6 +239,12 @@ impl Server {
                         last_sys_publish = Instant::now();
                     }
                 }
+
+                // Periodically purge allocator arenas to return memory to OS
+                if last_memory_purge.elapsed().as_secs() >= MEMORY_PURGE_INTERVAL_SECS {
+                    crate::jemalloc_purge();
+                    last_memory_purge = Instant::now();
+                }
             }
         } else {
             // Multi-worker: spawn worker threads
@@ -281,6 +291,12 @@ impl Server {
                         publisher.publish_if_changed();
                         last_sys_publish = Instant::now();
                     }
+                }
+
+                // Periodically purge allocator arenas to return memory to OS
+                if last_memory_purge.elapsed().as_secs() >= MEMORY_PURGE_INTERVAL_SECS {
+                    crate::jemalloc_purge();
+                    last_memory_purge = Instant::now();
                 }
             }
         }

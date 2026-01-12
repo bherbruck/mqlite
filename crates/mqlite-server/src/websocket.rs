@@ -223,52 +223,50 @@ pub fn accept_websocket(
 ) -> Result<WebSocket<StdTcpStream>, WebSocketError> {
     let expected_path = expected_path.to_string();
 
-    let callback =
-        |request: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
-            // Validate path if configured
-            if !expected_path.is_empty() {
-                let request_path = request.uri().path();
-                if request_path != expected_path {
-                    log::debug!(
-                        "WebSocket path mismatch: expected '{}', got '{}'",
-                        expected_path,
-                        request_path
-                    );
-                    let mut err_response = ErrorResponse::new(Some("Invalid path".to_string()));
-                    *err_response.status_mut() = tungstenite::http::StatusCode::NOT_FOUND;
-                    return Err(err_response);
-                }
+    let callback = |request: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+        // Validate path if configured
+        if !expected_path.is_empty() {
+            let request_path = request.uri().path();
+            if request_path != expected_path {
+                log::debug!(
+                    "WebSocket path mismatch: expected '{}', got '{}'",
+                    expected_path,
+                    request_path
+                );
+                let mut err_response = ErrorResponse::new(Some("Invalid path".to_string()));
+                *err_response.status_mut() = tungstenite::http::StatusCode::NOT_FOUND;
+                return Err(err_response);
             }
+        }
 
-            // Check for mqtt subprotocol in Sec-WebSocket-Protocol header
-            let has_mqtt = request
-                .headers()
-                .get("Sec-WebSocket-Protocol")
-                .and_then(|v: &HeaderValue| v.to_str().ok())
-                .map(|protocols: &str| {
-                    protocols
-                        .split(',')
-                        .any(|p: &str| p.trim().eq_ignore_ascii_case(MQTT_SUBPROTOCOL))
-                })
-                .unwrap_or(false);
+        // Check for mqtt subprotocol in Sec-WebSocket-Protocol header
+        let has_mqtt = request
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|v: &HeaderValue| v.to_str().ok())
+            .map(|protocols: &str| {
+                protocols
+                    .split(',')
+                    .any(|p: &str| p.trim().eq_ignore_ascii_case(MQTT_SUBPROTOCOL))
+            })
+            .unwrap_or(false);
 
-            if !has_mqtt {
-                // Allow connections without subprotocol for compatibility
-                // but if they specify protocols, mqtt must be one of them
-                let specified_protocols = request.headers().get("Sec-WebSocket-Protocol").is_some();
-                if specified_protocols {
-                    log::debug!("WebSocket client didn't request mqtt subprotocol");
-                }
+        if !has_mqtt {
+            // Allow connections without subprotocol for compatibility
+            // but if they specify protocols, mqtt must be one of them
+            let specified_protocols = request.headers().get("Sec-WebSocket-Protocol").is_some();
+            if specified_protocols {
+                log::debug!("WebSocket client didn't request mqtt subprotocol");
             }
+        }
 
-            // Always respond with mqtt subprotocol
-            response.headers_mut().insert(
-                "Sec-WebSocket-Protocol",
-                MQTT_SUBPROTOCOL.parse().unwrap(),
-            );
+        // Always respond with mqtt subprotocol
+        response
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", MQTT_SUBPROTOCOL.parse().unwrap());
 
-            Ok(response)
-        };
+        Ok(response)
+    };
 
     match tungstenite::accept_hdr(stream, callback) {
         Ok(ws) => Ok(ws),
@@ -284,7 +282,9 @@ pub fn accept_websocket(
 /// This converts the std TcpStream to mio TcpStream using fd duplication.
 /// The original WebSocket is dropped (closing its fd), but the duplicated fd
 /// remains valid for the new WebSocket.
-pub fn wrap_websocket(mut ws: WebSocket<StdTcpStream>) -> io::Result<WebSocketTransport<TcpStream>> {
+pub fn wrap_websocket(
+    mut ws: WebSocket<StdTcpStream>,
+) -> io::Result<WebSocketTransport<TcpStream>> {
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
     // Ensure handshake response is fully flushed before converting

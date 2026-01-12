@@ -112,7 +112,10 @@ impl Server {
             let mut wss_listener = TcpListener::bind(config.websocket_tls.bind)?;
             poll.registry()
                 .register(&mut wss_listener, LISTENER_WSS, Interest::READABLE)?;
-            info!("Secure WebSocket listening on {}", config.websocket_tls.bind);
+            info!(
+                "Secure WebSocket listening on {}",
+                config.websocket_tls.bind
+            );
             (Some(wss_listener), Some(Arc::new(wss_tls_config)))
         } else {
             (None, None)
@@ -217,10 +220,7 @@ impl Server {
         let cert_file = File::open(&cert_path).map_err(|e| {
             Error::Io(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!(
-                    "Failed to open WSS certificate file {:?}: {}",
-                    cert_path, e
-                ),
+                format!("Failed to open WSS certificate file {:?}: {}", cert_path, e),
             ))
         })?;
         let mut cert_reader = BufReader::new(cert_file);

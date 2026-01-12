@@ -93,6 +93,10 @@ pub struct Config {
     pub prometheus: PrometheusConfig,
     /// TLS configuration.
     pub tls: TlsConfig,
+    /// WebSocket configuration.
+    pub websocket: WebSocketConfig,
+    /// Secure WebSocket (WSS) configuration.
+    pub websocket_tls: WebSocketTlsConfig,
     /// Bridge configurations.
     #[serde(default)]
     pub bridge: Vec<BridgeConfig>,
@@ -127,6 +131,12 @@ pub const DEFAULT_PROMETHEUS_BIND: &str = "127.0.0.1:9090";
 
 /// Default TLS bind address.
 pub const DEFAULT_TLS_BIND: &str = "0.0.0.0:8883";
+
+/// Default WebSocket bind address.
+pub const DEFAULT_WS_BIND: &str = "0.0.0.0:8083";
+
+/// Default secure WebSocket bind address.
+pub const DEFAULT_WSS_BIND: &str = "0.0.0.0:8084";
 
 /// Default PROXY protocol header timeout in seconds.
 pub const DEFAULT_PROXY_TIMEOUT_SECS: u64 = 5;
@@ -496,6 +506,82 @@ impl Default for TlsConfig {
     }
 }
 
+// === WebSocket Configuration ===
+
+/// WebSocket configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WebSocketConfig {
+    /// Enable WebSocket listener.
+    pub enabled: bool,
+    /// WebSocket bind address (default: 0.0.0.0:8083).
+    #[serde(default = "default_ws_bind")]
+    pub bind: SocketAddr,
+    /// WebSocket path (default: /mqtt). Clients must connect to this path.
+    #[serde(default = "default_ws_path")]
+    pub path: String,
+    /// PROXY protocol configuration.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub proxy_protocol: ProxyProtocolConfig,
+}
+
+fn default_ws_path() -> String {
+    String::new() // Empty = accept any path
+}
+
+fn default_ws_bind() -> SocketAddr {
+    DEFAULT_WS_BIND.parse().unwrap()
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_ws_bind(),
+            path: default_ws_path(),
+            proxy_protocol: ProxyProtocolConfig::default(),
+        }
+    }
+}
+
+/// Secure WebSocket (WSS) configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WebSocketTlsConfig {
+    /// Enable secure WebSocket listener.
+    pub enabled: bool,
+    /// Secure WebSocket bind address (default: 0.0.0.0:9002).
+    #[serde(default = "default_wss_bind")]
+    pub bind: SocketAddr,
+    /// Path to PEM-encoded certificate file (uses tls.cert if not specified).
+    #[serde(default)]
+    pub cert: Option<PathBuf>,
+    /// Path to PEM-encoded private key file (uses tls.key if not specified).
+    #[serde(default)]
+    pub key: Option<PathBuf>,
+    /// PROXY protocol configuration.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub proxy_protocol: ProxyProtocolConfig,
+}
+
+fn default_wss_bind() -> SocketAddr {
+    DEFAULT_WSS_BIND.parse().unwrap()
+}
+
+impl Default for WebSocketTlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_wss_bind(),
+            cert: None,
+            key: None,
+            proxy_protocol: ProxyProtocolConfig::default(),
+        }
+    }
+}
+
 // === Bridge Configuration ===
 
 /// MQTT protocol version for bridge connections.
@@ -694,7 +780,12 @@ impl Config {
             .set_default("prometheus.bind", DEFAULT_PROMETHEUS_BIND)?
             // TLS defaults (disabled by default)
             .set_default("tls.enabled", false)?
-            .set_default("tls.bind", DEFAULT_TLS_BIND)?;
+            .set_default("tls.bind", DEFAULT_TLS_BIND)?
+            // WebSocket defaults (disabled by default)
+            .set_default("websocket.enabled", false)?
+            .set_default("websocket.bind", DEFAULT_WS_BIND)?
+            .set_default("websocket_tls.enabled", false)?
+            .set_default("websocket_tls.bind", DEFAULT_WSS_BIND)?;
 
         // Load from file with env var substitution
         let path = path.as_ref();
@@ -780,6 +871,33 @@ impl Config {
             if self.tls.key.as_os_str().is_empty() {
                 return Err(ConfigError::Validation(
                     "tls.key is required when TLS is enabled".into(),
+                ));
+            }
+        }
+
+        // Validate WSS config - needs either its own cert/key or TLS cert/key
+        if self.websocket_tls.enabled {
+            let has_own_cert = self
+                .websocket_tls
+                .cert
+                .as_ref()
+                .is_some_and(|p| !p.as_os_str().is_empty());
+            let has_own_key = self
+                .websocket_tls
+                .key
+                .as_ref()
+                .is_some_and(|p| !p.as_os_str().is_empty());
+            let has_tls_cert = !self.tls.cert.as_os_str().is_empty();
+            let has_tls_key = !self.tls.key.as_os_str().is_empty();
+
+            if !has_own_cert && !has_tls_cert {
+                return Err(ConfigError::Validation(
+                    "websocket_tls requires cert (set websocket_tls.cert or tls.cert)".into(),
+                ));
+            }
+            if !has_own_key && !has_tls_key {
+                return Err(ConfigError::Validation(
+                    "websocket_tls requires key (set websocket_tls.key or tls.key)".into(),
                 ));
             }
         }

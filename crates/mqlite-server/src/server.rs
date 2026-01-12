@@ -26,6 +26,7 @@ use crate::prometheus;
 use crate::proxy;
 use crate::shared::SharedState;
 use crate::sys_tree::SysTreePublisher;
+use crate::websocket;
 use crate::worker::{Worker, WorkerMsg};
 
 /// Token for the plain TCP listener socket.
@@ -33,6 +34,12 @@ const LISTENER: Token = Token(0);
 
 /// Token for the TLS listener socket.
 const LISTENER_TLS: Token = Token(1);
+
+/// Token for the WebSocket listener socket.
+const LISTENER_WS: Token = Token(2);
+
+/// Token for the secure WebSocket listener socket.
+const LISTENER_WSS: Token = Token(3);
 
 /// Channel capacity for worker messages.
 const CHANNEL_CAPACITY: usize = 4096;
@@ -45,6 +52,12 @@ pub struct Server {
     tls_listener: Option<TcpListener>,
     /// TLS server configuration (if TLS is enabled).
     tls_config: Option<Arc<ServerConfig>>,
+    /// WebSocket listener (if WebSocket is enabled).
+    ws_listener: Option<TcpListener>,
+    /// Secure WebSocket listener (if WSS is enabled).
+    wss_listener: Option<TcpListener>,
+    /// TLS config for WSS (may share with MQTTS).
+    wss_tls_config: Option<Arc<ServerConfig>>,
     /// Senders to worker channels.
     worker_senders: Vec<Sender<WorkerMsg>>,
     /// Round-robin counter for connection distribution.
@@ -81,11 +94,38 @@ impl Server {
             (None, None)
         };
 
+        // Initialize WebSocket listener if enabled
+        let ws_listener = if config.websocket.enabled {
+            let mut ws_listener = TcpListener::bind(config.websocket.bind)?;
+            poll.registry()
+                .register(&mut ws_listener, LISTENER_WS, Interest::READABLE)?;
+            info!("WebSocket listening on {}", config.websocket.bind);
+            Some(ws_listener)
+        } else {
+            None
+        };
+
+        // Initialize secure WebSocket listener if enabled
+        let (wss_listener, wss_tls_config) = if config.websocket_tls.enabled {
+            // Load TLS config for WSS (use own cert/key or fall back to tls config)
+            let wss_tls_config = Self::load_wss_tls_config(&config)?;
+            let mut wss_listener = TcpListener::bind(config.websocket_tls.bind)?;
+            poll.registry()
+                .register(&mut wss_listener, LISTENER_WSS, Interest::READABLE)?;
+            info!("Secure WebSocket listening on {}", config.websocket_tls.bind);
+            (Some(wss_listener), Some(Arc::new(wss_tls_config)))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             poll,
             listener,
             tls_listener,
             tls_config,
+            ws_listener,
+            wss_listener,
+            wss_tls_config,
             worker_senders: Vec::new(),
             next_worker: 0,
             num_workers,
@@ -159,6 +199,84 @@ impl Server {
         Ok(tls_config)
     }
 
+    /// Load TLS configuration for secure WebSocket.
+    /// Uses websocket_tls cert/key if specified, otherwise falls back to tls config.
+    fn load_wss_tls_config(config: &Config) -> Result<ServerConfig> {
+        let cert_path = config
+            .websocket_tls
+            .cert
+            .clone()
+            .unwrap_or_else(|| config.tls.cert.clone());
+        let key_path = config
+            .websocket_tls
+            .key
+            .clone()
+            .unwrap_or_else(|| config.tls.key.clone());
+
+        // Load certificate chain
+        let cert_file = File::open(&cert_path).map_err(|e| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "Failed to open WSS certificate file {:?}: {}",
+                    cert_path, e
+                ),
+            ))
+        })?;
+        let mut cert_reader = BufReader::new(cert_file);
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to parse WSS certificate: {}", e),
+                ))
+            })?;
+
+        if certs.is_empty() {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "No certificates found in WSS certificate file",
+            )));
+        }
+
+        // Load private key
+        let key_file = File::open(&key_path).map_err(|e| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Failed to open WSS key file {:?}: {}", key_path, e),
+            ))
+        })?;
+        let mut key_reader = BufReader::new(key_file);
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|e| {
+                Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to parse WSS private key: {}", e),
+                ))
+            })?
+            .ok_or_else(|| {
+                Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "No private key found in WSS key file",
+                ))
+            })?;
+
+        // Build TLS config
+        let tls_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| {
+                Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to build WSS TLS config: {}", e),
+                ))
+            })?;
+
+        info!("WSS TLS configuration loaded from {:?}", cert_path);
+        Ok(tls_config)
+    }
+
     /// Run the server with workers.
     pub fn run(&mut self) -> Result<()> {
         let shared = Arc::new(SharedState::new());
@@ -226,6 +344,8 @@ impl Server {
                     match event.token() {
                         LISTENER => self.accept_connections()?,
                         LISTENER_TLS => self.accept_tls_connections()?,
+                        LISTENER_WS => self.accept_websocket_connections()?,
+                        LISTENER_WSS => self.accept_websocket_tls_connections()?,
                         _ => {}
                     }
                 }
@@ -281,6 +401,8 @@ impl Server {
                     match event.token() {
                         LISTENER => self.accept_connections()?,
                         LISTENER_TLS => self.accept_tls_connections()?,
+                        LISTENER_WS => self.accept_websocket_connections()?,
+                        LISTENER_WSS => self.accept_websocket_tls_connections()?,
                         _ => {}
                     }
                 }
@@ -414,6 +536,98 @@ impl Server {
                         addr,
                         preamble,
                     });
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Accept new WebSocket connections and distribute to workers.
+    fn accept_websocket_connections(&mut self) -> Result<()> {
+        let ws_listener = match &self.ws_listener {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+
+        loop {
+            match ws_listener.accept() {
+                Ok((socket, addr)) => {
+                    // Convert to std socket for blocking handshake
+                    let std_socket: std::net::TcpStream = socket.into();
+
+                    // Set to blocking mode for the handshake
+                    if let Err(e) = std_socket.set_nonblocking(false) {
+                        debug!("Failed to set socket to blocking for {}: {}", addr, e);
+                        continue;
+                    }
+
+                    // Perform WebSocket handshake (blocking)
+                    match websocket::accept_websocket(std_socket, &self.config.websocket.path) {
+                        Ok(ws) => {
+                            // Wrap in mio-compatible transport
+                            match websocket::wrap_websocket(ws) {
+                                Ok(ws_transport) => {
+                                    let worker_id = self.next_worker;
+                                    self.next_worker = (self.next_worker + 1) % self.num_workers;
+
+                                    debug!(
+                                        "Accepted WebSocket connection from {}, assigning to worker {}",
+                                        addr, worker_id
+                                    );
+
+                                    let transport = Transport::websocket(ws_transport);
+                                    let _ =
+                                        self.worker_senders[worker_id].send(WorkerMsg::NewClient {
+                                            transport,
+                                            addr,
+                                            preamble: Vec::new(),
+                                        });
+                                }
+                                Err(e) => {
+                                    debug!("Failed to wrap WebSocket for {}: {}", addr, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!("WebSocket handshake failed from {}: {}", addr, e);
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Accept new secure WebSocket (WSS) connections and distribute to workers.
+    /// TODO: WSS support requires adding Transport::WebSocketTls variant
+    fn accept_websocket_tls_connections(&mut self) -> Result<()> {
+        let wss_listener = match &self.wss_listener {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        let _wss_tls_config = match &self.wss_tls_config {
+            Some(c) => Arc::clone(c),
+            None => return Ok(()),
+        };
+
+        // For now, accept and immediately close WSS connections with a warning
+        // Full WSS support requires Transport::WebSocketTls variant
+        loop {
+            match wss_listener.accept() {
+                Ok((_socket, addr)) => {
+                    debug!(
+                        "WSS connection from {} rejected - WSS not yet implemented",
+                        addr
+                    );
+                    // Socket is dropped, closing the connection
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;

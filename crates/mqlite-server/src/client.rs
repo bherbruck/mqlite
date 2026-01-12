@@ -11,14 +11,18 @@ use mio::net::TcpStream;
 use mio::Token;
 use rustls::ServerConnection;
 
+use crate::websocket::WebSocketTransport;
+
 // === Transport Abstraction ===
 
-/// Transport layer abstraction for plain TCP and TLS connections.
+/// Transport layer abstraction for plain TCP, TLS, and WebSocket connections.
 pub enum Transport {
     /// Plain TCP connection.
     Plain(TcpStream),
     /// TLS-wrapped TCP connection.
     Tls(Box<rustls::StreamOwned<ServerConnection, TcpStream>>),
+    /// WebSocket connection (uses mio TcpStream).
+    WebSocket(Box<WebSocketTransport<TcpStream>>),
 }
 
 impl Transport {
@@ -32,12 +36,18 @@ impl Transport {
         Transport::Tls(Box::new(rustls::StreamOwned::new(tls_conn, stream)))
     }
 
+    /// Create a WebSocket transport.
+    pub fn websocket(ws: WebSocketTransport<TcpStream>) -> Self {
+        Transport::WebSocket(Box::new(ws))
+    }
+
     /// Get the underlying TCP stream for mio registration.
     #[allow(dead_code)]
     pub fn tcp_stream(&self) -> &TcpStream {
         match self {
             Transport::Plain(s) => s,
             Transport::Tls(s) => s.get_ref(),
+            Transport::WebSocket(ws) => ws.tcp_stream(),
         }
     }
 
@@ -46,6 +56,7 @@ impl Transport {
         match self {
             Transport::Plain(s) => s,
             Transport::Tls(s) => s.get_mut(),
+            Transport::WebSocket(ws) => ws.tcp_stream_mut(),
         }
     }
 }
@@ -55,6 +66,7 @@ impl Read for Transport {
         match self {
             Transport::Plain(s) => s.read(buf),
             Transport::Tls(s) => s.read(buf),
+            Transport::WebSocket(ws) => ws.read(buf),
         }
     }
 }
@@ -64,6 +76,7 @@ impl Write for Transport {
         match self {
             Transport::Plain(s) => s.write(buf),
             Transport::Tls(s) => s.write(buf),
+            Transport::WebSocket(ws) => ws.write(buf),
         }
     }
 
@@ -71,6 +84,7 @@ impl Write for Transport {
         match self {
             Transport::Plain(s) => s.flush(),
             Transport::Tls(s) => s.flush(),
+            Transport::WebSocket(ws) => ws.flush(),
         }
     }
 
@@ -78,6 +92,7 @@ impl Write for Transport {
         match self {
             Transport::Plain(s) => s.write_vectored(bufs),
             Transport::Tls(s) => s.write_vectored(bufs),
+            Transport::WebSocket(ws) => ws.write_vectored(bufs),
         }
     }
 }
@@ -87,6 +102,7 @@ impl AsRawFd for Transport {
         match self {
             Transport::Plain(s) => s.as_raw_fd(),
             Transport::Tls(s) => s.get_ref().as_raw_fd(),
+            Transport::WebSocket(ws) => ws.as_raw_fd(),
         }
     }
 }

@@ -199,7 +199,11 @@ impl Worker {
                     addr,
                     preamble,
                 } => {
-                    self.accept_client(transport, addr, preamble)?;
+                    let token = self.accept_client(transport, addr, preamble)?;
+                    // With edge-triggered epoll, data pending before registration won't
+                    // fire an event. Do an initial read to handle WebSocket connections
+                    // where MQTT CONNECT may arrive during the blocking handshake.
+                    self.handle_readable(token)?;
                 }
                 WorkerMsg::Disconnect { token } => {
                     if let Some(client) = self.clients.get_mut(&token) {
@@ -274,12 +278,13 @@ impl Worker {
     }
 
     /// Accept a new client connection.
+    /// Returns the token assigned to the new client.
     fn accept_client(
         &mut self,
         mut transport: Transport,
         addr: SocketAddr,
         preamble: Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<Token> {
         let token = Token(self.next_token);
         self.next_token += 1;
 
@@ -302,7 +307,7 @@ impl Worker {
         // Track socket opened for $SYS metrics
         self.shared.metrics.increment_sockets_opened();
 
-        Ok(())
+        Ok(token)
     }
 
     /// Get subscribers for a topic, using cache if valid.

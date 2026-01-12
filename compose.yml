@@ -5,6 +5,8 @@ services:
     ports:
       - 1883:1883
       - 8883:8883 # TLS
+      - 8083:8083 # WebSocket
+      - 8084:8084 # Secure WebSocket
       - 9090:9090 # Prometheus metrics
     volumes:
       - mqlite_data:/var/lib/mqlite

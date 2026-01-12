@@ -2,6 +2,19 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git Workflow Rules
+
+**CRITICAL: NEVER delete the `develop` branch.** This branch maintains the project's development lineage and must always exist. After merging PRs from develop to main:
+- Do NOT suggest deleting the develop branch
+- Do NOT delete develop on GitHub
+- Keep develop aligned with main after merges
+
+**CRITICAL: NEVER work directly on `main`.** The only exception is version bumps. All other work must be done on `develop` or a feature branch.
+
+Branch workflow:
+- `develop` - Primary development branch. All new work goes here first.
+- `main` - Stable branch. Receives merges from develop via PR. DO NOT commit directly to main.
+
 ## Project Overview
 
 mqlite is a high-performance MQTT 3.1.1 broker written in Rust, optimized for low latency and high throughput. It uses `mio` for async I/O with epoll, direct cross-thread writes for publish delivery, and zero-copy message sharing with `Bytes`.

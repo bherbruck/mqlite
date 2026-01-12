@@ -31,6 +31,7 @@ mod shared;
 mod subscription;
 mod sys_tree;
 mod util;
+mod websocket;
 mod will;
 mod worker;
 mod write_buffer;

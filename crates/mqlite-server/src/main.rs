@@ -17,6 +17,7 @@ static MALLOC_CONF: &[u8] =
 
 mod auth;
 mod bridge;
+mod cleanup;
 mod client;
 mod client_handle;
 mod config;

@@ -26,6 +26,7 @@ use mqlite_core::packet::{
 };
 
 use crate::auth::AuthProvider;
+use crate::cleanup;
 use crate::client::{Client, ClientState, Transport};
 use crate::client_handle::ClientWriteHandle;
 use crate::config::Config;
@@ -34,7 +35,9 @@ use crate::fanout::{
     write_cross_worker_pending, FanoutContext,
 };
 use crate::handlers::connect as connect_handler;
+use crate::handlers::disconnect as disconnect_handler;
 use crate::handlers::publish as publish_handler;
+use crate::handlers::qos as qos_handler;
 use crate::handlers::subscribe as subscribe_handler;
 use crate::publish_encoder::PublishEncoder;
 use crate::route_cache::RouteCache;
@@ -213,15 +216,8 @@ impl Worker {
                         if !client.clean_session {
                             if let Some(ref client_id) = client.client_id {
                                 let mut sessions = self.shared.sessions.write();
-                                // Create session if it doesn't exist - handles race conditions
                                 let session = sessions.entry(client_id.clone()).or_default();
-                                for (pid, pending) in &client.pending_qos1 {
-                                    session.pending_qos1.push((*pid, pending.publish.clone()));
-                                }
-                                for (pid, pending) in &client.pending_qos2 {
-                                    session.pending_qos2.push((*pid, pending.publish.clone()));
-                                }
-                                // Signal that takeover is complete
+                                connect_handler::save_pending_to_session(client, session);
                                 session.takeover_complete = true;
                             }
                         }
@@ -411,45 +407,25 @@ impl Worker {
 
             Packet::Puback { packet_id } => {
                 if let Some(client) = self.clients.get_mut(&token) {
-                    client.pending_qos1.remove(&packet_id);
-                    // MQTT 5: Restore outgoing quota when ACK received
-                    client.restore_quota();
+                    qos_handler::handle_puback(client, packet_id);
                 }
             }
 
             Packet::Pubrec { packet_id } => {
                 if let Some(client) = self.clients.get_mut(&token) {
-                    // PUBREL is critical for QoS 2 flow - use guaranteed write
-                    if let Err(e) = client.queue_control_packet(&Packet::Pubrel { packet_id }) {
-                        log::warn!(
-                            "Failed to queue PUBREL for client {:?} packet_id={}: {}",
-                            client.client_id,
-                            packet_id,
-                            e
-                        );
-                    }
+                    qos_handler::handle_pubrec(client, packet_id);
                 }
             }
 
             Packet::Pubrel { packet_id } => {
                 if let Some(client) = self.clients.get_mut(&token) {
-                    // PUBCOMP is critical for QoS 2 flow - use guaranteed write
-                    if let Err(e) = client.queue_control_packet(&Packet::Pubcomp { packet_id }) {
-                        log::warn!(
-                            "Failed to queue PUBCOMP for client {:?} packet_id={}: {}",
-                            client.client_id,
-                            packet_id,
-                            e
-                        );
-                    }
+                    qos_handler::handle_pubrel(client, packet_id);
                 }
             }
 
             Packet::Pubcomp { packet_id } => {
                 if let Some(client) = self.clients.get_mut(&token) {
-                    client.pending_qos2.remove(&packet_id);
-                    // MQTT 5: Restore outgoing quota when QoS 2 flow completes
-                    client.restore_quota();
+                    qos_handler::handle_pubcomp(client, packet_id);
                 }
             }
 
@@ -469,32 +445,13 @@ impl Worker {
 
             Packet::Pingreq => {
                 if let Some(client) = self.clients.get_mut(&token) {
-                    // PINGRESP is critical - client will disconnect if not received
-                    if let Err(e) = client.queue_control_packet(&Packet::Pingresp) {
-                        log::warn!(
-                            "Failed to queue PINGRESP for client {:?}: {}",
-                            client.client_id,
-                            e
-                        );
-                    }
-                    // Flush immediately - don't wait for next poll() cycle
-                    // This ensures PINGRESP goes out ASAP even if worker is busy with fan-out
-                    let _ = client.flush();
+                    disconnect_handler::handle_pingreq(client);
                 }
             }
 
             Packet::Disconnect { reason_code } => {
                 if let Some(client) = self.clients.get_mut(&token) {
-                    // MQTT v5 reason code 0x04 = Disconnect with Will Message
-                    if reason_code == 0x04 {
-                        // Keep will and mark as non-graceful so will gets published
-                        client.graceful_disconnect = false;
-                    } else {
-                        // Normal disconnect - clear will and mark as graceful
-                        client.graceful_disconnect = true;
-                        client.will = None;
-                    }
-                    client.state = ClientState::Disconnecting;
+                    disconnect_handler::handle_disconnect(client, reason_code);
                 }
             }
 
@@ -550,59 +507,40 @@ impl Worker {
         }
 
         // Handle client takeover (MQTT-3.1.4-2)
-        let mut old_location: Option<ClientLocation> = None;
-        if !connect.client_id.is_empty() {
-            let existing_location = self
-                .shared
-                .client_registry
-                .read()
-                .get(&connect.client_id)
-                .cloned();
+        let takeover_result =
+            connect_handler::check_existing_client(&connect.client_id, token, self.id, &self.shared);
+        let old_location = takeover_result.as_ref().and_then(|r| r.old_location);
 
-            if let Some(location) = existing_location {
-                if location.token != token || location.worker_id != self.id {
-                    old_location = Some(location);
-
-                    if location.worker_id == self.id {
-                        // Same worker - disconnect directly
-                        if let Some(existing_client) = self.clients.get_mut(&location.token) {
-                            if !existing_client.clean_session {
-                                let mut sessions = self.shared.sessions.write();
-                                let session =
-                                    sessions.entry(connect.client_id.clone()).or_default();
-                                for (pid, pending) in &existing_client.pending_qos1 {
-                                    session.pending_qos1.push((*pid, pending.publish.clone()));
-                                }
-                                for (pid, pending) in &existing_client.pending_qos2 {
-                                    session.pending_qos2.push((*pid, pending.publish.clone()));
-                                }
-                                session.takeover_complete = true;
-                            }
-                            existing_client.state = ClientState::Disconnecting;
-                        }
-                    } else {
-                        // Cross-worker takeover
-                        if !connect.clean_session {
+        if let Some(ref result) = takeover_result {
+            if let Some(location) = result.old_location {
+                if !result.is_cross_worker {
+                    // Same worker - disconnect directly
+                    if let Some(existing_client) = self.clients.get_mut(&location.token) {
+                        if !existing_client.clean_session {
                             let mut sessions = self.shared.sessions.write();
-                            let session = sessions.entry(connect.client_id.clone()).or_default();
-                            session.takeover_complete = false;
+                            let session =
+                                sessions.entry(connect.client_id.clone()).or_default();
+                            connect_handler::save_pending_to_session(existing_client, session);
+                            session.takeover_complete = true;
                         }
-                        let _ =
-                            self.worker_senders[location.worker_id].send(WorkerMsg::Disconnect {
-                                token: location.token,
-                            });
+                        existing_client.state = ClientState::Disconnecting;
                     }
+                } else {
+                    // Cross-worker takeover
+                    if !connect.clean_session {
+                        let mut sessions = self.shared.sessions.write();
+                        let session = sessions.entry(connect.client_id.clone()).or_default();
+                        session.takeover_complete = false;
+                    }
+                    let _ =
+                        self.worker_senders[location.worker_id].send(WorkerMsg::Disconnect {
+                            token: location.token,
+                        });
                 }
             }
-
-            self.shared.client_registry.write().insert(
-                connect.client_id.clone(),
-                ClientLocation {
-                    worker_id: self.id,
-                    token,
-                },
-            );
         }
+
+        connect_handler::register_client(&connect.client_id, token, self.id, &self.shared);
 
         // Handle session persistence
         let mut pending_to_resend: Vec<Publish> = Vec::new();
@@ -816,35 +754,23 @@ impl Worker {
             return_codes.push(options.qos as u8);
 
             // Update session for persistent clients
-            let mut skip_retained = false;
+            let mut skip_retained = options.retain_handling == 2;
             if !clean_session {
                 if let Some(ref cid) = client_id {
                     let mut sessions = self.shared.sessions.write();
                     if let Some(session) = sessions.get_mut(cid) {
-                        let subscription_exists = session
-                            .subscriptions
-                            .iter()
-                            .any(|s| s.topic_filter == *topic_filter);
-                        session
-                            .subscriptions
-                            .retain(|s| s.topic_filter != *topic_filter);
-                        session.subscriptions.push(StoredSubscription {
-                            topic_filter: topic_filter.clone(),
-                            options: *options,
-                            subscription_id: subscribe.subscription_id,
-                        });
-
-                        // RetainHandling
-                        if options.retain_handling == 2
-                            || (options.retain_handling == 1 && subscription_exists)
-                        {
-                            skip_retained = true;
-                        }
+                        let result = subscribe_handler::update_session_subscription(
+                            session,
+                            topic_filter,
+                            *options,
+                            subscribe.subscription_id,
+                        );
+                        skip_retained = result.skip_retained;
                     }
                 }
             }
 
-            if options.retain_handling == 2 || skip_retained {
+            if skip_retained {
                 continue;
             }
 
@@ -1081,51 +1007,35 @@ impl Worker {
                 self.route_cache.remove_client(self.id, token);
 
                 if let Some(ref client_id) = client.client_id {
-                    // Check if we're still the owner of this client registration
-                    let is_current_owner = {
-                        let registry = self.shared.client_registry.read();
-                        registry
-                            .get(client_id)
-                            .map(|loc| loc.token == token && loc.worker_id == self.id)
-                            .unwrap_or(false)
-                    };
+                    // Check if we're still the owner and remove from registry if so
+                    let is_current_owner = cleanup::remove_from_registry_if_owner(
+                        client_id,
+                        token,
+                        self.id,
+                        &self.shared,
+                    );
 
-                    if is_current_owner {
-                        // We're still the owner - remove from registry
-                        self.shared.client_registry.write().remove(client_id);
-                    }
-
-                    // Always save pending messages for persistent sessions, even after takeover.
-                    // For cross-worker takeover, the new client may have already drained session
-                    // pending messages, but we still need to save our client's pending messages
-                    // (which were in flight when we got the Disconnect message).
+                    // Save pending messages for persistent sessions
                     if !client.clean_session {
-                        let mut sessions = self.shared.sessions.write();
-                        // Create session if it doesn't exist - handles race where cleanup
-                        // runs before new client's CONNECT handler creates the session
-                        let session = sessions.entry(client_id.clone()).or_default();
-                        // Only set last_connection if we're still the owner
-                        // (otherwise the new client has already taken over)
-                        if is_current_owner {
-                            session.last_connection = Some((self.id, token));
-                        }
-                        // Always save pending messages - they might not have been
-                        // transferred to session yet if this was a takeover
                         log::debug!(
                             "cleanup_clients for {}: saving {} QoS1, {} QoS2 pending",
                             client_id,
                             client.pending_qos1.len(),
                             client.pending_qos2.len()
                         );
-                        for (pid, pending) in &client.pending_qos1 {
-                            session.pending_qos1.push((*pid, pending.publish.clone()));
-                        }
-                        for (pid, pending) in &client.pending_qos2 {
-                            session.pending_qos2.push((*pid, pending.publish.clone()));
-                        }
-                        // Signal takeover completion for any waiting worker
-                        // (handles the case where cleanup runs before Disconnect msg is received)
-                        session.takeover_complete = true;
+                        let (qos1, qos2) = cleanup::collect_pending_for_session(
+                            &client.pending_qos1,
+                            &client.pending_qos2,
+                        );
+                        cleanup::update_session_on_disconnect(
+                            client_id,
+                            token,
+                            self.id,
+                            is_current_owner,
+                            &qos1,
+                            &qos2,
+                            &self.shared,
+                        );
                     }
                 }
 

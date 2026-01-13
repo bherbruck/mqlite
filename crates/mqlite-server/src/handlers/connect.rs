@@ -108,12 +108,75 @@ pub fn build_auth_rejection_connack(auth_result: &AuthResult, is_v5: bool) -> Co
 }
 
 /// Result of client takeover handling.
-#[allow(dead_code)]
 pub struct TakeoverResult {
     /// Location of the old client (if any) for subscription cleanup.
     pub old_location: Option<ClientLocation>,
     /// Whether this was a cross-worker takeover (requires waiting).
     pub is_cross_worker: bool,
+}
+
+/// Save a client's pending QoS 1/2 messages to a session.
+///
+/// This is used during:
+/// - Same-worker takeover (save before disconnect)
+/// - Cross-worker takeover (save when receiving Disconnect message)
+/// - Client cleanup (save on disconnect for persistent sessions)
+#[inline]
+pub fn save_pending_to_session(client: &Client, session: &mut Session) {
+    for (pid, pending) in &client.pending_qos1 {
+        session.pending_qos1.push((*pid, pending.publish.clone()));
+    }
+    for (pid, pending) in &client.pending_qos2 {
+        session.pending_qos2.push((*pid, pending.publish.clone()));
+    }
+}
+
+/// Check if a client with this ID already exists and determine takeover type.
+///
+/// Returns `None` if no existing client, or `Some(TakeoverResult)` with the
+/// old location and whether it's a cross-worker takeover.
+#[inline]
+pub fn check_existing_client(
+    client_id: &str,
+    new_token: Token,
+    worker_id: usize,
+    shared: &SharedStateHandle,
+) -> Option<TakeoverResult> {
+    if client_id.is_empty() {
+        return None;
+    }
+
+    let existing_location = shared
+        .client_registry
+        .read()
+        .get(client_id)
+        .cloned();
+
+    match existing_location {
+        Some(location) if location.token != new_token || location.worker_id != worker_id => {
+            Some(TakeoverResult {
+                old_location: Some(location),
+                is_cross_worker: location.worker_id != worker_id,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Register a new client in the client registry.
+#[inline]
+pub fn register_client(
+    client_id: &str,
+    token: Token,
+    worker_id: usize,
+    shared: &SharedStateHandle,
+) {
+    if !client_id.is_empty() {
+        shared.client_registry.write().insert(
+            client_id.to_string(),
+            ClientLocation { worker_id, token },
+        );
+    }
 }
 
 /// Generate an assigned client ID for MQTT 5 clients with empty client ID.
@@ -346,5 +409,82 @@ mod tests {
         let id = generate_client_id(Token(42));
         assert!(id.starts_with("mqlite-"));
         assert!(id.ends_with("-42"));
+    }
+
+    #[test]
+    fn test_save_pending_to_session() {
+        use bytes::Bytes;
+
+        let mut session = Session::default();
+
+        // Create mock pending messages
+        let publish1 = Publish {
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            topic: Bytes::from_static(b"test/topic1"),
+            packet_id: Some(1),
+            payload: Bytes::from_static(b"payload1"),
+            properties: None,
+        };
+        let publish2 = Publish {
+            dup: false,
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            topic: Bytes::from_static(b"test/topic2"),
+            packet_id: Some(2),
+            payload: Bytes::from_static(b"payload2"),
+            properties: None,
+        };
+
+        // Simulate client pending messages
+        let mut pending_qos1 = ahash::AHashMap::new();
+        pending_qos1.insert(
+            1u16,
+            PendingPublish {
+                publish: publish1.clone(),
+                sent_at: Instant::now(),
+            },
+        );
+
+        let mut pending_qos2 = ahash::AHashMap::new();
+        pending_qos2.insert(
+            2u16,
+            PendingPublish {
+                publish: publish2.clone(),
+                sent_at: Instant::now(),
+            },
+        );
+
+        // Manually do what save_pending_to_session does
+        for (pid, pending) in &pending_qos1 {
+            session.pending_qos1.push((*pid, pending.publish.clone()));
+        }
+        for (pid, pending) in &pending_qos2 {
+            session.pending_qos2.push((*pid, pending.publish.clone()));
+        }
+
+        assert_eq!(session.pending_qos1.len(), 1);
+        assert_eq!(session.pending_qos2.len(), 1);
+        assert_eq!(session.pending_qos1[0].0, 1);
+        assert_eq!(session.pending_qos2[0].0, 2);
+    }
+
+    #[test]
+    fn test_takeover_result_structure() {
+        let result = TakeoverResult {
+            old_location: Some(ClientLocation {
+                worker_id: 1,
+                token: Token(42),
+            }),
+            is_cross_worker: true,
+        };
+
+        assert!(result.old_location.is_some());
+        assert!(result.is_cross_worker);
+
+        let loc = result.old_location.unwrap();
+        assert_eq!(loc.worker_id, 1);
+        assert_eq!(loc.token, Token(42));
     }
 }

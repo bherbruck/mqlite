@@ -5,5 +5,7 @@
 //! is done here to keep worker.rs manageable.
 
 pub mod connect;
+pub mod disconnect;
 pub mod publish;
+pub mod qos;
 pub mod subscribe;

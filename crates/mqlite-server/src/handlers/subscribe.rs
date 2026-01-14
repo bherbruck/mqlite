@@ -10,13 +10,13 @@ use bytes::Bytes;
 
 use mqlite_core::packet::{
     encode_variable_byte_integer, update_message_expiry, validate_topic, Packet, Publish, QoS,
-    Suback,
+    Suback, SubscriptionOptions,
 };
 
 use crate::auth::{AuthProvider, ClientInfo};
 use crate::client::Client;
 use crate::config::{LimitsConfig, MqttConfig};
-use crate::shared::RetainedMessage;
+use crate::shared::{RetainedMessage, Session, StoredSubscription};
 use crate::subscription::topic_matches_filter;
 
 /// Validation error for subscriptions.
@@ -243,6 +243,54 @@ pub fn send_suback(client: &mut Client, packet_id: u16, return_codes: Vec<u8>) {
     }
 }
 
+/// Result of updating a session subscription.
+pub struct SessionUpdateResult {
+    /// Whether to skip sending retained messages for this subscription.
+    pub skip_retained: bool,
+}
+
+/// Update a session's stored subscription for persistent clients.
+///
+/// Handles:
+/// - Removing any existing subscription with the same topic filter
+/// - Adding the new subscription
+/// - Determining whether to skip retained messages based on RetainHandling option
+///
+/// Returns `SessionUpdateResult` with `skip_retained` set based on MQTT 5 RetainHandling rules:
+/// - retain_handling=2: Always skip retained messages
+/// - retain_handling=1: Skip if subscription already existed
+/// - retain_handling=0: Never skip (default)
+pub fn update_session_subscription(
+    session: &mut Session,
+    topic_filter: &str,
+    options: SubscriptionOptions,
+    subscription_id: Option<u32>,
+) -> SessionUpdateResult {
+    // Check if subscription already exists
+    let subscription_exists = session
+        .subscriptions
+        .iter()
+        .any(|s| s.topic_filter == topic_filter);
+
+    // Remove old subscription if it exists
+    session
+        .subscriptions
+        .retain(|s| s.topic_filter != topic_filter);
+
+    // Add new subscription
+    session.subscriptions.push(StoredSubscription {
+        topic_filter: topic_filter.to_string(),
+        options,
+        subscription_id,
+    });
+
+    // Determine if we should skip retained messages
+    let skip_retained =
+        options.retain_handling == 2 || (options.retain_handling == 1 && subscription_exists);
+
+    SessionUpdateResult { skip_retained }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +344,98 @@ mod tests {
             SubscriptionError::SharedNotSupported.to_return_code(false),
             0x80
         );
+    }
+
+    #[test]
+    fn test_update_session_subscription_new() {
+        let mut session = Session::default();
+        let options = SubscriptionOptions {
+            qos: QoS::AtLeastOnce,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+        };
+
+        let result = update_session_subscription(&mut session, "test/topic", options, None);
+
+        assert!(!result.skip_retained);
+        assert_eq!(session.subscriptions.len(), 1);
+        assert_eq!(session.subscriptions[0].topic_filter, "test/topic");
+    }
+
+    #[test]
+    fn test_update_session_subscription_replace() {
+        let mut session = Session::default();
+        let options1 = SubscriptionOptions {
+            qos: QoS::AtMostOnce,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+        };
+        let options2 = SubscriptionOptions {
+            qos: QoS::ExactlyOnce,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+        };
+
+        // Add first subscription
+        update_session_subscription(&mut session, "test/topic", options1, None);
+
+        // Replace with new options
+        let result = update_session_subscription(&mut session, "test/topic", options2, Some(42));
+
+        assert!(!result.skip_retained);
+        assert_eq!(session.subscriptions.len(), 1);
+        assert_eq!(session.subscriptions[0].options.qos, QoS::ExactlyOnce);
+        assert_eq!(session.subscriptions[0].subscription_id, Some(42));
+    }
+
+    #[test]
+    fn test_update_session_subscription_retain_handling_2() {
+        let mut session = Session::default();
+        let options = SubscriptionOptions {
+            qos: QoS::AtLeastOnce,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 2, // Don't send retained messages
+        };
+
+        let result = update_session_subscription(&mut session, "test/topic", options, None);
+
+        assert!(result.skip_retained);
+    }
+
+    #[test]
+    fn test_update_session_subscription_retain_handling_1_new() {
+        let mut session = Session::default();
+        let options = SubscriptionOptions {
+            qos: QoS::AtLeastOnce,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 1, // Send retained only if subscription doesn't exist
+        };
+
+        // New subscription - should send retained
+        let result = update_session_subscription(&mut session, "test/topic", options, None);
+        assert!(!result.skip_retained);
+    }
+
+    #[test]
+    fn test_update_session_subscription_retain_handling_1_existing() {
+        let mut session = Session::default();
+        let options = SubscriptionOptions {
+            qos: QoS::AtLeastOnce,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 1, // Send retained only if subscription doesn't exist
+        };
+
+        // Add subscription first
+        update_session_subscription(&mut session, "test/topic", options, None);
+
+        // Re-subscribe - should skip retained
+        let result = update_session_subscription(&mut session, "test/topic", options, None);
+        assert!(result.skip_retained);
     }
 }

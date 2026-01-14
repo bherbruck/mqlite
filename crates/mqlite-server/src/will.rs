@@ -152,14 +152,28 @@ pub fn store_retained_will(publish: &Publish, shared: &SharedStateHandle) {
 
     if publish.payload.is_empty() {
         retained.remove(&topic_str);
+        // Remove from persistence
+        #[cfg(feature = "persistence")]
+        if let Err(e) = shared.remove_persisted_retained(&topic_str) {
+            log::warn!(
+                "Failed to remove persisted retained will for '{}': {}",
+                topic_str,
+                e
+            );
+        }
     } else {
         retained.insert(
-            topic_str,
+            topic_str.clone(),
             RetainedMessage {
                 publish: publish.clone(),
                 stored_at: Instant::now(),
             },
         );
+        // Persist to disk
+        #[cfg(feature = "persistence")]
+        if let Err(e) = shared.persist_retained(&topic_str, publish) {
+            log::warn!("Failed to persist retained will for '{}': {}", topic_str, e);
+        }
     }
 }
 

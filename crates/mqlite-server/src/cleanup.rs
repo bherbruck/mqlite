@@ -9,6 +9,12 @@ use mio::Token;
 
 use crate::shared::SharedStateHandle;
 
+/// Pending QoS 1 and QoS 2 messages collected for session storage.
+type PendingMessages = (
+    Vec<(u16, mqlite_core::packet::Publish)>,
+    Vec<(u16, mqlite_core::packet::Publish)>,
+);
+
 /// Check if the current worker is the owner of a client registration.
 ///
 /// Returns `true` if the given token and worker_id match the registered location.
@@ -92,10 +98,7 @@ pub fn update_session_on_disconnect(
 pub fn collect_pending_for_session(
     pending_qos1: &ahash::AHashMap<u16, crate::client::PendingPublish>,
     pending_qos2: &ahash::AHashMap<u16, crate::client::PendingPublish>,
-) -> (
-    Vec<(u16, mqlite_core::packet::Publish)>,
-    Vec<(u16, mqlite_core::packet::Publish)>,
-) {
+) -> PendingMessages {
     let qos1: Vec<_> = pending_qos1
         .iter()
         .map(|(pid, p)| (*pid, p.publish.clone()))

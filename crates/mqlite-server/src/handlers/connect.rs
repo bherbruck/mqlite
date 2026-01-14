@@ -146,11 +146,7 @@ pub fn check_existing_client(
         return None;
     }
 
-    let existing_location = shared
-        .client_registry
-        .read()
-        .get(client_id)
-        .cloned();
+    let existing_location = shared.client_registry.read().get(client_id).cloned();
 
     match existing_location {
         Some(location) if location.token != new_token || location.worker_id != worker_id => {
@@ -172,10 +168,10 @@ pub fn register_client(
     shared: &SharedStateHandle,
 ) {
     if !client_id.is_empty() {
-        shared.client_registry.write().insert(
-            client_id.to_string(),
-            ClientLocation { worker_id, token },
-        );
+        shared
+            .client_registry
+            .write()
+            .insert(client_id.to_string(), ClientLocation { worker_id, token });
     }
 }
 

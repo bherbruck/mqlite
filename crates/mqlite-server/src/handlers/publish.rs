@@ -130,6 +130,15 @@ pub fn handle_retained(publish: &Publish, shared: &SharedStateHandle) {
     if publish.payload.is_empty() {
         // Empty payload = delete retained message
         retained_msgs.remove(&topic_str);
+        // Remove from persistence
+        #[cfg(feature = "persistence")]
+        if let Err(e) = shared.remove_persisted_retained(&topic_str) {
+            log::warn!(
+                "Failed to remove persisted retained message for '{}': {}",
+                topic_str,
+                e
+            );
+        }
     } else {
         let retained_publish = Publish {
             dup: false,
@@ -141,10 +150,19 @@ pub fn handle_retained(publish: &Publish, shared: &SharedStateHandle) {
             properties: publish.properties.clone(),
         };
         let retained = RetainedMessage {
-            publish: retained_publish,
+            publish: retained_publish.clone(),
             stored_at: Instant::now(),
         };
-        retained_msgs.insert(topic_str, retained);
+        retained_msgs.insert(topic_str.clone(), retained);
+        // Persist to disk
+        #[cfg(feature = "persistence")]
+        if let Err(e) = shared.persist_retained(&topic_str, &retained_publish) {
+            log::warn!(
+                "Failed to persist retained message for '{}': {}",
+                topic_str,
+                e
+            );
+        }
     }
 }
 

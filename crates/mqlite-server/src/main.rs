@@ -23,6 +23,8 @@ mod client_handle;
 mod config;
 mod fanout;
 mod handlers;
+#[cfg(feature = "persistence")]
+mod persistence;
 mod prometheus;
 mod proxy;
 mod publish_encoder;

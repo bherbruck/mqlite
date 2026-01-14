@@ -507,8 +507,12 @@ impl Worker {
         }
 
         // Handle client takeover (MQTT-3.1.4-2)
-        let takeover_result =
-            connect_handler::check_existing_client(&connect.client_id, token, self.id, &self.shared);
+        let takeover_result = connect_handler::check_existing_client(
+            &connect.client_id,
+            token,
+            self.id,
+            &self.shared,
+        );
         let old_location = takeover_result.as_ref().and_then(|r| r.old_location);
 
         if let Some(ref result) = takeover_result {
@@ -518,8 +522,7 @@ impl Worker {
                     if let Some(existing_client) = self.clients.get_mut(&location.token) {
                         if !existing_client.clean_session {
                             let mut sessions = self.shared.sessions.write();
-                            let session =
-                                sessions.entry(connect.client_id.clone()).or_default();
+                            let session = sessions.entry(connect.client_id.clone()).or_default();
                             connect_handler::save_pending_to_session(existing_client, session);
                             session.takeover_complete = true;
                         }
@@ -532,10 +535,9 @@ impl Worker {
                         let session = sessions.entry(connect.client_id.clone()).or_default();
                         session.takeover_complete = false;
                     }
-                    let _ =
-                        self.worker_senders[location.worker_id].send(WorkerMsg::Disconnect {
-                            token: location.token,
-                        });
+                    let _ = self.worker_senders[location.worker_id].send(WorkerMsg::Disconnect {
+                        token: location.token,
+                    });
                 }
             }
         }

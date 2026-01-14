@@ -279,7 +279,27 @@ impl Server {
 
     /// Run the server with workers.
     pub fn run(&mut self) -> Result<()> {
+        // Initialize shared state (with optional persistence)
+        #[cfg(feature = "persistence")]
+        let shared = if self.config.persistence.enabled {
+            info!(
+                "Persistence enabled, data directory: {:?}",
+                self.config.persistence.path
+            );
+            match SharedState::with_persistence(&self.config.persistence.path) {
+                Ok(state) => Arc::new(state),
+                Err(e) => {
+                    error!("Failed to open persistence database: {}", e);
+                    return Err(Error::Client(format!("persistence error: {}", e)));
+                }
+            }
+        } else {
+            Arc::new(SharedState::new())
+        };
+
+        #[cfg(not(feature = "persistence"))]
         let shared = Arc::new(SharedState::new());
+
         let start_time = Instant::now();
 
         // Start Prometheus metrics server if enabled

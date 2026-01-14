@@ -23,6 +23,7 @@ mod bridge;
 mod limits;
 mod log;
 mod mqtt;
+mod persistence;
 mod prometheus;
 mod server;
 mod session;
@@ -46,6 +47,7 @@ pub use limits::{
 };
 pub use log::LogConfig;
 pub use mqtt::MqttConfig;
+pub use persistence::{PersistenceConfig, DEFAULT_PERSISTENCE_PATH};
 pub use prometheus::{PrometheusConfig, DEFAULT_PROMETHEUS_BIND};
 pub use server::{
     ProxyProtocolConfig, ServerConfig, DEFAULT_PROXY_TIMEOUT_SECS, DEFAULT_SYS_INTERVAL,
@@ -86,6 +88,8 @@ pub struct Config {
     pub acl: AclConfig,
     /// Prometheus metrics configuration.
     pub prometheus: PrometheusConfig,
+    /// Persistence configuration.
+    pub persistence: PersistenceConfig,
     /// TLS configuration.
     pub tls: TlsConfig,
     /// WebSocket configuration.
@@ -180,6 +184,10 @@ impl Config {
             // Prometheus defaults (disabled by default)
             .set_default("prometheus.enabled", false)?
             .set_default("prometheus.bind", DEFAULT_PROMETHEUS_BIND)?
+            // Persistence defaults (disabled by default)
+            .set_default("persistence.enabled", false)?
+            .set_default("persistence.path", DEFAULT_PERSISTENCE_PATH)?
+            .set_default("persistence.sync_interval_secs", 30)?
             // TLS defaults (disabled by default)
             .set_default("tls.enabled", false)?
             .set_default("tls.bind", DEFAULT_TLS_BIND)?

@@ -285,8 +285,8 @@ pub fn update_session_subscription(
     });
 
     // Determine if we should skip retained messages
-    let skip_retained = options.retain_handling == 2
-        || (options.retain_handling == 1 && subscription_exists);
+    let skip_retained =
+        options.retain_handling == 2 || (options.retain_handling == 1 && subscription_exists);
 
     SessionUpdateResult { skip_retained }
 }

@@ -6,6 +6,7 @@
 //! - RetainedMessages: retained message store
 //! - ClientRegistry: maps ClientId → (worker_id, Token) for routing
 //! - BrokerMetrics: atomic counters for $SYS topics
+//! - Persistence: optional fjall-backed retained message storage
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,6 +16,8 @@ use parking_lot::RwLock;
 
 use mio::Token;
 
+#[cfg(feature = "persistence")]
+use crate::persistence::{Persistence, PersistenceError, RetainedData};
 use crate::publish_encoder::PublishEncoder;
 use crate::subscription::{Subscriber, SubscriptionStore};
 use crate::sys_tree::BrokerMetrics;
@@ -74,6 +77,9 @@ pub struct SharedState {
     pub client_registry: RwLock<HashMap<String, ClientLocation>>,
     /// Broker metrics for $SYS topics (NOT behind RwLock - uses atomics).
     pub metrics: BrokerMetrics,
+    /// Optional persistence layer for retained messages.
+    #[cfg(feature = "persistence")]
+    pub persistence: Option<Persistence>,
 }
 
 impl SharedState {
@@ -84,7 +90,102 @@ impl SharedState {
             retained_messages: RwLock::new(HashMap::new()),
             client_registry: RwLock::new(HashMap::new()),
             metrics: BrokerMetrics::new(),
+            #[cfg(feature = "persistence")]
+            persistence: None,
         }
+    }
+
+    /// Create SharedState with persistence enabled.
+    ///
+    /// Opens the persistence database at the given path and loads
+    /// any previously stored retained messages.
+    #[cfg(feature = "persistence")]
+    pub fn with_persistence(persistence_path: &std::path::Path) -> Result<Self, PersistenceError> {
+        let persistence = Persistence::open(persistence_path)?;
+
+        // Load retained messages from disk
+        let retained_from_disk = persistence.load_retained()?;
+
+        let mut retained_messages = HashMap::new();
+        for (topic, data) in retained_from_disk {
+            // Convert RetainedData back to RetainedMessage
+            let publish = Publish {
+                dup: false,
+                qos: match data.qos {
+                    0 => QoS::AtMostOnce,
+                    1 => QoS::AtLeastOnce,
+                    _ => QoS::ExactlyOnce,
+                },
+                retain: true,
+                topic: bytes::Bytes::from(topic.clone()),
+                packet_id: None,
+                payload: bytes::Bytes::from(data.payload),
+                properties: data.properties.map(bytes::Bytes::from),
+            };
+
+            // Calculate stored_at from Unix timestamp
+            let stored_at = std::time::Instant::now()
+                - std::time::Duration::from_secs(
+                    crate::persistence::current_unix_timestamp().saturating_sub(data.stored_at),
+                );
+
+            retained_messages.insert(topic, RetainedMessage { publish, stored_at });
+        }
+
+        log::info!(
+            "Loaded {} retained messages from persistence",
+            retained_messages.len()
+        );
+
+        Ok(Self {
+            subscriptions: RwLock::new(SubscriptionStore::new()),
+            sessions: RwLock::new(HashMap::new()),
+            retained_messages: RwLock::new(retained_messages),
+            client_registry: RwLock::new(HashMap::new()),
+            metrics: BrokerMetrics::new(),
+            persistence: Some(persistence),
+        })
+    }
+
+    /// Save a retained message to persistence (if enabled).
+    #[cfg(feature = "persistence")]
+    pub fn persist_retained(&self, topic: &str, publish: &Publish) -> Result<(), PersistenceError> {
+        if let Some(ref persistence) = self.persistence {
+            // Extract Message Expiry Interval from properties if present
+            let message_expiry = publish.properties.as_ref().and_then(|props| {
+                mqlite_core::packet::PublishProperties::from_bytes(props)
+                    .ok()
+                    .and_then(|p| p.message_expiry_interval)
+            });
+
+            let data = RetainedData::new(
+                publish.qos as u8,
+                publish.payload.to_vec(),
+                publish.properties.as_ref().map(|p| p.to_vec()),
+                message_expiry,
+            );
+            persistence.save_retained(topic, &data)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a retained message from persistence (if enabled).
+    #[cfg(feature = "persistence")]
+    pub fn remove_persisted_retained(&self, topic: &str) -> Result<(), PersistenceError> {
+        if let Some(ref persistence) = self.persistence {
+            persistence.remove_retained(topic)?;
+        }
+        Ok(())
+    }
+
+    /// Sync persistence to disk (if enabled).
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)] // Intended for graceful shutdown
+    pub fn sync_persistence(&self) -> Result<(), PersistenceError> {
+        if let Some(ref persistence) = self.persistence {
+            persistence.sync()?;
+        }
+        Ok(())
     }
 
     /// Publish a message internally (for $SYS topics, bridges, etc.).
@@ -103,14 +204,30 @@ impl SharedState {
             if publish.payload.is_empty() {
                 // Empty payload = delete retained message
                 self.retained_messages.write().remove(&topic_str);
+                #[cfg(feature = "persistence")]
+                if let Err(e) = self.remove_persisted_retained(&topic_str) {
+                    log::warn!(
+                        "Failed to remove persisted retained message for '{}': {}",
+                        topic_str,
+                        e
+                    );
+                }
             } else {
                 self.retained_messages.write().insert(
-                    topic_str,
+                    topic_str.clone(),
                     RetainedMessage {
                         publish: publish.clone(),
                         stored_at: Instant::now(),
                     },
                 );
+                #[cfg(feature = "persistence")]
+                if let Err(e) = self.persist_retained(&topic_str, &publish) {
+                    log::warn!(
+                        "Failed to persist retained message for '{}': {}",
+                        topic_str,
+                        e
+                    );
+                }
             }
         }
 

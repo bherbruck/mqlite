@@ -15,7 +15,7 @@ mqlite-core = { path = "crates/mqlite-core" }
 mqlite-client = { path = "crates/mqlite-client" }
 
 # Shared dependencies
-bytes = "1.9"
+bytes = "1.11"
 thiserror = "2.0"
 log = "0.4"
 parking_lot = "0.12"
